@@ -97,10 +97,26 @@ std::string getCurrentDirectory() {
   return getcwd(buf, PATH_MAX);
 }
 
+#if defined(__aarch64__)
+uint64_t getTimeArm(){
+  uint64_t currentClock;
+  uint64_t currentFrq;
+  asm volatile("mrs %0, cntvct_el0" : "=r" (currentClock));
+  asm volatile("mrs %0, cntfrq_el0" : "=r" (currentFrq));
+  return ((currentClock * 1000000000ULL ) / currentFrq);
+}
+#endif
+
 uint64_t threadCpuNanos() {
+#if defined(__aarch64__)
+   int64_t time;
+   asm volatile("mrs %0, cntvct_el0" : "=r" (time));
+   return time;
+#else
   timespec ts;
   clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
   return ts.tv_sec * 1'000'000'000 + ts.tv_nsec;
+#endif
 }
 
 namespace {
