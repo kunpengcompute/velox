@@ -19,12 +19,22 @@
 #include <folly/hash/Checksum.h>
 namespace facebook::velox::bits {
 
+#if defined(__aarch64__)
+extern "C" {
+  extern unsigned int crc32_x4(const unsigned char *buf, size_t len, unsigned int seed);
+}
+#endif
+
 // A boost compatible CRC32 calculator.
 class Crc32 {
  public:
   void process_bytes(const void* data, int32_t size) {
     checksum_ =
+#if defined(__aarch64__)
+        crc32_x4(reinterpret_cast<const uint8_t*>(data), size, checksum_);
+#else
         folly::crc32(reinterpret_cast<const uint8_t*>(data), size, checksum_);
+#endif
   }
 
   uint32_t checksum() const {
