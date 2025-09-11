@@ -882,6 +882,9 @@ int32_t RowContainer::compareStringAsc(
     const DecodedVector& decoded,
     vector_size_t index) {
   std::string storage;
+  if (left.isInline()) {
+    return left.compare(decoded.valueAt<StringView>(index));
+  }
   return HashStringAllocator::contiguousString(left, storage)
       .compare(decoded.valueAt<StringView>(index));
 }
@@ -902,6 +905,9 @@ int RowContainer::compareComplexType(
 int32_t RowContainer::compareStringAsc(StringView left, StringView right) {
   std::string leftStorage;
   std::string rightStorage;
+  if (left.isInline() && right.isInline()) {
+    return left.compare(right);
+  }
   return HashStringAllocator::contiguousString(left, leftStorage)
       .compare(HashStringAllocator::contiguousString(right, rightStorage));
 }
