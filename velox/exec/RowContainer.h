@@ -683,6 +683,7 @@ class RowContainer {
   /// 'decoded'. 'mayHaveNulls' specifies if nulls need to be checked. This is a
   /// fast path for compare().
   template <bool mayHaveNulls>
+  __attribute__((always_inline))
   bool equals(
       const char* row,
       RowColumn column,
