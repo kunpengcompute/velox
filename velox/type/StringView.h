@@ -156,6 +156,66 @@ struct StringView {
   // Returns 0, if this == other
   //       < 0, if this < other
   //       > 0, if this > other
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+  int32_t compare(const StringView& other) const {
+    if (prefixAsInt() != other.prefixAsInt()) {
+      // The result is decided on prefix. The shorter will be less
+      // because the prefix is padded with zeros.
+      return sve_memcmp(prefix_, other.prefix_, kPrefixSize);
+    }
+    int32_t size = std::min(size_, other.size_) - kPrefixSize;
+    if (size <= 0) {
+      // One ends within the prefix.
+      return size_ - other.size_;
+    }
+    if (size <= kInlineSize && isInline() && other.isInline()) {
+      int32_t result = sve_memcmp(value_.inlined, other.value_.inlined, size);
+      return (result != 0) ? result : size_ - other.size_;
+    }
+    int32_t result =
+        sve_memcmp(data() + kPrefixSize, other.data() + kPrefixSize, size);
+    return (result != 0) ? result : size_ - other.size_;
+  }
+ 
+ 
+  static inline int32_t sve_memcmp(const void* s1, const void* s2, size_t n) {
+      if (n == 0) return 0;
+      
+      int32_t result;
+      const char* p1 = static_cast<const char*>(s1);
+      const char* p2 = static_cast<const char*>(s2);
+      
+      asm volatile(
+          "mov x3, #0\n"                    
+          "1:\n"
+          "whilelo p0.b, x3, %[size]\n"     
+          "b.none 3f\n"                     
+          
+          "ld1b z0.b, p0/z, [%[s1], x3]\n"  
+          "ld1b z1.b, p0/z, [%[s2], x3]\n"  
+          "incb x3\n"                       
+          
+          "cmpne p1.b, p0/z, z0.b, z1.b\n"  
+          "b.none 1b\n"                     
+          
+          "brkb p1.b, p0/z, p1.b\n"         
+          "lasta %w[result], p1, z0.b\n"   
+          "lasta w4, p1, z1.b\n"           
+          "sub %w[result], %w[result], w4\n" 
+          "b 4f\n"                        
+          
+          "3:\n"                           
+          "mov %w[result], #0\n"          
+          "4:\n"
+          
+          : [result] "=r" (result)
+          : [s1] "r" (p1), [s2] "r" (p2), [size] "r" (n)
+          : "x3", "x4", "z0", "z1", "p0", "p1", "cc", "memory"
+      );
+      
+      return result;
+    }
+#else
   int32_t compare(const StringView& other) const {
     if (prefixAsInt() != other.prefixAsInt()) {
       // The result is decided on prefix. The shorter will be less

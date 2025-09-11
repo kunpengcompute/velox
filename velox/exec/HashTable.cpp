@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <arm_sve.h>
 #include "velox/exec/HashTable.h"
 #include "velox/common/base/AsyncSource.h"
 #include "velox/common/base/Exceptions.h"
@@ -576,6 +577,62 @@ void HashTable<ignoreNullKeys>::arrayGroupProbe(HashLookup& lookup) {
     }
     i -= start;
   }
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+  else if (simd::isDense(rows, numProbes)) {
+    const int32_t kWidth = 4;
+    auto start = 0;
+    auto end = numProbes - kWidth;
+    svbool_t allActive = svptrue_b64();
+    svint64_t zeroVec = svdup_s64(0);
+    
+    for (i = start; i <= end; i += kWidth) {
+      auto baseRow = rows[i];
+      svint64_t hashIndices = svld1(allActive, reinterpret_cast<const int64_t*>(hashes + baseRow));
+      int64_t loadedValues[4];
+      uint64_t hashIndex0 = hashes[baseRow];
+      uint64_t hashIndex1 = hashes[baseRow + 1];
+      uint64_t hashIndex2 = hashes[baseRow + 2];
+      uint64_t hashIndex3 = hashes[baseRow + 3];
+      VELOX_DCHECK_LT(hashIndex0, capacity_);
+      VELOX_DCHECK_LT(hashIndex1, capacity_);
+      VELOX_DCHECK_LT(hashIndex2, capacity_);
+      VELOX_DCHECK_LT(hashIndex3, capacity_);
+      loadedValues[0] = reinterpret_cast<int64_t>(table_[hashIndex0]);
+      loadedValues[1] = reinterpret_cast<int64_t>(table_[hashIndex1]);
+      loadedValues[2] = reinterpret_cast<int64_t>(table_[hashIndex2]);
+      loadedValues[3] = reinterpret_cast<int64_t>(table_[hashIndex3]);
+      if (svptest_any(allActive, svwhilelt_b64(0, 4))) { 
+        groups[i] = reinterpret_cast<char*>(loadedValues[0]);  
+      }
+      if (svptest_any(allActive, svwhilelt_b64(1, 4))) { 
+        groups[i + 1] = reinterpret_cast<char*>(loadedValues[1]);  
+      }
+      if (svptest_any(allActive, svwhilelt_b64(2, 4))) { 
+        groups[i + 2] = reinterpret_cast<char*>(loadedValues[2]);  
+      }
+      if (svptest_any(allActive, svwhilelt_b64(3, 4))) { 
+        groups[i + 3] = reinterpret_cast<char*>(loadedValues[3]);  
+      }
+      svint64_t loaded = svld1(allActive, loadedValues);
+      svbool_t misses = svcmpeq(allActive, loaded, zeroVec); 
+      if (LIKELY(!svptest_any(allActive, misses))) {
+        continue;
+      }
+      for (uint64_t j = 0; j < 4; j++) {
+        auto row = baseRow + j;
+        if (!groups[row]) {
+          auto index = hashes[row];
+          VELOX_DCHECK_LT(index, capacity_);
+          auto hit = table_[index];
+          if (!hit) {
+            hit = insertEntry(lookup, index, row);
+          }
+          groups[row] = hit;
+        }
+      }
+    }
+  }
+#endif
   for (; i < numProbes; ++i) {
     auto row = rows[i];
     uint64_t index = hashes[row];
@@ -641,6 +698,26 @@ void HashTable<ignoreNullKeys>::arrayJoinProbe(HashLookup& lookup) {
   auto hits = lookup.hits.data();
   auto numRows = rows.size();
   int32_t i = 0;
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+  const int32_t kBatchSize = 4;
+  const int32_t kStep = kBatchSize * 2;
+  svbool_t pg = svptrue_b64();
+  for (; i + kStep <= numRows; i += kStep) {
+    auto firstRow = rows[i];
+      if (rows[i + kStep - 1] - firstRow == kStep - 1) {
+        svint64_t hashes_vec1 = svld1_s64(pg, reinterpret_cast<const int64_t*>(hashes + firstRow)); 
+        svint64_t gathered1 = svld1_gather_s64index_s64(
+            pg, 
+            reinterpret_cast<const int64_t*>(table_), 
+            hashes_vec1);
+        svst1_s64(pg, reinterpret_cast<int64_t*>(hits + firstRow), gathered1);
+        svint64_t hashes_vec2 = svld1_s64(pg, reinterpret_cast<const int64_t*>(hashes + firstRow + kBatchSize));
+        svint64_t gathered2 = svld1_gather_s64index_s64(
+            pg, 
+            reinterpret_cast<const int64_t*>(table_), 
+            hashes_vec2);  
+        svst1_s64(pg, reinterpret_cast<int64_t*>(hits + firstRow + kBatchSize), gathered2);
+#else
   constexpr int32_t kBatchSize = xsimd::batch<int64_t>::size;
   constexpr int32_t kStep = kBatchSize * 2;
   // We loop 2 vectors at a time for fewer switches. The rows are in practice
@@ -658,6 +735,7 @@ void HashTable<ignoreNullKeys>::arrayJoinProbe(HashLookup& lookup) {
           reinterpret_cast<const int64_t*>(hashes + firstRow + kBatchSize))
           .store_unaligned(
               reinterpret_cast<int64_t*>(hits) + firstRow + kBatchSize);
+#endif
     } else {
       for (auto j = i; j < i + kStep; ++j) {
         auto row = rows[j];
