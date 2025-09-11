@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm" OR CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+  set(CRC_FILE crc32_x4.S)
+endif ()
+
 velox_add_library(velox_exception Exceptions.cpp VeloxException.cpp
                   Exceptions.h)
 velox_link_libraries(
@@ -39,7 +43,9 @@ velox_add_library(
   SpillStats.cpp
   StatsReporter.cpp
   SuccinctPrinter.cpp
-  TraceConfig.cpp)
+  TraceConfig.cpp
+  ${CRC_FILE}
+)
 
 velox_link_libraries(
   velox_common_base

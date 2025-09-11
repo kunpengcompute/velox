@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+enable_language(ASM)
+endif()
+
 # VELOX BASE
 include_directories(external/xxhash)
 add_subdirectory(buffer)
