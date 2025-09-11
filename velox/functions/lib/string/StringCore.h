@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <arm_sve.h>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -49,26 +50,55 @@ namespace stringCore {
 static bool isAscii(const char* str, size_t length);
 
 FOLLY_ALWAYS_INLINE bool isAscii(const char* str, size_t length) {
-  const auto mask = xsimd::broadcast<uint8_t>(0x80);
-  size_t i = 0;
-  for (; i + mask.size <= length; i += mask.size) {
-    auto batch =
-        xsimd::load_unaligned(reinterpret_cast<const uint8_t*>(str) + i);
-#if XSIMD_WITH_AVX
-    // 1 instruction instead of 2 on AVX.
-    if (!_mm256_testz_si256(batch, mask)) {
-#else
-    if (xsimd::any(batch >= mask)) {
-#endif
-      return false;
+  #if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+    const svuint8_t v80 = svdup_u8(0x80);
+    const svbool_t  pg  = svptrue_b8();
+    size_t i = 0;
+    while (i + 128 <= length) {
+      const uint8_t* p = reinterpret_cast<const uint8_t*>(str) + i;
+      svuint8_t or4 = svorr_z(pg, svorr_z(pg,
+                                    svld1_u8(pg, p + 0 * 32),
+                                    svld1_u8(pg, p + 1 * 32)),
+                                  svorr_z(pg,
+                                    svld1_u8(pg, p + 2 * 32),
+                                    svld1_u8(pg, p + 3 * 32)));
+      if (svptest_any(pg, svcmpge(pg, or4, v80))) {
+        return false;
+      }
+      i += 128;
     }
-  }
-  for (; i < length; ++i) {
-    if (str[i] & 0x80) {
-      return false;
+    while (i < length) {
+      svbool_t pgTail = svwhilelt_b8(i, length);
+      svuint8_t v = svld1_u8(pgTail,
+                       reinterpret_cast<const uint8_t*>(str) + i);
+      if (svptest_any(pgTail, svcmpge(pgTail, v, v80))) {
+        return false;
+      }
+      i += 32;
     }
-  }
-  return true;
+    return true;
+  #else
+    const auto mask = xsimd::broadcast<uint8_t>(0x80);
+    size_t i = 0;
+    for (; i + mask.size <= length; i += mask.size) {
+      auto batch =
+          xsimd::load_unaligned(reinterpret_cast<const uint8_t*>(str) + i);
+  #if XSIMD_WITH_AVX
+      // 1 instruction instead of 2 on AVX.
+      if (!_mm256_testz_si256(batch, mask)) {
+  #else
+      if (xsimd::any(batch >= mask)) {
+  #endif
+        return false;
+      }
+    }
+    for (; i < length; ++i) {
+      if (str[i] & 0x80) {
+        return false;
+      }
+    }
+    return true;
+  #endif
 }
 
 /// Perform reverse for ascii string input
