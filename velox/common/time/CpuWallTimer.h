@@ -53,7 +53,11 @@ class CpuWallTimer {
 
  private:
   uint64_t cpuTimeStart_;
+#if defined(__aarch64__)
+  uint64_t wallTimeStart_;
+#else
   std::chrono::steady_clock::time_point wallTimeStart_;
+#endif
   CpuWallTiming& timing_;
 };
 
@@ -61,7 +65,11 @@ class CpuWallTimer {
 class DeltaCpuWallTimeStopWatch {
  public:
   explicit DeltaCpuWallTimeStopWatch()
+#if defined(__aarch64__)
+      : wallTimeStart_(process::getTimeArm()),
+#else
       : wallTimeStart_(std::chrono::steady_clock::now()),
+#endif
         cpuTimeStart_(process::threadCpuNanos()) {}
 
   CpuWallTiming elapsed() const {
@@ -69,17 +77,29 @@ class DeltaCpuWallTimeStopWatch {
     // so as to avoid the counter-intuitive phenomenon that the final calculated
     // cpu-time is slightly larger than the wall-time.
     uint64_t cpuTimeDuration = process::threadCpuNanos() - cpuTimeStart_;
-    uint64_t wallTimeDuration =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - wallTimeStart_)
-            .count();
+#if defined(__aarch64__)
+    uint64_t currentClock;
+    uint64_t currentFrq;
+    asm volatile("mrs %0, cntvct_el0" : "=r" (currentClock));
+    asm volatile("mrs %0, cntfrq_el0" : "=r" (currentFrq));
+    uint64_t wallTimeDuration = ((currentClock * 1000000000ULL ) / currentFrq) - wallTimeStart_;
+#else
+     uint64_t wallTimeDuration =
+         std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now() - wallTimeStart_)
+             .count();
+#endif
     return CpuWallTiming{1, wallTimeDuration, cpuTimeDuration};
   }
 
  private:
   // NOTE: Put `wallTimeStart_` before `cpuTimeStart_`, so that wall-time starts
   // counting earlier than cpu-time.
-  const std::chrono::steady_clock::time_point wallTimeStart_;
+#if defined(__aarch64__)
+  const uint64_t wallTimeStart_;
+#else
+   const std::chrono::steady_clock::time_point wallTimeStart_;
+#endif
   const uint64_t cpuTimeStart_;
 };
 

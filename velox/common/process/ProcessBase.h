@@ -39,6 +39,10 @@ pthread_t getThreadId();
 /// Get current working directory.
 std::string getCurrentDirectory();
 
+#if defined(__aarch64__)
+uint64_t getTimeArm();
+#endif
+
 /// Returns elapsed CPU nanoseconds on the calling thread
 uint64_t threadCpuNanos();
 
