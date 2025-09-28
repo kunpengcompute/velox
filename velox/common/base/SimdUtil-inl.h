@@ -15,7 +15,6 @@
  */
 #include <algorithm>
 #include <numeric>
-#include <iostream>
 
 #if XSIMD_WITH_NEON
 namespace xsimd::types {
