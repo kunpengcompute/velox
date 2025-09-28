@@ -127,6 +127,19 @@ struct BitMask<T, A, 2> {
   }
 #endif
 
+#if XSIMD_WITH_NEON
+static int toBitMask(xsimd::batch_bool<T, A> mask, const xsimd::neon&) {
+    return (static_cast<int>(vgetq_lane_u16(mask, 0) >> 15)) |
+                      (static_cast<int>(vgetq_lane_u16(mask, 1) >> 15) << 1) |
+                      (static_cast<int>(vgetq_lane_u16(mask, 2) >> 15) << 2) |
+                      (static_cast<int>(vgetq_lane_u16(mask, 3) >> 15) << 3) |
+                      (static_cast<int>(vgetq_lane_u16(mask, 4) >> 15) << 4) |
+                      (static_cast<int>(vgetq_lane_u16(mask, 5) >> 15) << 5) |
+                      (static_cast<int>(vgetq_lane_u16(mask, 6) >> 15) << 6) |
+                      (static_cast<int>(vgetq_lane_u16(mask, 7) >> 15) << 7);
+}
+#endif
+
 #if XSIMD_WITH_SVE 
   static int toBitMask(xsimd::batch_bool<T, A> mask, const xsimd::sve&) {
     svuint16_t onc = svdup_u16(1);  
@@ -156,6 +169,15 @@ struct BitMask<T, A, 4> {
   static int toBitMask(xsimd::batch_bool<T, A> mask, const xsimd::sse2&) {
     return _mm_movemask_ps(reinterpret_cast<__m128>(mask.data));
   }
+#endif
+
+#if XSIMD_WITH_NEON
+static int toBitMask(xsimd::batch_bool<T, A> mask, const xsimd::neon&) {
+  return (static_cast<int>(vgetq_lane_u32(mask, 0) >> 31))
+                    | (static_cast<int>(vgetq_lane_u32(mask, 1) >> 31) << 1)
+                    | (static_cast<int>(vgetq_lane_u32(mask, 2) >> 31) << 2)
+                    | (static_cast<int>(vgetq_lane_u32(mask, 3) >> 31) << 3);
+}
 #endif
 
 #if XSIMD_WITH_SVE
@@ -193,6 +215,12 @@ struct BitMask<T, A, 8> {
   static int toBitMask(xsimd::batch_bool<T, A> mask, const xsimd::sse2&) {
     return _mm_movemask_pd(reinterpret_cast<__m128d>(mask.data));
   }
+#endif
+
+#if XSIMD_WITH_NEON
+static int toBitMask(xsimd::batch_bool<T, A> mask, const xsimd::neon&) {
+  return (static_cast<int>(vgetq_lane_u64(mask, 0) >> 63)) | (static_cast<int>(vgetq_lane_u64(mask, 1) >> 63) << 1);
+}
 #endif
 
 #if XSIMD_WITH_SVE
