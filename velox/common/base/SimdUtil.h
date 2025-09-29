@@ -222,6 +222,17 @@ gather(const T* base, Batch64<IndexType> vindex, const A& arch = {}) {
   return Impl::template apply<kScale>(base, vindex.data, arch);
 }
 
+template <
+    typename T,
+    typename IndexType,
+    int kScale = sizeof(T),
+    typename A = xsimd::default_arch>
+xsimd::batch<T, A>
+gather(const T* base, Batch128<IndexType> vindex, const A& arch = {}) {
+  using Impl = detail::Gather<T, IndexType, A>;
+  return Impl::template apply<kScale>(base, vindex.data, arch);
+}
+
 // Same as 'gather' above except the indices are read from memory.
 template <
     typename T,
@@ -250,17 +261,6 @@ xsimd::batch<T, A> maskGather(
     const A& arch = {}) {
   using Impl = detail::Gather<T, IndexType, A>;
   return Impl::template maskApply<kScale>(src, mask, base, vindex, arch);
-}
-
-template <
-    typename T,
-    typename IndexType,
-    int kScale = sizeof(T),
-    typename A = xsimd::default_arch>
-xsimd::batch<T, A>
-gather(const T* base, Batch128<IndexType> vindex, const A& arch = {}) {
-  using Impl = detail::Gather<T, IndexType, A>;
-  return Impl::template apply<kScale>(base, vindex.data, arch);
 }
 
 template <
@@ -522,7 +522,7 @@ inline T* addBytes(T* pointer, int32_t bytes) {
 // 'memcpy' implementation that copies at maximum width and unrolls
 // when 'bytes' is constant.
 template <typename A = xsimd::default_arch>
-inline void memcpy(void* to, const void* from, int32_t bytes, const A& = {});
+inline void memcpy(void* to, const void* from, int64_t bytes, const A& = {});
 
 // memset implementation that writes at maximum width and unrolls for
 // constant values of 'bytes'.
