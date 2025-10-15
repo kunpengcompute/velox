@@ -1331,10 +1331,10 @@ struct GetHalf<int64_t, int32_t, A> {
     constexpr std::size_t input_size = xsimd::batch<int32_t, A>::size;
     constexpr std::size_t half_size = input_size / 2;
 
-    std::array<int32_t, input_size> input_buffer;
+    alignas(A::alignment()) std::array<int32_t, input_size> input_buffer;
     data.store_aligned(input_buffer.data());
 
-    std::array<int64_t, half_size> output_buffer;
+    alignas(A::alignment()) std::array<int64_t, half_size> output_buffer;
     for (std::size_t i = 0; i < half_size; ++i) {
       output_buffer[i] = static_cast<int64_t>(
           kSecond ? input_buffer[i + half_size] : input_buffer[i]);
@@ -1401,9 +1401,9 @@ struct GetHalf<uint64_t, int32_t, A> {
       const xsimd::generic&) {
     constexpr std::size_t input_size = xsimd::batch<int32_t, A>::size;
     constexpr std::size_t half_size = input_size / 2;
-    std::array<int32_t, input_size> input_buffer;
+    alignas(A::alignment()) std::array<int32_t, input_size> input_buffer;
     data.store_aligned(input_buffer.data());
-    std::array<uint64_t, half_size> output_buffer;
+    alignas(A::alignment()) std::array<uint64_t, half_size> output_buffer;
     for (std::size_t i = 0; i < half_size; ++i) {
       output_buffer[i] = static_cast<uint64_t>(
           kSecond ? static_cast<uint32_t>(input_buffer[i + half_size])
