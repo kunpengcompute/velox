@@ -73,8 +73,6 @@ struct FromBitMask {
 extern const FromBitMask<int32_t, xsimd::default_arch> fromBitMask32;
 extern const FromBitMask<int64_t, xsimd::default_arch> fromBitMask64;
 
-
-
 template <typename T, typename A>
 struct BitMask<T, A, 1> {
   static constexpr int kAllSet = bits::lowMask(xsimd::batch_bool<T, A>::size);
