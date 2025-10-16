@@ -1039,7 +1039,7 @@ xsimd::batch<int16_t, A> pack32(
     xsimd::batch<int32_t, A> x,
     xsimd::batch<int32_t, A> y,
     const xsimd::sve&) {   
-  return 	svuzp1_s16(svreinterpret_s16_s32(x), 
+  return svuzp1_s16(svreinterpret_s16_s32(x), 
                     svreinterpret_s16_s32(y));
 }
 #endif
