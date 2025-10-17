@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <arm_sve.h>
 
 #ifdef __BMI2__
 #include <x86intrin.h>
@@ -857,6 +858,37 @@ storeBits(uint64_t* target, uint64_t offset, uint64_t word, uint8_t numBits) {
 
 // Copies a string of bits between locations in memory given by an
 // address and a bit offset for source and destination.
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+inline void copyBitsSVE(
+    const uint64_t* source,
+    uint64_t sourceOffset,
+    uint64_t* target,
+    uint64_t targetOffset,
+    uint64_t numBits) {
+
+  const uint8_t* srcBase = reinterpret_cast<const uint8_t*>(source) +(sourceOffset >> 3);
+  uint8_t* dstBase = reinterpret_cast<uint8_t*>(target) + (targetOffset >> 3);
+
+  uint64_t bitOffsetStart = sourceOffset & 7;
+  uint64_t bitsCopied = 0;
+
+  uint64_t svbytes = svcntb();
+  uint64_t svbits = svbytes << 3;
+
+  while (bitsCopied + svbits <= numBits) {
+    svuint8_t data_vec = svld1_u8(svptrue_b8(), srcBase + (bitsCopied >> 3));
+    svst1_u8(svptrue_b8(), dstBase + (bitsCopied >> 3), data_vec);
+    bitsCopied += svbits;
+  }
+  if (bitsCopied < numBits) {
+    uint64_t remaining_bits = numBits - bitsCopied;
+    uint64_t remaining_bytes = (remaining_bits + 7) >> 3;
+    svbool_t pg = svwhilelt_b8(static_cast<uint64_t>(0), remaining_bytes);
+    svuint8_t tail_vec = svld1_u8(pg, srcBase + (bitsCopied >> 3));
+  }
+}
+# endif
+
 inline void copyBits(
     const uint64_t* source,
     uint64_t sourceOffset,
