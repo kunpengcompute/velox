@@ -68,7 +68,7 @@ void RleBpDecoder::readBits(
     } else {
       bits::copyBits(
           reinterpret_cast<const uint64_t*>(bufferStart_),
-          static_cast<uint64_t>(bitOffset_),
+          bitOffset_,
           outputBuffer,
           numWritten,
           consumed);
