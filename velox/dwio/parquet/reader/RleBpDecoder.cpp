@@ -66,32 +66,12 @@ void RleBpDecoder::readBits(
       bits::fillBits(
           outputBuffer, numWritten, numWritten + consumed, value_ != 0);
     } else {
-#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
-      if (bitOffset_ % 8 == 0 && numWritten % 8 == 0 && 
-          (reinterpret_cast<uintptr_t>(bufferStart_) % 8 == 0)) {
-        bits::copyBitsSVE(
-            reinterpret_cast<const uint64_t*>(bufferStart_),
-            static_cast<uint64_t>(bitOffset_),
-            outputBuffer,
-            static_cast<uint64_t>(numWritten),
-            static_cast<uint64_t>(consumed));
-      } else {
-        bits::copyBits(
-            reinterpret_cast<const uint64_t*>(bufferStart_),
-            static_cast<uint64_t>(bitOffset_),
-            outputBuffer,
-            static_cast<uint64_t>(numWritten),
-            static_cast<uint64_t>(consumed));
-      }
-#else
       bits::copyBits(
           reinterpret_cast<const uint64_t*>(bufferStart_),
-          static_cast<uint64_t>(bitOffset_),
+          bitOffset_,
           outputBuffer,
-          static_cast<uint64_t>(numWritten),
-          static_cast<uint64_t>(consumed));
-#endif
-
+          numWritten,
+          consumed);
       int64_t offset = bitOffset_ + consumed;
       bufferStart_ += offset >> 3;
       bitOffset_ = offset & 7;
