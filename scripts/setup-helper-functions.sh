@@ -144,7 +144,7 @@ function get_cxx_flags {
         elif [ "$ARM_CPU_PRODUCT" = "$Neoverse_V1" ]; then
           echo -n "-mcpu=neoverse-v1 "
         else
-          echo -n "-march=armv8.2-a+sve -msve-vector-bits=256 -DXSIMD_ARM_SVE_NATIVE -DSVE_BITS=256 "
+          echo -n "-march=armv8.2-a+sve+sve2-bitperm -msve-vector-bits=256 -DXSIMD_ARM_SVE_NATIVE -DSVE_BITS=256 "
         fi
       else
         echo -n ""
