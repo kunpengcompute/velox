@@ -26,6 +26,10 @@
 #include <cstring>
 #include <string>
 
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+#include <arm_sve.h>
+#endif
+
 #ifdef __BMI2__
 #include <x86intrin.h>
 #endif
@@ -863,6 +867,55 @@ inline void copyBits(
     uint64_t* target,
     uint64_t targetOffset,
     uint64_t numBits) {
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+  if (sourceOffset % 8 == 0 && targetOffset % 8 == 0 && 
+           (reinterpret_cast<uintptr_t>(source) % 8 == 0)) {
+
+    const uint8_t* srcBase = reinterpret_cast<const uint8_t*>(source) +(sourceOffset >> 3);
+    uint8_t* dstBase = reinterpret_cast<uint8_t*>(target) + (targetOffset >> 3);
+
+    uint64_t bitOffsetStart = sourceOffset & 7;
+    uint64_t bitsCopied = 0;
+
+    uint64_t svbytes = svcntb();
+    uint64_t svbits = svbytes << 3;
+
+    while (bitsCopied + svbits <= numBits) {
+      svuint8_t data_vec = svld1_u8(svptrue_b8(), srcBase + (bitsCopied >> 3));
+      svst1_u8(svptrue_b8(), dstBase + (bitsCopied >> 3), data_vec);
+      bitsCopied += svbits;
+    }
+    if (bitsCopied < numBits) {
+      uint64_t remaining_bits = numBits - bitsCopied;
+      uint64_t remaining_bytes = (remaining_bits + 7) >> 3;
+      svbool_t pg = svwhilelt_b8(static_cast<uint64_t>(0), remaining_bytes);
+      svuint8_t tail_vec = svld1_u8(pg, srcBase + (bitsCopied >> 3));
+      svst1_u8(pg, dstBase + (bitsCopied >> 3), tail_vec);
+    }
+  } else {
+    uint64_t i = 0;
+    for (; i + 64 <= numBits; i += 64) {
+      uint64_t word = detail::loadBits<uint64_t>(source, i + sourceOffset, 64);
+      detail::storeBits<uint64_t>(target, targetOffset + i, word, 64);
+    }
+    if (i + 32 <= numBits) {
+      auto lastWord = detail::loadBits<uint32_t>(source, sourceOffset + i, 32);
+      detail::storeBits<uint32_t>(target, targetOffset + i, lastWord, 32);
+      i += 32;
+    }
+    if (i + 16 <= numBits) {
+      auto lastWord = detail::loadBits<uint16_t>(source, sourceOffset + i, 16);
+      detail::storeBits<uint16_t>(target, targetOffset + i, lastWord, 16);
+      i += 16;
+    }
+    for (; i < numBits; i += 8) {
+      auto copyBits = std::min<uint64_t>(numBits - i, 8);
+      auto lastWord =
+          detail::loadBits<uint8_t>(source, sourceOffset + i, copyBits);
+      detail::storeBits<uint8_t>(target, targetOffset + i, lastWord, copyBits);
+    }
+  }
+#else
   uint64_t i = 0;
   for (; i + 64 <= numBits; i += 64) {
     uint64_t word = detail::loadBits<uint64_t>(source, i + sourceOffset, 64);
@@ -884,6 +937,7 @@ inline void copyBits(
         detail::loadBits<uint8_t>(source, sourceOffset + i, copyBits);
     detail::storeBits<uint8_t>(target, targetOffset + i, lastWord, copyBits);
   }
+#endif
 }
 
 // Copies the bits from the range starting at data + sourceOffset, to another
