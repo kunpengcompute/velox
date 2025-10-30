@@ -235,7 +235,7 @@ struct StringView {
         memcmp(data() + kPrefixSize, other.data() + kPrefixSize, size);
     return (result != 0) ? result : size_ - other.size_;
   }
-
+#endif
   bool operator<(const StringView& other) const {
     return compare(other) < 0;
   }
