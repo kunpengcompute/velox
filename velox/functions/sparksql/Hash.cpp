@@ -356,6 +356,7 @@ void applyWithType(
   const auto begin = rows.begin();
   const auto end = rows.end();
 
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__) && SVE_BITS == 256  
   if (rows.isAllSelected()) {
     VELOX_DCHECK_LT(end - 1, result.size());
     VELOX_DCHECK(!result.values_->isView());
@@ -393,12 +394,13 @@ void applyWithType(
         result.nullSet(row);
       }
     }
-  } else {
+ #else
     auto func = [&](vector_size_t row) {
       result.set(row, hashSeed);
     };
     bits::forEachSetBit(rows.getBitData(), begin, end, func);
   }
+#endif
 
   exec::LocalSelectivityVector selectedMinusNulls(context);
 

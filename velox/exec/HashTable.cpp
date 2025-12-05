@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
 #include <arm_sve.h>
+#endif
 #include "velox/exec/HashTable.h"
 #include "velox/common/base/AsyncSource.h"
 #include "velox/common/base/Exceptions.h"
@@ -577,7 +579,7 @@ void HashTable<ignoreNullKeys>::arrayGroupProbe(HashLookup& lookup) {
     }
     i -= start;
   }
-#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__) && SVE_BITS == 256
   else if (simd::isDense(rows, numProbes)) {
     const int32_t kWidth = 4;
     auto start = 0;
@@ -698,7 +700,7 @@ void HashTable<ignoreNullKeys>::arrayJoinProbe(HashLookup& lookup) {
   auto hits = lookup.hits.data();
   auto numRows = rows.size();
   int32_t i = 0;
-#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__) && SVE_BITS == 256
   const int32_t kBatchSize = 4;
   const int32_t kStep = kBatchSize * 2;
   svbool_t pg = svptrue_b64();

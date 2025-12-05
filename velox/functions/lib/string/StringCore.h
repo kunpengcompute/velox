@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 #pragma once
-
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
 #include <arm_sve.h>
+#endif
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -50,7 +51,7 @@ namespace stringCore {
 static bool isAscii(const char* str, size_t length);
 
 FOLLY_ALWAYS_INLINE bool isAscii(const char* str, size_t length) {
-  #if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+  #if defined(__ARM_FEATURE_SVE) && defined(__aarch64__) && SVE_BITS == 256
     const svuint8_t v80 = svdup_u8(0x80);
     const svbool_t  pg  = svptrue_b8();
     size_t i = 0;
