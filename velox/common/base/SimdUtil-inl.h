@@ -584,6 +584,7 @@ struct Gather<T, int32_t, A, 4> {
     return apply<kScale>(base, loadIndices(indices, arch), arch);
   }
 
+#if XSIMD_WITH_SVE
   template <int kScale>
   static xsimd::batch<T, A>
   apply(const T* base, const int32_t* indices, const xsimd::sve& arch) {
@@ -594,6 +595,7 @@ struct Gather<T, int32_t, A, 4> {
                 reinterpret_cast<const int32_t*>(base), 
                 hashes_vec));
   }
+#endif
 
   template <int kScale>
   static xsimd::batch<T, A>
@@ -611,6 +613,7 @@ struct Gather<T, int32_t, A, 4> {
   }
 #endif
 
+#if XSIMD_WITH_SVE
   template <int kScale>
   static xsimd::batch<T, A>
   apply(const T* base, VIndexType vindex, const xsimd::sve&) {
@@ -623,6 +626,7 @@ struct Gather<T, int32_t, A, 4> {
                 reinterpret_cast<const int32_t*>(base), 
                 hashes_vec));
   }
+#endif
 
   template <int kScale>
   static xsimd::batch<T, A>
@@ -752,6 +756,7 @@ struct Gather<T, int32_t, A, 8> {
     return genericGather<T, A, kScale>(base, indices);
   }
 
+#if XSIMD_WITH_SVE  
   template <int kScale>
   static xsimd::batch<T, A>
   apply(const T* base, const int32_t* indices, const xsimd::sve& arch) {
@@ -763,7 +768,7 @@ struct Gather<T, int32_t, A, 8> {
                 reinterpret_cast<const int64_t*>(base), 
                 idx64_lo));
   }
-
+#endif
 
 #if (XSIMD_WITH_SVE && SVE_BITS == 256) //no ut test
   template <int kScale>
@@ -911,6 +916,7 @@ struct Gather<T, int64_t, A, 8> {
   }
 #endif
 
+#if XSIMD_WITH_SVE  
   template <int kScale>
   static xsimd::batch<T, A>
   apply(const T* base, const int64_t* indices, const xsimd::sve& arch) {
@@ -921,6 +927,7 @@ struct Gather<T, int64_t, A, 8> {
                 reinterpret_cast<const int64_t*>(base), 
                 hashes_vec));
   }
+#endif
 
   template <int kScale>
   static xsimd::batch<T, A>

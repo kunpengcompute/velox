@@ -867,7 +867,7 @@ inline void copyBits(
     uint64_t* target,
     uint64_t targetOffset,
     uint64_t numBits) {
-#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__) && SVE_BITS == 256
   if (sourceOffset % 8 == 0 && targetOffset % 8 == 0 && 
            (reinterpret_cast<uintptr_t>(source) % 8 == 0)) {
 
