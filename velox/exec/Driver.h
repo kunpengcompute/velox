@@ -657,6 +657,10 @@ struct DriverFactory {
 
   static void registerAdapter(DriverAdapter adapter);
 
+  bool isRollupEnabled(
+          std::shared_ptr<const core::ExpandNode> expandNode,
+          std::shared_ptr<const core::AggregationNode> aggregationNode);
+
   bool supportsSerialExecution() const {
     return !needsPartitionedOutput() && !needsExchangeClient();
   }
