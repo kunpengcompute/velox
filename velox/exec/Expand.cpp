@@ -102,7 +102,7 @@ RowVectorPtr Expand::getOutput() {
   }
 
   ++rowIndex_;
-  if (rowIndex_ == fieldProjections_.size()) {
+  if (rowIndex_ == fieldProjections_.size() || rollupEnabled_) {
     rowIndex_ = 0;
     input_ = nullptr;
   }

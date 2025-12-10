@@ -41,6 +41,10 @@ class Expand : public Operator {
     return noMoreInput_ && input_ == nullptr;
   }
 
+  void setRollupEnabled(bool rollupEnabled) {
+    rollupEnabled_ = rollupEnabled;
+  }
+
  private:
   std::vector<std::vector<column_index_t>> fieldProjections_;
 
@@ -49,5 +53,7 @@ class Expand : public Operator {
 
   // Used to indicate the index of fieldProjections_.
   int32_t rowIndex_{0};
+
+  bool rollupEnabled_{false};
 };
 } // namespace facebook::velox::exec

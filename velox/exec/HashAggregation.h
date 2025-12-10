@@ -50,6 +50,14 @@ class HashAggregation : public Operator {
 
   void close() override;
 
+  void setProjectNode(std::shared_ptr<const core::ProjectNode> projectNode) {
+    projectNode_ = projectNode;
+  }
+
+  void setExpandNode(std::shared_ptr<const core::ExpandNode> expandNode) {
+    expandNode_ = expandNode;
+  }
+
  private:
   void updateRuntimeStats();
 
@@ -83,6 +91,20 @@ class HashAggregation : public Operator {
       std::vector<column_index_t>& groupingKeyOutputChannels) const;
 
   void updateEstimatedOutputRowSize();
+
+  void initProjection(
+    std::vector<column_index_t>& groupingKeyInputChannels,
+    std::vector<column_index_t>& groupingKeyOutputChannels);
+
+  RowVectorPtr rollupProjection(RowVectorPtr input, int32_t rowIndex);
+
+  void initRollupAgg();
+
+  void resetRollupOutput();
+
+  std::shared_ptr<const core::AggregationNode> createIntermediateOrFinalAggregation(
+    core::AggregationNode::Step step,
+    std::shared_ptr<const core::AggregationNode> partialAggNode);
 
   std::shared_ptr<const core::AggregationNode> aggregationNode_;
 
@@ -124,6 +146,18 @@ class HashAggregation : public Operator {
 
   // Possibly reusable output vector.
   RowVectorPtr output_;
+
+  std::shared_ptr<const core::AggregationNode> rollupAggregationNode_;
+  std::shared_ptr<const core::ExpandNode> expandNode_;
+  std::shared_ptr<const core::ProjectNode> projectNode_;
+
+  std::vector<std::vector<column_index_t>> fieldProjections_;
+  std::vector<std::vector<std::shared_ptr<const core::ConstantTypedExpr>>>
+      constantProjections_;
+
+  std::vector<std::unique_ptr<GroupingSet>> groupingSetsRollUp_;
+  std::vector<RowContainerIterator> rollupResultIterators_;
+  int32_t groupingSetIndex{0};
 };
 
 } // namespace facebook::velox::exec
