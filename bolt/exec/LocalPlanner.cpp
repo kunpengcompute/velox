@@ -1082,7 +1082,9 @@ std::vector<DriverAdapter> DriverFactory::adapters;
 bool DriverFactory::isRollupEnabled(
           std::shared_ptr<const core::ExpandNode> expandNode,
           std::shared_ptr<const core::AggregationNode> aggregationNode) {
-  if (aggregationNode->isPreGrouped()) {
+  if (!aggregationNode->preGroupedKeys().empty() &&
+      aggregationNode->preGroupedKeys().size() ==
+          aggregationNode->groupingKeys().size()) {
     return false;
   }
   auto projections = expandNode->projections();

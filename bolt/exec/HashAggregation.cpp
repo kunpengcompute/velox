@@ -942,7 +942,7 @@ void HashAggregation::initProjection() {
         rowProjection.push_back(kConstantChannel);
         constantProjection.push_back(constant);
       } else {
-        VELOX_USER_FAIL(
+        BOLT_USER_FAIL(
             "Expand operator doesn't support this expression. Only column references and constants are supported. {}",
             columnProjection->toString());
       }
