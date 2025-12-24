@@ -378,6 +378,17 @@ class SelectivityVector {
     return os;
   }
 
+  uint64_t* getBits() const {
+    return const_cast<uint64_t*>(bits_.data());
+  }
+
+  vector_size_t getBegin() const {
+    return begin_;
+  }
+
+  vector_size_t getEnd() const {
+    return end_;
+  }
  private:
   // The vector of bits for what is selected vs not (1 is selected).
   std::vector<uint64_t> bits_;

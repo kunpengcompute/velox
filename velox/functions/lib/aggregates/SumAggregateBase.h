@@ -21,6 +21,7 @@
 #include "velox/functions/lib/CheckedArithmeticImpl.h"
 #include "velox/functions/lib/aggregates/DecimalAggregate.h"
 #include "velox/functions/lib/aggregates/SimpleNumericAggregate.h"
+#include <arm_sve.h>
 
 namespace facebook::velox::functions::aggregate {
 
@@ -111,6 +112,419 @@ class SumAggregateBase
   }
 
  protected:
+  template <typename T>
+  static constexpr bool kMayPushdown = !std::is_same_v<T, int128_t> &&
+      !std::is_same_v<T, Timestamp> && !std::is_same_v<T, UnknownValue>;
+
+#define UNLIKELY(x) (__builtin_expect((x), 0))
+
+  template <typename T>
+  inline bool isBitSet(const T* bits, uint64_t idx) {
+    return bits[idx / (sizeof(bits[0]) * 8)] &
+        (static_cast<T>(1) << (idx & ((sizeof(bits[0]) * 8) - 1)));
+  }
+
+  inline bool isBitNull(const uint64_t* bits, int32_t index) {
+    return isBitSet(bits, index) == false;
+  }
+  template <typename T, typename U>
+  constexpr inline T roundUp(T value, U factor) {
+    return (value + (factor - 1)) / factor * factor;
+  }
+
+  svbool_t getBitMask(
+      uint8_t* nulls_,
+      int32_t index,
+      int mode,
+      uint32_t* dic,
+      int32_t length) {
+    svbool_t pg;
+    if (mode == 0) {
+      pg = svptrue_b8();
+      return pg;
+    } else if (mode == 1) {
+      __asm__ __volatile__("ldr %0, [%1]"
+                           : "=Upl"(pg)
+                           : "r"(&(nulls_[index]))
+                           : "memory");
+      return pg;
+    } else if (mode == 2) {
+      if (!isBitNull(
+              reinterpret_cast<uint64_t*>(nulls_),
+              0))
+      {
+        pg = svptrue_b8();
+      } else {
+        pg = svpfalse();
+      }
+      return pg;
+    } else if (mode == 3) {
+      svuint32_t onc = svdup_u32(1);
+      svuint32_t inv = svindex_u32(0, 1);
+      svuint32_t pow = svlsl_m(svptrue_b32(), onc, inv);
+      uint8_t tmpNulls[4] = {0};
+      uint32_t* null32ptr = reinterpret_cast<uint32_t*>(nulls_);
+
+      svuint32_t posv, idxbufv, bufv, offsetv;
+      svbool_t nullvec, pg1;
+      pg1 = svwhilelt_b32(index*8, length);
+      posv = svld1(
+          pg1,
+          dic +
+              (index *
+               8)); // 这里要从arr8的index，转成这个代表第几个元素，所以要乘8
+      idxbufv = svlsr_x(pg1, posv, 5); // div 32 得到uint32 对应下标
+      bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
+      offsetv = svand_m(pg1, posv, 0b11111); // uint32内偏移，mod 32
+      bufv = svlsr_m(pg1, bufv, offsetv); // 右移，取第offsettv位
+      bufv = svand_m(pg1, bufv, 0x1); // 将其他位置0
+      nullvec = svcmpgt(pg1, bufv, 0);
+      if (__builtin_expect((svptest_any(pg1, nullvec)), 0)) {
+        uint8_t nullsres = svaddv(nullvec, pow);
+        tmpNulls[0] = nullsres;
+      } else {
+        tmpNulls[0] = 0;
+      }
+
+      pg1 = svwhilelt_b32(index*8, length);
+      posv = svld1(pg1, dic + index*8 + 8);
+      idxbufv = svlsr_x(pg1, posv, 5); // div 32 得到uint32 对应下标
+      bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
+      offsetv = svand_m(pg1, posv, 0b11111); // uint32内偏移，mod 32
+      bufv = svlsr_m(pg1, bufv, offsetv); // 右移，取第offsettv位
+      bufv = svand_m(pg1, bufv, 0x1); // 将其他位置0
+      nullvec = svcmpgt(pg1, bufv, 0);
+      if (__builtin_expect((svptest_any(pg1, nullvec)), 0)) {
+        uint8_t nullsres = svaddv(nullvec, pow);
+        tmpNulls[1] = nullsres;
+      } else {
+        tmpNulls[1] = 0;
+      }
+
+      pg1 = svwhilelt_b32(index*8, length);
+      posv = svld1(pg1, dic + index*8 + 16);
+      idxbufv = svlsr_x(pg1, posv, 5); // div 32 得到uint32 对应下标
+      bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
+      offsetv = svand_m(pg1, posv, 0b11111); // uint32内偏移，mod 32
+      bufv = svlsr_m(pg1, bufv, offsetv); // 右移，取第offsettv位
+      bufv = svand_m(pg1, bufv, 0x1); // 将其他位置0
+      nullvec = svcmpgt(pg1, bufv, 0);
+      if (__builtin_expect((svptest_any(pg1, nullvec)), 0)) {
+        uint8_t nullsres = svaddv(nullvec, pow);
+        tmpNulls[2] = nullsres;
+      } else {
+        tmpNulls[2] = 0;
+      }
+
+      pg1 = svwhilelt_b32(index*8, length);
+      posv = svld1(pg1, dic + index*8 + 24);
+      idxbufv = svlsr_x(pg1, posv, 5); // div 32 得到uint32 对应下标
+      bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
+      offsetv = svand_m(pg1, posv, 0b11111); // uint32内偏移，mod 32
+      bufv = svlsr_m(pg1, bufv, offsetv); // 右移，取第offsettv位
+      bufv = svand_m(pg1, bufv, 0x1); // 将其他位置0
+      nullvec = svcmpgt(pg1, bufv, 0);
+      if (__builtin_expect((svptest_any(pg1, nullvec)), 0)) {
+        uint8_t nullsres = svaddv(nullvec, pow);
+        tmpNulls[3] = nullsres;
+      } else {
+        tmpNulls[3] = 0;
+      }
+      __asm__ __volatile__("ldr %0, [%1]"
+                           : "=Upl"(pg)
+                           : "r"(tmpNulls)
+                           : "memory");
+      return pg;
+    }
+    // 其实最后一种情况和第一个是一样的
+    return pg;
+  }
+
+  svint64_t getValueSVE(
+      int64_t* value,
+
+      int32_t mode,
+      svbool_t pg,
+      uint32_t index,
+      uint32_t* dic) {
+        svint64_t result;
+    if (mode == 0 || mode == 1) {
+      result = svld1_s64(pg, value + index);
+      // return;
+    } else if (mode == 2) {
+      result = svdup_n_s64(value[0]);
+      // return;
+    } else if (mode == 3) {
+      // pg进来是对应int64(value)的如果要取对应dic，要调整p寄存器，原来可能是
+      // 0001 0001 0001 0001，调整后0000 0000 0101 0101
+      svbool_t pg64to32 = svuzp1_b8(pg, svpfalse());
+      svuint32_t offset = svld1(pg64to32, dic + index);
+      svuint64_t offsetLow = svunpklo(offset);
+      result = svld1_gather_index(pg, value, offsetLow);
+      // return;
+    }
+    return result;
+  }
+
+  bool clearNullSVE(svuint64_t ptr, svbool_t pg) //
+  {
+    if (this->numNulls_) {
+      svint64_t group = svld1sb_gather_u64base_offset_s64(
+          pg, ptr, this->nullByte_); // 这里要变
+      svuint8_t group8 = svreinterpret_u8(group);
+
+      svuint8_t nullMasks = svdup_u8(this->nullMask_);
+      svuint8_t tmp = svand_u8_z(pg, group8, nullMasks);
+      svuint8_t zero = svdup_u8(0);
+      svbool_t test = svcmpne(svptrue_b8(), tmp, zero);
+      if (svptest_any(svptrue_b8(), test)) {
+        svuint8_t negNullMasks = sveor_n_u8_m(svptrue_b8(), nullMasks, 0xFF);
+        svuint8_t adjust = svand_u8_m(test, group8, negNullMasks);
+        svst1b_scatter_u64base_offset_s64(
+            pg, ptr, this->nullByte_, svreinterpret_s64(adjust));
+
+        svuint8_t one = svdup_u8(1);
+        int num = svaddv(test, one);
+        this->numNulls_ -= num;
+        this->numNulls_ = this->numNulls_ < 0 ? 0 : this->numNulls_;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  svint64_t loadGatherResult(svuint64_t ptr, svbool_t mask, int64_t idx) {
+    svint64_t value =
+        svld1_gather_u64base_offset_s64(mask, ptr, idx); // 这里要变
+    return value;
+  }
+
+  void storeScatterResult(svuint64_t ptr, svbool_t mask, svint64_t value, int64_t idx) {
+    svst1_scatter_u64base_offset_s64(mask, ptr, idx, value);
+  }
+
+  void hashAggUpdateSVEWithChar(
+      char** result,
+      uint64_t* bitmap1,
+      uint64_t* bitmap2,
+      int64_t* value,
+      int32_t begin,
+      int32_t end,
+      int mode1,
+      int mode2,
+      uint32_t* dic) {
+    uint8_t* bitmap1_8 = reinterpret_cast<uint8_t*>(bitmap1);
+    uint8_t* bitmap2_8 = reinterpret_cast<uint8_t*>(bitmap2);
+
+    int32_t firstWord =
+        roundUp(begin, 32) == begin ? begin : roundUp(begin, 32) - 32;
+    int32_t lastWord = roundUp(end, 32);
+    svbool_t mask, mask1, mask2;
+    svint64_t tmpValue;
+        // 注意这里的count是统计第几个元素，svbool_t去load，bitmap，一次性可以处理32个元素
+            for (int32_t count = firstWord; count + 32 <= lastWord; count += 32) {
+      int32_t arr8Index = count / 8;
+      if (bitmap2_8 != nullptr) {
+        mask2 = getBitMask(bitmap2_8, arr8Index, mode1, dic, end); // 一次取32个
+      }
+      __asm__ __volatile__("ldr %0, [%1]"
+                                 : "=Upl"(mask1)
+                                                            : "r"(&bitmap1_8[arr8Index])
+                           : "memory");
+      mask = svand_b_z(svptrue_b8(), mask1, mask2);
+      mask = svand_b_z(svptrue_b8(), mask, svwhilelt_b8(count, end));
+      if (!svptest_any(svptrue_b8(), mask)) {
+        continue;
+      }
+
+      svbool_t mask00 = svunpklo(mask);
+      svbool_t mask01 = svunpkhi(mask);
+      if (svptest_any(svptrue_b16(), mask00)) {
+        svbool_t mask10 = svunpklo(mask00);
+        if (svptest_any(svptrue_b32(), mask10)) {
+          svbool_t mask20 = svunpklo(mask10);
+          svbool_t mask21 = svunpkhi(mask10);
+          if (svptest_any(svptrue_b64(), mask20)) {
+            svint64_t tmpValue0;
+            tmpValue0 = getValueSVE(value, mode2, mask20, count, dic);
+            svuint64_t ptr =
+                svld1(mask20, reinterpret_cast<uint64_t*>(result + count));
+            clearNullSVE(ptr, mask20);
+            svint64_t tmpResult0 = loadGatherResult(ptr, mask20, this->getOffsetFromAgg());
+            tmpResult0 = svadd_m(mask20, tmpResult0, tmpValue0);
+            storeScatterResult(ptr, mask20, tmpResult0, this->getOffsetFromAgg());
+          }
+
+          if (svptest_any(svptrue_b64(), mask21)) {
+            svint64_t tmpValue1;
+            tmpValue1 = getValueSVE(value, mode2, mask21, 4 + count, dic);
+            svuint64_t ptr =
+                svld1(mask21, reinterpret_cast<uint64_t*>(result + count + 4));
+            clearNullSVE(ptr, mask21);
+            svint64_t tmpResult1 = loadGatherResult(ptr, mask21, this->getOffsetFromAgg());
+            tmpResult1 = svadd_m(mask21, tmpResult1, tmpValue1);
+            storeScatterResult(ptr, mask21, tmpResult1, this->getOffsetFromAgg());
+          }
+        }
+        svbool_t mask11 = svunpkhi(mask00);
+        if (svptest_any(svptrue_b32(), mask11)) {
+          svbool_t mask22 = svunpklo(mask11);
+          svbool_t mask23 = svunpkhi(mask11);
+          if (svptest_any(svptrue_b64(), mask22)) {
+            svint64_t tmpValue2;
+            tmpValue2 = getValueSVE(value, mode2, mask22, 8 + count, dic);
+            svuint64_t ptr =
+                svld1(mask22, reinterpret_cast<uint64_t*>(result + count + 8));
+            clearNullSVE(ptr, mask22);
+            svint64_t tmpResult2 = loadGatherResult(ptr, mask22, this->getOffsetFromAgg());
+            tmpResult2 = svadd_m(mask22, tmpResult2, tmpValue2);
+            storeScatterResult(ptr, mask22, tmpResult2, this->getOffsetFromAgg());
+          }
+
+          if (svptest_any(svptrue_b64(), mask23)) {
+            svint64_t tmpValue3;
+            tmpValue3 = getValueSVE(value, mode2, mask23, 12 + count, dic);
+            svuint64_t ptr =
+                svld1(mask23, reinterpret_cast<uint64_t*>(result + count + 12));
+            clearNullSVE(ptr, mask23);
+            svint64_t tmpResult3 = loadGatherResult(ptr, mask23, this->getOffsetFromAgg());
+            tmpResult3 = svadd_m(mask23, tmpResult3, tmpValue3);
+            storeScatterResult(ptr, mask23, tmpResult3, this->getOffsetFromAgg());
+          }
+        }
+      }
+
+      svbool_t mask12 = svunpklo(mask01);
+
+      if (svptest_any(svptrue_b16(), mask01)) {
+        svbool_t mask24 = svunpklo(mask12);
+        svbool_t mask25 = svunpkhi(mask12);
+        if (svptest_any(svptrue_b32(), mask12)) {
+          if (svptest_any(svptrue_b64(), mask24)) {
+            svint64_t tmpValue4;
+            tmpValue4 = getValueSVE(value, mode2, mask24, 16 + count, dic);
+            svuint64_t ptr =
+                svld1(mask24, reinterpret_cast<uint64_t*>(result + count + 16));
+            clearNullSVE(ptr, mask24);
+            svint64_t tmpResult4 = loadGatherResult(ptr, mask24, this->getOffsetFromAgg());
+            tmpResult4 = svadd_m(mask24, tmpResult4, tmpValue4);
+            storeScatterResult(ptr, mask24, tmpResult4, this->getOffsetFromAgg());
+          }
+
+          if (svptest_any(svptrue_b64(), mask25)) {
+            svint64_t tmpValue5;
+            tmpValue5 = getValueSVE(value, mode2, mask25, 20 + count, dic);
+            svuint64_t ptr =
+                svld1(mask25, reinterpret_cast<uint64_t*>(result + count + 20));
+            clearNullSVE(ptr, mask25);
+            svint64_t tmpResult5 = loadGatherResult(ptr, mask25, this->getOffsetFromAgg());
+            tmpResult5 = svadd_m(mask25, tmpResult5, tmpValue5);
+            storeScatterResult(ptr, mask25, tmpResult5, this->getOffsetFromAgg());
+          }
+        }
+        svbool_t mask13 = svunpkhi(mask01);
+
+        if (svptest_any(svptrue_b32(), mask13)) {
+          svbool_t mask26 = svunpklo(mask13);
+          svbool_t mask27 = svunpkhi(mask13);
+          if (svptest_any(svptrue_b64(), mask26)) {
+            svint64_t tmpValue6;
+            tmpValue6 = getValueSVE(value,  mode2, mask26, 24 + count, dic);
+            svuint64_t ptr =
+                svld1(mask26, reinterpret_cast<uint64_t*>(result + count + 24));
+            clearNullSVE(ptr, mask26);
+            svint64_t tmpResult6 = loadGatherResult(ptr, mask26, this->getOffsetFromAgg());
+            tmpResult6 = svadd_m(mask26, tmpResult6, tmpValue6);
+            storeScatterResult(ptr, mask26, tmpResult6, this->getOffsetFromAgg());
+          }
+
+          if (svptest_any(svptrue_b64(), mask27)) {
+            svint64_t tmpValue7;
+            tmpValue7 = getValueSVE(value, mode2, mask27, 28 + count, dic);
+            svuint64_t ptr =
+                svld1(mask27, reinterpret_cast<uint64_t*>(result + count + 28));
+            clearNullSVE(ptr, mask27);
+            svint64_t tmpResult7 = loadGatherResult(ptr, mask27, this->getOffsetFromAgg());
+            tmpResult7 = svadd_m(mask27, tmpResult7, tmpValue7);
+            storeScatterResult(ptr, mask27, tmpResult7, this->getOffsetFromAgg());
+          }
+        }
+      }
+    }
+  }
+
+  template <
+      bool tableHasNulls,
+      typename TData = ResultType,
+      typename TValue = TInput,
+      typename UpdateSingleValue>
+  void updateGroups(
+      char** groups,
+      const SelectivityVector& rows,
+      const VectorPtr& arg,
+      UpdateSingleValue updateSingleValue,
+      bool mayPushdown,
+      DecodedVector& decoded) {
+
+    if constexpr (kMayPushdown<TData>) {
+      auto encoding = decoded.base()->encoding();
+      if (encoding == VectorEncoding::Simple::LAZY &&
+          !arg->type()->isDecimal()) {
+        velox::aggregate::SimpleCallableHook<TData, UpdateSingleValue> hook(
+            exec::Aggregate::offset_,
+            exec::Aggregate::nullByte_,
+            exec::Aggregate::nullMask_,
+            groups,
+            &this->exec::Aggregate::numNulls_,
+            updateSingleValue);
+
+        auto indices = decoded.indices();
+        decoded.base()->as<const LazyVector>()->load(
+            RowSet(indices, arg->size()), &hook);
+        return;
+      }
+    }
+    // groups
+    // rows.bits
+    uint64_t* bitmask1 = rows.getBits();
+    // decode.bits
+    uint64_t* bitmask2 = decoded.getNulls();
+    // decode value
+    int64_t* value = reinterpret_cast<int64_t*>(decoded.getData());
+    // begin, end
+    vector_size_t begin = rows.getBegin();
+    vector_size_t end = rows.getEnd();
+
+    // mode1, mode2
+    int mode1 = decoded.getMode1();
+    int mode2 = decoded.getmode2();
+
+    // decode dic
+    vector_size_t* dic = decoded.getDic();
+
+    hashAggUpdateSVEWithChar(
+        groups,
+        bitmask1,
+        bitmask2,
+        value,
+        begin,
+        end,
+        mode1,
+        mode2,
+        reinterpret_cast<uint32_t*>(dic));
+  }
+
+  template <
+      bool tableHasNulls,
+      typename TDataType = TAccumulator,
+      typename Update>
+  inline void
+  updateNonNullValue(char* group, TDataType value, Update updateValue) {
+    if constexpr (tableHasNulls) {
+      exec::Aggregate::clearNull(group);
+    }
+    updateValue(*exec::Aggregate::value<TDataType>(group), value);
+  }
   // TData is used to store the updated sum state. It can be either
   // TAccumulator or TResult, which in most cases are the same, but for
   // sum(real) can differ. TValue is used to decode the sum input 'args'.
@@ -132,8 +546,14 @@ class SumAggregateBase
     }
 
     if (exec::Aggregate::numNulls_) {
-      BaseAggregate::template updateGroups<true, TData, TValue>(
+      DecodedVector decoded(*arg, rows, !mayPushdown);
+      if (std::is_same_v<TData, int8_t> && std::is_same_v<TValue, int8_t> && decoded.mayHaveNulls() && Overflow) {
+        updateGroups<true, TData, TValue>( // 在这个地方进行向量化改造
+          groups, rows, arg, &updateSingleValue<TData>, false, decoded);
+      } else {
+        BaseAggregate::template updateGroups<true, TData, TValue>( // 在这个地方进行向量化改造
           groups, rows, arg, &updateSingleValue<TData>, false);
+      }
     } else {
       BaseAggregate::template updateGroups<false, TData, TValue>(
           groups, rows, arg, &updateSingleValue<TData>, false);

@@ -176,6 +176,17 @@ class DecodedVector {
     return indices_[idx];
   }
 
+  int getmode2() const {
+    if (isIdentityMapping_) {
+      return 1;
+    }
+    if (isConstantMapping_) {
+      return 2;
+    }
+    VELOX_DCHECK(indices_);
+    return 3;
+  }
+
   /// Returns a scalar value for the top-level row 'idx'.
   template <typename T>
   T valueAt(vector_size_t idx) const {
@@ -208,6 +219,26 @@ class DecodedVector {
 
     VELOX_DCHECK(indices_);
     return bits::isBitNull(nulls_, indices_[idx]);
+  }
+
+  int getMode1() {
+    if (!nulls_) {
+      return 0;
+    }
+
+    if (isIdentityMapping_ || hasExtraNulls_) {
+      return 1;
+    }
+
+    if (isConstantMapping_) {
+      return 2;
+    }
+
+    return 3;
+  }
+
+  vector_size_t* getDic() {
+    return const_cast<vector_size_t*>(indices_);
   }
 
   /// Returns the largest decoded row number + 1, i.e. rows.end().
@@ -295,6 +326,14 @@ class DecodedVector {
 
   /// Pre-allocated vector of 0, 1, 2,..
   static const std::vector<vector_size_t>& consecutiveIndices();
+
+  uint64_t* getNulls() {
+    return const_cast<uint64_t*>(nulls_);
+  }
+
+  void* getData() {
+    return const_cast<void*>(data_);
+  }
 
  private:
   DecodedVector(
