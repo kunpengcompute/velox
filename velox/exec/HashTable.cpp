@@ -566,6 +566,12 @@ void HashTable<ignoreNullKeys>:: groupNormalizedKeyProbeScalar(HashLookup& looku
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::groupNormalizedKeyProbe(HashLookup& lookup) {
+  if (normalizedKeyMode_ == NormalizedKeyMode::scalar) {
+    // TODO scalar2
+    groupNormalizedKeyProbeScalar(lookup);
+    return;
+  }
+
   ProbeState state1;
   ProbeState state2;
   ProbeState state3;
