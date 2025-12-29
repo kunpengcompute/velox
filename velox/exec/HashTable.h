@@ -121,6 +121,8 @@ class BaseHashTable {
   /// Specifies the hash mode of a table.
   enum class HashMode { kHash, kArray, kNormalizedKey };
 
+  enum class NormalizedKeyMode {nativeVelox, scalar, sve}; // TODO scalar2
+
   static constexpr int8_t kNoSpillInputStartPartitionBit = -1;
 
   /// The name of the runtime stats collected and reported by operators that use
@@ -888,6 +890,8 @@ class HashTable : public BaseHashTable {
   // Shortcut path for group by with normalized keys.
   void groupNormalizedKeyProbe(HashLookup& lookup);
 
+  void groupNormalizedKeyProbeScalar(HashLookup& lookup); // TODO scalar2
+
   // Array probe with SIMD.
   void arrayJoinProbe(HashLookup& lookup);
 
@@ -1053,6 +1057,7 @@ class HashTable : public BaseHashTable {
   // Counts the number of rehash() calls.
   int64_t numRehashes_{0};
   HashMode hashMode_ = HashMode::kArray;
+  NormalizedKeyMode normalizedKeyMode_ = NormalizedKeyMode::scalar; // TODO scalar2
   // Owns the memory of multiple build side hash join tables that are
   // combined into a single probe hash table.
   std::vector<std::unique_ptr<HashTable<ignoreNullKeys>>> otherTables_;

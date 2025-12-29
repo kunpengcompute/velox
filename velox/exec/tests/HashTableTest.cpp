@@ -987,6 +987,45 @@ TEST_P(HashTableTest, checkSizeValidation) {
   ASSERT_EQ(table->capacity(), 512 << 10);
 }
 
+TEST_P(HashTableTest, NormalizedKeyMode_scalarExecution) { // normalized key mode
+  // TODO scalar2 bug: reinterpret_cast<sveht::KeyValue*>(table_)[3589192].value!=NULL after computeValueIds
+  //    quick-fix: in allocateTables(): table_ = (char**) malloc(byteSize);
+
+  // prepare table
+  auto rowType = ROW({"a"}, {BIGINT()});
+  auto table_ptr = createHashTableForAggregation(rowType, 1);
+  HashTable<false>& table = *table_ptr;
+
+  // prepare input rowVector
+  auto input_ptr = makeRowVector({
+      makeFlatVector<int64_t>(200'0000, [](auto row) { return row; }),
+  }); // 这样rangesWithReserve就会超过kArrayHashMaxSize=2097152，于是decideHashMode是normalizedKey
+  const RowVector& input = *input_ptr;
+
+  // prepare lookup
+  auto lookup_ptr = std::make_unique<HashLookup>(table.hashers());
+  HashLookup& lookup = *lookup_ptr;
+
+  // prepare lookup.rows
+  SelectivityVector rows(input_ptr->size());
+
+  table.prepareForGroupProbe(
+      lookup,
+      input_ptr,
+      rows,
+      BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  // group probe table using lookup and record results in lookup.hits
+  table.groupProbe(lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  // for (auto i = 0; i < lookup.rows.size(); ++i) {
+  for (auto i = 0; i < 5; ++i) {
+    std::cout << "groupProbe " << i << ": " << *reinterpret_cast<int64_t*>(lookup.hits[i]) << std::endl;
+  }
+
+  std::cout << table.hashMode() << std::endl;
+}
+
 TEST_P(HashTableTest, listNullKeyRows) {
   VectorPtr keys = makeFlatVector<int64_t>(500, folly::identity);
   testListNullKeyRows(keys, BaseHashTable::HashMode::kArray);

@@ -318,6 +318,13 @@ void HashTable<ignoreNullKeys>::storeRowPointer(
     reinterpret_cast<char**>(table_)[index] = row;
     return;
   }
+  if (hashMode_ == HashMode::kNormalizedKey && normalizedKeyMode_ == NormalizedKeyMode::scalar) {
+    // TODO scalar2
+    auto* table = reinterpret_cast<sveht::KeyValue*>(table_);
+    table[index].key = reinterpret_cast<normalized_key_t*>(row)[-1]; // 保存normalizedKey，TODO 所以在storeKey函数中还是要在group行-1位置保存normalizedKey!
+    table[index].value = row;
+    return;
+  }
   const int64_t offset = bucketOffset(index);
   auto* bucket = bucketAt(offset);
   const auto slotIndex = index & (sizeof(TagVector) - 1);
@@ -333,13 +340,19 @@ char* HashTable<ignoreNullKeys>::insertEntry(
   char* group = rows_->newRow();
   lookup.hits[row] = group; // NOLINT
   storeKeys(lookup, row);
-  storeRowPointer(index, lookup.hashes[row], group);
+
   if (hashMode_ == HashMode::kNormalizedKey) {
+    // TODO scalar2 这一步提前，因为storeRowPointer函数要改造依赖group行-1位置保存的normalizedKey
+    // TODO scalar2 都要存normalizedKey，因为下面storeRowPointer函数里要从group行-1位置取出normalizedKey放到table key
     // We store the unique digest of key values (normalized key) in
     // the word below the row. Space was reserved in the allocation
     // unless we have given up on normalized keys.
     RowContainer::normalizedKey(group) = lookup.normalizedKeys[row]; // NOLINT
   }
+
+  // TODO scalar2 storeRowPointer函数要改造依赖group行-1位置保存的normalizedKey
+  storeRowPointer(index, lookup.hashes[row], group);
+
   ++numDistinct_;
   lookup.newGroups.push_back(row);
   return group;
@@ -498,6 +511,56 @@ void HashTable<ignoreNullKeys>::groupProbe(
     state1.preProbe(*this, lookup.hashes[row], row);
     state1.firstProbe(*this, 0);
     fullProbe<false>(lookup, state1, false);
+  }
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>:: groupNormalizedKeyProbeScalar(HashLookup& lookup) {
+  // TODO scalar2
+  // TODO 暂时不管ignoreNullKeys
+
+  VELOX_DCHECK(!lookup.hashes.empty());
+  VELOX_DCHECK(!lookup.hits.empty());
+
+  int32_t numProbes = lookup.rows.size();
+  const vector_size_t* rows = lookup.rows.data();
+  auto hashes = lookup.hashes.data();
+  auto groups = lookup.hits.data();
+  int32_t i = 0;
+
+  auto* table = reinterpret_cast<sveht::KeyValue*>(table_);
+
+  for (; i < numProbes; ++i) {
+    // sveht::build_scalar(build_keys.data(),build_values.data(),build_keys.size(),p,table.data());
+    // int ret = build_single_key(build_keys[i], build_values[i], p, table);
+
+    auto row = rows[i];
+    uint64_t index = hashes[row] & (capacity_ - 1);
+    // VELOX_DCHECK_LT(index, capacity_);
+
+    // std::cout << i << " "<< lookup.normalizedKeys[i] << std::endl; // TODO scalar2 debug
+
+    // 标量线性探测：
+    uint64_t start = index;
+    while (true) {
+      char* group  = table[index].value;
+      if (UNLIKELY(!table[index].value)) { // 空桶标记 用char*空指针来判断 TODO scalar2 unlikely?
+        group = insertEntry(lookup, index, row); // key来自lookup&hasher->decodedVector()&row
+        break;
+      }
+      if (RowContainer::normalizedKey(group) == lookup.normalizedKeys[row]) {
+        // TODO scalar2 直接比较normalizedKey
+        groups[row] = group; // NOLINT
+        break;
+      }
+      index = (index + 1) & (capacity_ - 1); // 线性探测
+      if (index == start) {
+        // return 2; // table full
+        // Throws here if we have looped through all the buckets in the table.
+        VELOX_FAIL(
+            "Have looped through all the buckets in table: {}", (*this).toString()); // TODO scalar
+      }
+    }
   }
 }
 
@@ -713,7 +776,14 @@ void HashTable<ignoreNullKeys>::allocateTables(
   VELOX_CHECK(bits::isPowerOfTwo(size), "Size is not a power of two: {}", size);
   VELOX_CHECK_GT(size, 0);
   capacity_ = size;
-  const uint64_t byteSize = capacity_ * tableSlotSize();
+  // const uint64_t byteSize = capacity_ * tableSlotSize();
+  size_t slotSize; // TODO scalar2
+  if (hashMode_ == HashMode::kNormalizedKey && normalizedKeyMode_ == NormalizedKeyMode::scalar) {
+    slotSize = 16; // 8-byte normalizedKey + 8-byte group ptr
+  } else {
+    slotSize = tableSlotSize(); // BaseHashTable method has no hashMode_ attribute
+  }
+  const uint64_t byteSize = capacity_ * slotSize;
   VELOX_CHECK_EQ(byteSize % kBucketSize, 0);
   numTombstones_ = 0;
   sizeMask_ = byteSize - 1;
@@ -727,8 +797,10 @@ void HashTable<ignoreNullKeys>::allocateTables(
   const auto numPages =
       memory::AllocationTraits::numPages(size * tableSlotSize());
   rows_->pool()->allocateContiguous(numPages, tableAllocation_);
-  table_ = tableAllocation_.data<char*>();
-  ::memset(table_, 0, capacity_ * sizeof(char*));
+  // table_ = tableAllocation_.data<char*>();
+  // TODO scalar2 bug: reinterpret_cast<sveht::KeyValue*>(table_)[3589192].value!=NULL after computeValueIds
+  table_ = (char**) malloc(byteSize); // TODO scalar2 bug quick-fix
+  ::memset(table_, 0, capacity_ * slotSize);
 }
 
 template <bool ignoreNullKeys>
@@ -1123,7 +1195,28 @@ void HashTable<ignoreNullKeys>::insertForGroupBy(
       VELOX_CHECK_NULL(table_[index]);
       table_[index] = groups[i];
     }
-  } else {
+  }
+  else if (hashMode_ == HashMode::kNormalizedKey && normalizedKeyMode_ == NormalizedKeyMode::scalar) { // TODO scalar2
+    auto* table = reinterpret_cast<sveht::KeyValue*>(table_);
+    for (auto i = 0; i < numGroups; ++i) {
+      uint64_t index = hashes[i] & (capacity_ - 1);
+      uint64_t start = index;
+      while (true) {
+        char* group  = table[index].value;
+        if (UNLIKELY(!table[index].value)) { // 空桶插入
+          // NOTE 现在空指针就可以判断空桶，不需要initialize empty table
+          // NOTE 此处不必线性探测对非空桶判断是否键相等，因为此处是把旧表数据迁移到新表，而旧的哈希表里的分组都是unique的，因此这里只需要为每个分组数据找到空桶插入即可。
+          table[index].key = reinterpret_cast<normalized_key_t*>(groups[i])[-1]; // 从group -1位置取出normalizedKey放到hash table里
+          table[index].value = groups[i];
+          break;
+        }
+        index = (index + 1) & (capacity_ - 1); // linear probing
+          VELOX_FAIL("Have looped through all the buckets in table: {}", (*this).toString());
+        }
+      }
+    }
+  }
+  else {
     constexpr int32_t kPrefetchDistance = 10;
     for (int32_t i = 0; i < numGroups; ++i) {
       auto hash = hashes[i];
