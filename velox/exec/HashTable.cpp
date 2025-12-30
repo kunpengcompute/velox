@@ -462,6 +462,155 @@ void populateNormalizedKeys(HashLookup& lookup, int8_t sizeBits) {
 }
 } // namespace
 
+#define LANE_COUNT 4
+
+void step1_load_keys(const uint64_t* new_key,  const svbool_t inv_mask, svuint64_t& prev_key) {
+  svbool_t pg       = svptrue_b64();
+  svuint64_t newk = svld1(inv_mask, new_key);
+
+  svbool_t active_mask = svnot_b_z(pg, inv_mask);
+  svuint64_t oldk   = svld1(active_mask, (const uint64_t*)&prev_key);
+  prev_key = svorr_z(svptrue_b64(), newk, oldk);
+
+}
+
+void step3_gather_build(const KeyValue* table, svuint64_t h, svuint64_t& tab_key) {
+  svbool_t pg    = svptrue_b64();
+  // Compute byte offsets = h * sizeof(KeyValue) = h * 16
+  svuint64_t offset = svlsl_n_u64_z(pg, h, 4);  // 2^4 = 16
+  tab_key = svld1_gather_u64offset_u64(pg, &table[0].key, offset);
+}
+void step3_gather_build_value(KeyValue* table, svuint64_t h, svuint64_t& tab_key) {
+  svbool_t pg    = svptrue_b64();
+  // Compute byte offsets = h * sizeof(KeyValue) = h * 16
+  svuint64_t offset = svlsl_n_u64_z(pg, h, 4);  // 2^4 = 16
+  tab_key = svld1_gather_u64offset_u64(pg, &table[0].key + 8, offset);
+}
+
+inline __attribute__((always_inline)) svbool_t get_uniq_mask(svbool_t pg, svuint64_t val) {
+  svuint64_t count;
+  uint64_t vals[LANE_COUNT];
+  svst1(pg, vals, val);
+  uint64_t counts[LANE_COUNT] = {1,1,1,1};
+  std::unordered_set<int> unique_counts;
+
+  for (int i = 0; i < LANE_COUNT; i++) {
+    if (unique_counts.find(i) != unique_counts.end()) {
+      counts[i] = 0;
+      continue;
+    }
+    for (int j = i + 1; j < LANE_COUNT; j++) {
+      if (vals[j] == vals[i]) {
+        counts[i]++;
+        unique_counts.emplace(j);
+      }
+    }
+  }
+  count = svld1(pg, counts);
+  svbool_t mask = svcmpgt_n_u64(pg, count, 0);
+
+  return mask;
+}
+
+/**
+ * @brief Group normalized keys and probe the hash table.
+ *
+ * This function processes a batch of keys, normalizes them, and probes a hash table to find matches.
+ * It uses SVE (Scalable Vector Extension) instructions for vectorized processing.
+ *
+ * @param numProbes The number of keys to process.
+ * @param rows Array of row indices, indicating the position of each key in the input arrays.
+ * @param hashes Array of precomputed hash values for each key.
+ * @param groups Output array where the resulting group values will be stored.
+ * @param normalizeKey Array of normalized keys to be processed.
+ * @param table The hash table to be probed, represented as an array of KeyValue structures.
+ * @param capacity_ The capacity of the hash table (must be a power of 2).
+ */
+
+// void groupNormalizedKeyProbeSVE(int32_t numProbes, const int32_t* rows, const uint64_t* hashes, char** groups, const uint64_t* normalizeKey, KeyValue* table, uint64_t capacity_) {
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>:: groupNormalizedKeyProbeSVE(HashLookup& lookup) {
+  int32_t numProbes = lookup.rows.size();
+  const int32_t* rows = lookup.rows.data();
+  auto hashes = lookup.hashes.data();
+  auto groups = lookup.hits.data();
+  auto normalizeKey = lookup.normalizedKeys.data();
+
+  auto* table = reinterpret_cast<KeyValue*>(table_);
+
+  // Core vector build loop for this group
+  svbool_t inv_mask = svptrue_b64();
+  svuint64_t key_vec = svdup_n_u64(0);
+  svuint64_t val_vec = svdup_n_u64(0);
+  svuint64_t tab_key = svdup_n_u64(0);
+  svuint64_t off = svdup_n_u64(0);
+  svuint64_t dummy_payload = svdup_n_u64(0);
+  svuint64_t curr_index = svdup_n_u64(0);
+  svuint64_t index_vec = svindex_u64(0, 1);
+
+  // 取第i行并标记hash值
+  // auto row = rows[i];
+  // uint64_t index = hashes[row] & (capacity_ - 1);
+
+  int i = 0, iter = 0, inc_i = 0, inc_o = 0;
+  const int sve64Width = 4;
+  while (i < numProbes) {
+    svbool_t pgTrue = svptrue_b64();
+    svbool_t pgI = svwhilelt_b64(i, numProbes);
+
+    svbool_t active_mask = svnot_b_z(pgTrue, inv_mask);
+    active_mask = svand_b_z(pgTrue, active_mask, pgI);
+    inv_mask = svand_b_z(pgTrue, inv_mask, pgI);
+    curr_index = svadd_n_u64_z(active_mask, curr_index, 1); // 线性探测法
+
+    svint64_t rowId = svld1sw_s64(inv_mask, rows + i);
+    svuint64_t new_h = svld1_gather_index(inv_mask, hashes, rowId);
+    curr_index = svorr_z(pgI, curr_index, new_h);
+    curr_index = svand_n_u64_z(pgI, curr_index, capacity_ - 1);
+
+    step3_gather_build(table, curr_index, tab_key);
+    svbool_t empty_mask = svcmpeq_n_u64(pgI, tab_key, 0); // TODO: 疑问Normalized key能不能是0
+    svbool_t index_mask = get_uniq_mask(pgI, curr_index); // 选出index可以不重复的地方，如果重复了，剩下的点置位0
+    svbool_t to_write_mask = svand_z(pgI, index_mask, empty_mask); // 选出需要写入的地方
+    // 更新hash表中的key
+    svuint64_t byte_off = svlsl_n_u64_z(pgI, curr_index, 4);
+    step1_load_keys(normalizeKey + i, inv_mask,key_vec); // normalizekey在key_vec里面
+    svst1_scatter_u64offset_u64(to_write_mask, &table[0].key, byte_off, key_vec);
+
+    // 空的地方要执行insertEntry
+    svuint64_t compacted_indices = svcompact_u64(to_write_mask, index_vec);
+    uint32_t active_count = svcntp_b64(svptrue_b64(), to_write_mask);
+    uint32_t active_indices[4]; // 使用svcntw()获取当前矢量宽度下32位元素的最大数量，这是一种安全的做法。
+    svst1w(svptrue_b32(), active_indices, compacted_indices);
+
+    uint64_t indices[4] = {0}; // 使用svcntw()获取当前矢量宽度下32位元素的最大数量，这是一种安全的做法。
+    svst1(to_write_mask, indices, curr_index);
+
+    for (int j = 0; j < active_count; j++) {
+      // table[indices[active_indices[j]]].value = insertEntry(lookup, indices[active_indices[j]], i + j);
+      table[indices[active_indices[j]]].value = (char*)malloc(100 * sizeof(char));
+      groups[i + j] = table[indices[active_indices[j]]].value;
+    }
+
+    // 处理位置非空的地方，直接在hits中存group
+    svbool_t not_empty = svnot_b_z(pgTrue, empty_mask);
+
+    svbool_t match = svcmpeq(pgI, tab_key, key_vec); // TODO:match直接赋值进hits就好
+    step3_gather_build_value(table, curr_index, val_vec);
+    svst1_scatter_u64index_u64(match, reinterpret_cast<uint64_t*>(groups), curr_index, val_vec);
+
+    inv_mask = svorr_b_z(pgI, match, to_write_mask);
+    svbool_t still_active_mask = svnot_b_z(pgI, inv_mask);
+
+    curr_index = svcompact(still_active_mask, curr_index);
+    key_vec = svcompact(still_active_mask, key_vec);
+    int num = svcntp_b64(pgI, inv_mask);
+    svbool_t active_lanes = svwhilelt_b64_s64(0, 4 - num);
+    inv_mask = svnot_b_z(pgI, active_lanes);
+    i += num;
+  }
+}
+
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::groupProbe(
     HashLookup& lookup,
@@ -559,6 +708,8 @@ void HashTable<ignoreNullKeys>:: groupNormalizedKeyProbeScalar(HashLookup& looku
     }
   }
 }
+
+
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::groupNormalizedKeyProbe(HashLookup& lookup) {

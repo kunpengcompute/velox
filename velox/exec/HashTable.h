@@ -892,6 +892,8 @@ class HashTable : public BaseHashTable {
 
   void groupNormalizedKeyProbeScalar(HashLookup& lookup); // TODO scalar2
 
+  void groupNormalizedKeyProbeSVE(HashLookup& lookup); // TODO scalar2
+
   // Array probe with SIMD.
   void arrayJoinProbe(HashLookup& lookup);
 
