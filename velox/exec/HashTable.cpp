@@ -24,6 +24,7 @@
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/vector/VectorTypeUtils.h"
+#include "sveht/src/sve_hash.hpp"
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -1210,7 +1211,6 @@ void HashTable<ignoreNullKeys>::insertForGroupBy(
         }
         index = (index + 1) & (capacity_ - 1); // linear probing
           VELOX_FAIL("Have looped through all the buckets in table: {}", (*this).toString());
-        }
       }
     }
   }

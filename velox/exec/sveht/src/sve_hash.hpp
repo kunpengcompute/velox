@@ -16,7 +16,7 @@ namespace sveht {
 //   // Total: 16 bytes
 // };
 
-struct alignas(64) KeyValue { // TODO 需要alignas(64)吗？
+struct KeyValue { // TODO 需要alignas(64)吗？
   uint64_t key; // TODO scalar2 this key is 8-byte normalizedKey computed by Velox
   char* value;
   // Total: 16 bytes
