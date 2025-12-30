@@ -988,9 +988,6 @@ TEST_P(HashTableTest, checkSizeValidation) {
 }
 
 TEST_P(HashTableTest, NormalizedKeyMode_scalarExecution) { // normalized key mode
-  // TODO scalar2 bug: reinterpret_cast<sveht::KeyValue*>(table_)[3589192].value!=NULL after computeValueIds
-  //    quick-fix: in allocateTables(): table_ = (char**) malloc(byteSize);
-
   // prepare table
   auto rowType = ROW({"a"}, {BIGINT()});
   auto table_ptr = createHashTableForAggregation(rowType, 1);

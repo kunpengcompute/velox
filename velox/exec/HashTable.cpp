@@ -538,8 +538,6 @@ void HashTable<ignoreNullKeys>:: groupNormalizedKeyProbeScalar(HashLookup& looku
     uint64_t index = hashes[row] & (capacity_ - 1);
     // VELOX_DCHECK_LT(index, capacity_);
 
-    // std::cout << i << " "<< lookup.normalizedKeys[i] << std::endl; // TODO scalar2 debug
-
     // 标量线性探测：
     uint64_t start = index;
     while (true) {
@@ -548,17 +546,14 @@ void HashTable<ignoreNullKeys>:: groupNormalizedKeyProbeScalar(HashLookup& looku
         group = insertEntry(lookup, index, row); // key来自lookup&hasher->decodedVector()&row
         break;
       }
-      if (RowContainer::normalizedKey(group) == lookup.normalizedKeys[row]) {
-        // TODO scalar2 直接比较normalizedKey
+      // if (RowContainer::normalizedKey(group) == lookup.normalizedKeys[row]) { // 直接比较normalizedKey
+	  if (table[index].key == lookup.normalizedKeys[row]) { // 直接比较normalizedKey，而且直接从table里取出来，而不是从group里
         groups[row] = group; // NOLINT
         break;
       }
       index = (index + 1) & (capacity_ - 1); // 线性探测
       if (index == start) {
-        // return 2; // table full
-        // Throws here if we have looped through all the buckets in the table.
-        VELOX_FAIL(
-            "Have looped through all the buckets in table: {}", (*this).toString()); // TODO scalar
+        VELOX_FAIL("Have looped through all the buckets in table: {}", (*this).toString());
       }
     }
   }
@@ -782,13 +777,12 @@ void HashTable<ignoreNullKeys>::allocateTables(
   VELOX_CHECK(bits::isPowerOfTwo(size), "Size is not a power of two: {}", size);
   VELOX_CHECK_GT(size, 0);
   capacity_ = size;
-  // const uint64_t byteSize = capacity_ * tableSlotSize();
   size_t slotSize; // TODO scalar2
   if (hashMode_ == HashMode::kNormalizedKey && normalizedKeyMode_ == NormalizedKeyMode::scalar) {
     slotSize = 16; // 8-byte normalizedKey + 8-byte group ptr
   } else {
     slotSize = tableSlotSize(); // BaseHashTable method has no hashMode_ attribute
-  }
+  } // ATTENTION: DO NOT USE tableSlotSize() below, use slotSize instead!!!!
   const uint64_t byteSize = capacity_ * slotSize;
   VELOX_CHECK_EQ(byteSize % kBucketSize, 0);
   numTombstones_ = 0;
@@ -801,11 +795,9 @@ void HashTable<ignoreNullKeys>::allocateTables(
   // tags and 16 * 6 bytes of pointers and a padding of 16 bytes to round up the
   // cache line.
   const auto numPages =
-      memory::AllocationTraits::numPages(size * tableSlotSize());
+      memory::AllocationTraits::numPages(size * slotSize); // size is capacity_
   rows_->pool()->allocateContiguous(numPages, tableAllocation_);
-  // table_ = tableAllocation_.data<char*>();
-  // TODO scalar2 bug: reinterpret_cast<sveht::KeyValue*>(table_)[3589192].value!=NULL after computeValueIds
-  table_ = (char**) malloc(byteSize); // TODO scalar2 bug quick-fix
+  table_ = tableAllocation_.data<char*>();
   ::memset(table_, 0, capacity_ * slotSize);
 }
 
