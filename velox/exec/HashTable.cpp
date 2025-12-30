@@ -319,7 +319,7 @@ void HashTable<ignoreNullKeys>::storeRowPointer(
     reinterpret_cast<char**>(table_)[index] = row;
     return;
   }
-  if (hashMode_ == HashMode::kNormalizedKey && normalizedKeyMode_ == NormalizedKeyMode::scalar) {
+  if (hashMode_ == HashMode::kNormalizedKey && normalizedKeyMode_ == NormalizedKeyMode::scalar) { // TODO NOTE sve不调用这里，而是自行向量化
     // TODO scalar2
     auto* table = reinterpret_cast<sveht::KeyValue*>(table_);
     table[index].key = reinterpret_cast<normalized_key_t*>(row)[-1]; // 保存normalizedKey，TODO 所以在storeKey函数中还是要在group行-1位置保存normalizedKey!
@@ -930,7 +930,7 @@ void HashTable<ignoreNullKeys>::allocateTables(
   VELOX_CHECK_GT(size, 0);
   capacity_ = size;
   size_t slotSize; // TODO scalar2
-  if (hashMode_ == HashMode::kNormalizedKey && normalizedKeyMode_ == NormalizedKeyMode::scalar) {
+  if (hashMode_ == HashMode::kNormalizedKey && normalizedKeyMode_ != NormalizedKeyMode::nativeVelox) {
     slotSize = 16; // 8-byte normalizedKey + 8-byte group ptr
   } else {
     slotSize = tableSlotSize(); // BaseHashTable method has no hashMode_ attribute
@@ -1346,7 +1346,8 @@ void HashTable<ignoreNullKeys>::insertForGroupBy(
       table_[index] = groups[i];
     }
   }
-  else if (hashMode_ == HashMode::kNormalizedKey && normalizedKeyMode_ == NormalizedKeyMode::scalar) { // TODO scalar2
+  else if (hashMode_ == HashMode::kNormalizedKey && normalizedKeyMode_ != NormalizedKeyMode::nativeVelox) { // TODO scalar2
+    // 假设不会二次切换哈希模式，即哈希表里没有旧数据要迁移(numDistinct_=0)，假设不需要扩容的假设，于是此处暂时scalar实现，未来再向量化
     auto* table = reinterpret_cast<sveht::KeyValue*>(table_);
     for (auto i = 0; i < numGroups; ++i) {
       uint64_t index = hashes[i] & (capacity_ - 1);
@@ -1361,7 +1362,9 @@ void HashTable<ignoreNullKeys>::insertForGroupBy(
           break;
         }
         index = (index + 1) & (capacity_ - 1); // linear probing
+        if (index == start) {
           VELOX_FAIL("Have looped through all the buckets in table: {}", (*this).toString());
+        }
       }
     }
   }
