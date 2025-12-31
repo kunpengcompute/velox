@@ -547,7 +547,7 @@ class SumAggregateBase
 
     if (exec::Aggregate::numNulls_) {
       DecodedVector decoded(*arg, rows, !mayPushdown);
-      if (std::is_same_v<TData, int8_t> && std::is_same_v<TValue, int8_t> && decoded.mayHaveNulls() && Overflow) {
+      if (std::is_same_v<TData, int64_t> && std::is_same_v<TValue, int64_t> && decoded.mayHaveNulls() && Overflow) {
         updateGroups<true, TData, TValue>( // 在这个地方进行向量化改造
           groups, rows, arg, &updateSingleValue<TData>, false, decoded);
       } else {

@@ -314,12 +314,12 @@ template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::storeRowPointer(
     uint64_t index,
     uint64_t hash,
-    char* row) {
+    char* row) { // TODO scala2 NOTE this function is used by both HashAgg and HashJoin
   if (hashMode_ == HashMode::kArray) {
     reinterpret_cast<char**>(table_)[index] = row;
     return;
   }
-  if (hashMode_ == HashMode::kNormalizedKey && normalizedKeyMode_ == NormalizedKeyMode::scalar) { // TODO NOTE sve不调用这里，而是自行向量化
+  if (hashMode_ == HashMode::kNormalizedKey && normalizedKeyMode_ == NormalizedKeyMode::scalar && !isJoinBuild_) { // TODO NOTE sve不调用这里，而是自行向量化
     // TODO scalar2
     auto* table = reinterpret_cast<sveht::KeyValue*>(table_);
     table[index].key = reinterpret_cast<normalized_key_t*>(row)[-1]; // 保存normalizedKey，TODO 所以在storeKey函数中还是要在group行-1位置保存normalizedKey!
@@ -925,12 +925,12 @@ void HashTable<ignoreNullKeys>::joinNormalizedKeyProbe(HashLookup& lookup) {
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::allocateTables(
     uint64_t size,
-    int8_t spillInputStartPartitionBit) {
+    int8_t spillInputStartPartitionBit) { // TODO scala2 NOTE this function is used by both HashAgg and HashJoin
   VELOX_CHECK(bits::isPowerOfTwo(size), "Size is not a power of two: {}", size);
   VELOX_CHECK_GT(size, 0);
   capacity_ = size;
   size_t slotSize; // TODO scalar2
-  if (hashMode_ == HashMode::kNormalizedKey && normalizedKeyMode_ != NormalizedKeyMode::nativeVelox) {
+  if (hashMode_ == HashMode::kNormalizedKey && normalizedKeyMode_ != NormalizedKeyMode::nativeVelox && !isJoinBuild_) {
     slotSize = 16; // 8-byte normalizedKey + 8-byte group ptr
   } else {
     slotSize = tableSlotSize(); // BaseHashTable method has no hashMode_ attribute
