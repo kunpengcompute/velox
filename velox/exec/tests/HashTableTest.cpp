@@ -995,7 +995,7 @@ TEST_P(HashTableTest, NormalizedKeyMode_scalarExecution) { // normalized key mod
 
   // prepare input rowVector
   auto input_ptr = makeRowVector({
-      makeFlatVector<int64_t>(200'0000, [](auto row) { return row; }),
+      makeFlatVector<int64_t>(2000000, [](auto row) { return row; }),
   }); // 这样rangesWithReserve就会超过kArrayHashMaxSize=2097152，于是decideHashMode是normalizedKey
   const RowVector& input = *input_ptr;
 

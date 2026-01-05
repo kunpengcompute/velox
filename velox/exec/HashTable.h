@@ -879,6 +879,8 @@ class HashTable : public BaseHashTable {
       raw_vector<uint64_t>& hashes);
 
   char* insertEntry(HashLookup& lookup, uint64_t index, vector_size_t row);
+  char*
+  insertEntryforSVE(HashLookup& lookup, uint64_t index, vector_size_t row);
 
   bool compareKeys(const char* group, HashLookup& lookup, vector_size_t row);
 
@@ -1059,7 +1061,7 @@ class HashTable : public BaseHashTable {
   // Counts the number of rehash() calls.
   int64_t numRehashes_{0};
   HashMode hashMode_ = HashMode::kArray;
-  NormalizedKeyMode normalizedKeyMode_ = NormalizedKeyMode::scalar; // TODO scalar2
+  NormalizedKeyMode normalizedKeyMode_ = NormalizedKeyMode::sve ; // TODO scalar2，NormalizedKeyMode::sve\NormalizedKeyMode::scalar
   // Owns the memory of multiple build side hash join tables that are
   // combined into a single probe hash table.
   std::vector<std::unique_ptr<HashTable<ignoreNullKeys>>> otherTables_;
