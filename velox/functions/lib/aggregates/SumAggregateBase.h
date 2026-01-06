@@ -453,6 +453,172 @@ class SumAggregateBase
     }
   }
 
+    void hashAggUpdateSVEWithCharForNormal(
+      char** result,
+      uint64_t* bitmap1,
+      uint64_t* bitmap2,
+      int64_t* value,
+      int32_t begin,
+      int32_t end,
+      int mode1,
+      int mode2,
+      uint32_t* dic) {
+    uint8_t* bitmap1_8 = reinterpret_cast<uint8_t*>(bitmap1);
+    uint8_t* bitmap2_8 = reinterpret_cast<uint8_t*>(bitmap2);
+
+    int32_t firstWord =
+        roundUp(begin, 32) == begin ? begin : roundUp(begin, 32) - 32;
+    int32_t lastWord = roundUp(end, 32);
+    svbool_t mask, mask1, mask2;
+    svint64_t tmpValue;
+        // 注意这里的count是统计第几个元素，svbool_t去load，bitmap，一次性可以处理32个元素
+            for (int32_t count = firstWord; count + 32 <= lastWord; count += 32) {
+      int32_t arr8Index = count / 8;
+      if (bitmap2_8 != nullptr) {
+        mask2 = getBitMask(bitmap2_8, arr8Index, mode1, dic, end); // 一次取32个
+      }
+      __asm__ __volatile__("ldr %0, [%1]"
+                                 : "=Upl"(mask1)
+                                                            : "r"(&bitmap1_8[arr8Index])
+                           : "memory");
+      mask = svand_b_z(svptrue_b8(), mask1, mask2);
+      mask = svand_b_z(svptrue_b8(), mask, svwhilelt_b8(count, end));
+      if (!svptest_any(svptrue_b8(), mask)) {
+        continue;
+      }
+
+      svbool_t mask00 = svunpklo(mask);
+      svbool_t mask01 = svunpkhi(mask);
+      if (svptest_any(svptrue_b16(), mask00)) {
+        svbool_t mask10 = svunpklo(mask00);
+        if (svptest_any(svptrue_b32(), mask10)) {
+          svbool_t mask20 = svunpklo(mask10);
+          svbool_t mask21 = svunpkhi(mask10);
+          if (svptest_any(svptrue_b64(), mask20)) {
+            svuint64_t ptr =
+                svld1(mask20, reinterpret_cast<uint64_t*>(result + count));
+            clearNullSVE(ptr, mask20);
+            uint8_t flag0[4] = {0, 0, 0, 0};
+            __asm__ __volatile__("str %1, [%0]": : "r" (&flag0[0]), "Upl" (mask20) : "memory");
+            for (int i = 0; i < 4; i++) {
+              if (flag0[i] != 0) {
+                *exec::Aggregate::value<int64_t>(*(result + count + i)) += value[count + i];
+              }
+            }
+          }
+
+          if (svptest_any(svptrue_b64(), mask21)) {
+            svuint64_t ptr =
+                svld1(mask21, reinterpret_cast<uint64_t*>(result + count + 4));
+            clearNullSVE(ptr, mask21);
+            uint8_t flag1[4] = {0, 0, 0, 0};
+            __asm__ __volatile__("str %1, [%0]": : "r" (&flag1[0]), "Upl" (mask21) : "memory");
+            for (int i = 0; i < 4; i++) {
+              if (flag1[i] != 0) {
+                *exec::Aggregate::value<int64_t>(*(result + count + 4 + i)) += value[count + 4 + i];
+              }
+            }
+          }
+        }
+        svbool_t mask11 = svunpkhi(mask00);
+        if (svptest_any(svptrue_b32(), mask11)) {
+          svbool_t mask22 = svunpklo(mask11);
+          svbool_t mask23 = svunpkhi(mask11);
+          if (svptest_any(svptrue_b64(), mask22)) {
+            svuint64_t ptr =
+                svld1(mask22, reinterpret_cast<uint64_t*>(result + count + 8));
+            clearNullSVE(ptr, mask22);
+            uint8_t flag2[4] = {0, 0, 0, 0};
+            __asm__ __volatile__("str %1, [%0]": : "r" (&flag2[0]), "Upl" (mask22) : "memory");
+            for (int i = 0; i < 4; i++) {
+              if (flag2[i] != 0) {
+                *exec::Aggregate::value<int64_t>(*(result + count + 8 + i)) += value[count + 8 + i];
+              }
+            }
+          }
+
+          if (svptest_any(svptrue_b64(), mask23)) {
+            svuint64_t ptr =
+                svld1(mask23, reinterpret_cast<uint64_t*>(result + count + 12));
+            clearNullSVE(ptr, mask23);
+            uint8_t flag3[4] = {0, 0, 0, 0};
+            __asm__ __volatile__("str %1, [%0]": : "r" (&flag3[0]), "Upl" (mask23) : "memory");
+            for (int i = 0; i < 4; i++) {
+              if (flag3[i] != 0) {
+                *exec::Aggregate::value<int64_t>(*(result + count + 12 + i)) += value[count + 12 + i];
+              }
+            }
+          }
+        }
+      }
+
+      svbool_t mask12 = svunpklo(mask01);
+
+      if (svptest_any(svptrue_b16(), mask01)) {
+        svbool_t mask24 = svunpklo(mask12);
+        svbool_t mask25 = svunpkhi(mask12);
+        if (svptest_any(svptrue_b32(), mask12)) {
+          if (svptest_any(svptrue_b64(), mask24)) {
+            svuint64_t ptr =
+                svld1(mask24, reinterpret_cast<uint64_t*>(result + count + 16));
+            clearNullSVE(ptr, mask24);
+            uint8_t flag4[4] = {0, 0, 0, 0};
+            __asm__ __volatile__("str %1, [%0]": : "r" (&flag4[0]), "Upl" (mask24) : "memory");
+            for (int i = 0; i < 4; i++) {
+              if (flag4[i] != 0) {
+                *exec::Aggregate::value<int64_t>(*(result + count + 16 + i)) += value[count + 16 + i];
+              }
+            }
+          }
+
+          if (svptest_any(svptrue_b64(), mask25)) {
+            svuint64_t ptr =
+                svld1(mask25, reinterpret_cast<uint64_t*>(result + count + 20));
+            clearNullSVE(ptr, mask25);
+            uint8_t flag5[4] = {0, 0, 0, 0};
+            __asm__ __volatile__("str %1, [%0]": : "r" (&flag5[0]), "Upl" (mask25) : "memory");
+            for (int i = 0; i < 4; i++) {
+              if (flag5[i] != 0) {
+                *exec::Aggregate::value<int64_t>(*(result + count + 20 + i)) += value[count + 20 + i];
+              }
+            }
+          }
+        }
+        svbool_t mask13 = svunpkhi(mask01);
+
+        if (svptest_any(svptrue_b32(), mask13)) {
+          svbool_t mask26 = svunpklo(mask13);
+          svbool_t mask27 = svunpkhi(mask13);
+          if (svptest_any(svptrue_b64(), mask26)) {
+            svuint64_t ptr =
+                svld1(mask26, reinterpret_cast<uint64_t*>(result + count + 24));
+            clearNullSVE(ptr, mask26);
+            uint8_t flag6[4] = {0, 0, 0, 0};
+            __asm__ __volatile__("str %1, [%0]": : "r" (&flag6[0]), "Upl" (mask26) : "memory");
+            for (int i = 0; i < 4; i++) {
+              if (flag6[i] != 0) {
+                *exec::Aggregate::value<int64_t>(*(result + count + 24 + i)) += value[count + 24 + i];
+              }
+            }
+          }
+
+          if (svptest_any(svptrue_b64(), mask27)) {
+            svuint64_t ptr =
+                svld1(mask27, reinterpret_cast<uint64_t*>(result + count + 28));
+            clearNullSVE(ptr, mask27);
+            uint8_t flag7[4] = {0, 0, 0, 0};
+            __asm__ __volatile__("str %1, [%0]": : "r" (&flag7[0]), "Upl" (mask27) : "memory");
+            for (int i = 0; i < 4; i++) {
+              if (flag7[i] != 0) {
+                *exec::Aggregate::value<int64_t>(*(result + count + 28 + i)) += value[count + 28 + i];
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   template <
       bool tableHasNulls,
       typename TData = ResultType,
@@ -502,7 +668,7 @@ class SumAggregateBase
     // decode dic
     vector_size_t* dic = decoded.getDic();
 
-    hashAggUpdateSVEWithChar(
+    hashAggUpdateSVEWithCharForNormal(
         groups,
         bitmask1,
         bitmask2,
