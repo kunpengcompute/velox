@@ -809,6 +809,9 @@ class HashTable : public BaseHashTable {
       int32_t numGroups,
       raw_vector<uint64_t>& hashes,
       bool initNormalizedKeys);
+  uint64_t* getKeyPtr();
+  char** getValuePtr();
+  uint8_t* getTagPtr();
 
   // Inserts 'numGroups' entries into 'this'. 'groups' point to contents in a
   // RowContainer owned by 'this'. 'hashes' are the hash numbers or array
