@@ -1190,7 +1190,16 @@ void HashTable<ignoreNullKeys>::clear(bool freeTable) {
   if (table_) {
     if (!freeTable) {
       // All modes have 8 bytes per slot.
-      ::memset(table_, 0, capacity_ * sizeof(char*));
+      if (hashMode_ == HashMode::kNormalizedKey &&
+          normalizedKeyMode_ == NormalizedKeyMode::scalar && !isJoinBuild_) {
+        ::memset(table_, 0, capacity_ * 16);
+      } else if (
+          hashMode_ == HashMode::kNormalizedKey &&
+          normalizedKeyMode_ == NormalizedKeyMode::sve && !isJoinBuild_) {
+        ::memset(table_, 0, capacity_ * 17);
+      } else {
+        ::memset(table_, 0, capacity_ * sizeof(char*));
+      }
     } else {
       rows_->pool()->freeContiguous(tableAllocation_);
       table_ = nullptr;
