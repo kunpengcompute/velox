@@ -15,6 +15,7 @@
  */
 
 #include "velox/exec/HashTable.h"
+#include "sveht/src/sve_hash.hpp"
 #include "velox/common/base/AsyncSource.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/Portability.h"
@@ -24,7 +25,6 @@
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/vector/VectorTypeUtils.h"
-#include "sveht/src/sve_hash.hpp"
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -319,10 +319,14 @@ void HashTable<ignoreNullKeys>::storeRowPointer(
     reinterpret_cast<char**>(table_)[index] = row;
     return;
   }
-  if (hashMode_ == HashMode::kNormalizedKey && normalizedKeyMode_ == NormalizedKeyMode::scalar && !isJoinBuild_) { // TODO NOTE sve不调用这里，而是自行向量化
+  if (hashMode_ == HashMode::kNormalizedKey &&
+      normalizedKeyMode_ == NormalizedKeyMode::scalar &&
+      !isJoinBuild_) { // TODO NOTE sve不调用这里，而是自行向量化
     // TODO scalar2
     auto* table = reinterpret_cast<sveht::KeyValue*>(table_);
-    table[index].key = reinterpret_cast<normalized_key_t*>(row)[-1]; // 保存normalizedKey，TODO 所以在storeKey函数中还是要在group行-1位置保存normalizedKey!
+    table[index].key = reinterpret_cast<normalized_key_t*>(
+        row)[-1]; // 保存normalizedKey，TODO
+                  // 所以在storeKey函数中还是要在group行-1位置保存normalizedKey!
     table[index].value = row;
     return;
   }
@@ -343,11 +347,13 @@ char* HashTable<ignoreNullKeys>::insertEntry(
   storeKeys(lookup, row);
 
   if (hashMode_ == HashMode::kNormalizedKey) {
-    // TODO scalar2 这一步提前，因为storeRowPointer函数要改造依赖group行-1位置保存的normalizedKey
-    // TODO scalar2 都要存normalizedKey，因为下面storeRowPointer函数里要从group行-1位置取出normalizedKey放到table key
-    // We store the unique digest of key values (normalized key) in
-    // the word below the row. Space was reserved in the allocation
-    // unless we have given up on normalized keys.
+    // TODO scalar2
+    // 这一步提前，因为storeRowPointer函数要改造依赖group行-1位置保存的normalizedKey
+    // TODO scalar2
+    // 都要存normalizedKey，因为下面storeRowPointer函数里要从group行-1位置取出normalizedKey放到table
+    // key We store the unique digest of key values (normalized key) in the word
+    // below the row. Space was reserved in the allocation unless we have given
+    // up on normalized keys.
     RowContainer::normalizedKey(group) = lookup.normalizedKeys[row]; // NOLINT
   }
 
@@ -369,11 +375,13 @@ char* HashTable<ignoreNullKeys>::insertEntryforSVE(
   storeKeys(lookup, row);
 
   if (hashMode_ == HashMode::kNormalizedKey) {
-    // TODO scalar2 这一步提前，因为storeRowPointer函数要改造依赖group行-1位置保存的normalizedKey
-    // TODO scalar2 都要存normalizedKey，因为下面storeRowPointer函数里要从group行-1位置取出normalizedKey放到table key
-    // We store the unique digest of key values (normalized key) in
-    // the word below the row. Space was reserved in the allocation
-    // unless we have given up on normalized keys.
+    // TODO scalar2
+    // 这一步提前，因为storeRowPointer函数要改造依赖group行-1位置保存的normalizedKey
+    // TODO scalar2
+    // 都要存normalizedKey，因为下面storeRowPointer函数里要从group行-1位置取出normalizedKey放到table
+    // key We store the unique digest of key values (normalized key) in the word
+    // below the row. Space was reserved in the allocation unless we have given
+    // up on normalized keys.
     RowContainer::normalizedKey(group) = lookup.normalizedKeys[row]; // NOLINT
   }
 
@@ -487,47 +495,55 @@ void populateNormalizedKeys(HashLookup& lookup, int8_t sizeBits) {
 
 #define LANE_COUNT 4
 
-void step1_load_keys(const uint64_t* new_key,  const svbool_t inv_mask, svuint64_t& prev_key) {
-  svbool_t pg       = svptrue_b64();
+void step1_load_keys(
+    const uint64_t* new_key,
+    const svbool_t inv_mask,
+    svuint64_t& prev_key) {
+  svbool_t pg = svptrue_b64();
   svuint64_t newk = svld1(inv_mask, new_key);
 
   svbool_t active_mask = svnot_b_z(pg, inv_mask);
-  svuint64_t oldk   = svld1(active_mask, (const uint64_t*)&prev_key);
+  svuint64_t oldk = svld1(active_mask, (const uint64_t*)&prev_key);
   prev_key = svorr_z(svptrue_b64(), newk, oldk);
-
 }
 
 void step3_gather_build(
-    const sveht::KeyValue* table, svuint64_t h, svuint64_t& tab_key) {
-  svbool_t pg    = svptrue_b64();
+    const sveht::KeyValue* table,
+    svuint64_t h,
+    svuint64_t& tab_key) {
+  svbool_t pg = svptrue_b64();
   // Compute byte offsets = h * sizeof(KeyValue) = h * 16
-  svuint64_t offset = svlsl_n_u64_z(pg, h, 4);  // 2^4 = 16
+  svuint64_t offset = svlsl_n_u64_z(pg, h, 4); // 2^4 = 16
   tab_key = svld1_gather_u64offset_u64(pg, &table[0].key, offset);
 }
 void step3_gather_build_value(
-    sveht::KeyValue* table, svuint64_t h, svuint64_t& tab_key) {
-  svbool_t pg    = svptrue_b64();
+    sveht::KeyValue* table,
+    svuint64_t h,
+    svuint64_t& tab_key) {
+  svbool_t pg = svptrue_b64();
   // Compute byte offsets = h * sizeof(KeyValue) = h * 16
-  svuint64_t offset = svlsl_n_u64_z(pg, h, 4);  // 2^4 = 16
-  tab_key = svld1_gather_u64offset_u64(pg, reinterpret_cast<uint64_t*>(&table[0].value), offset);
+  svuint64_t offset = svlsl_n_u64_z(pg, h, 4); // 2^4 = 16
+  tab_key = svld1_gather_u64offset_u64(
+      pg, reinterpret_cast<uint64_t*>(&table[0].value), offset);
 }
 
-inline __attribute__((always_inline)) svbool_t get_uniq_mask(svbool_t pg, svuint64_t val) {
+inline __attribute__((always_inline)) svbool_t
+get_uniq_mask(svbool_t pg, svuint64_t val) {
   svuint64_t count;
   uint64_t vals[LANE_COUNT];
   svst1(pg, vals, val);
-  uint64_t counts[LANE_COUNT] = {1,1,1,1};
+  uint64_t counts[LANE_COUNT] = {1, 1, 1, 1};
   std::unordered_set<int> unique_counts;
 
   for (int i = 0; i < LANE_COUNT; i++) {
-    if (unique_counts.find(i) != unique_counts.end()) {
-      counts[i] = 0;
+    if (counts[i] == 0) {
       continue;
     }
     for (int j = i + 1; j < LANE_COUNT; j++) {
       if (vals[j] == vals[i]) {
-        counts[i]++;
-        unique_counts.emplace(j);
+        // counts[i]++;
+        // unique_counts.emplace(j);
+        counts[j] = 0;
       }
     }
   }
@@ -537,119 +553,269 @@ inline __attribute__((always_inline)) svbool_t get_uniq_mask(svbool_t pg, svuint
   return mask;
 }
 
+inline __attribute__((always_inline)) svbool_t
+get_uniq_mask2(svbool_t pg, const svuint64_t val) {
+  svuint64_t s1 = svext_u64(val, val, 1);
+  svbool_t mask2 = svcmpeq(svwhilelt_b64(0, 3), val, s1);
+
+  svuint64_t s2 = svext_u64(val, val, 2);
+  svbool_t mask3 = svcmpeq(svwhilelt_b64(0, 2), val, s2);
+  svbool_t mask12 = svorr_b_z(pg, mask2, mask3);
+
+  svuint64_t s3 = svext_u64(val, val, 3);
+  svbool_t mask4 = svcmpeq(svwhilelt_b64(0, 1), val, s3);
+
+  svbool_t mask = svorr_b_z(pg, mask4, mask12);
+  mask = svnot_b_z(pg, mask);
+
+  return mask;
+}
+
+inline __attribute__((always_inline)) svbool_t
+get_uniq_mask3(svbool_t pg, svuint64_t val) { // TODO没有完全成立
+
+  svbool_t mask1 = svpfalse();
+  svuint8_t val_8 = svreinterpret_u8_u64(val);
+
+  svuint8_t s1 = svext_u8(val_8, val_8, 8);
+  svbool_t mask2 = svcmpeq(svwhilelt_b64(0, 4), val, svreinterpret_u64_u8(s1));
+
+  svuint8_t s2 = svext_u8(val_8, val_8, 16);
+  svbool_t mask3 = svcmpeq(svwhilelt_b64(0, 2), val, svreinterpret_u64_u8(s2));
+
+  auto s3 = svrev_b64(mask2);
+  svbool_t mask4 = svand_b_z(svwhilelt_b64(0, 1), svwhilelt_b64(0, 1), s3);
+
+  svbool_t mask11 = svorr_b_z(pg, mask1, mask2);
+  svbool_t mask12 = svorr_b_z(pg, mask3, mask4);
+  svbool_t mask = svorr_b_z(pg, mask11, mask12);
+  mask = svnot_b_z(pg, mask);
+
+  return mask;
+}
+
 /**
  * @brief Group normalized keys and probe the hash table.
  *
- * This function processes a batch of keys, normalizes them, and probes a hash table to find matches.
- * It uses SVE (Scalable Vector Extension) instructions for vectorized processing.
+ * This function processes a batch of keys, normalizes them, and probes a hash
+ * table to find matches. It uses SVE (Scalable Vector Extension) instructions
+ * for vectorized processing.
  *
  * @param numProbes The number of keys to process.
- * @param rows Array of row indices, indicating the position of each key in the input arrays.
+ * @param rows Array of row indices, indicating the position of each key in the
+ * input arrays.
  * @param hashes Array of precomputed hash values for each key.
  * @param groups Output array where the resulting group values will be stored.
  * @param normalizeKey Array of normalized keys to be processed.
- * @param table The hash table to be probed, represented as an array of KeyValue structures.
+ * @param table The hash table to be probed, represented as an array of KeyValue
+ * structures.
  * @param capacity_ The capacity of the hash table (must be a power of 2).
  */
 
-// void groupNormalizedKeyProbeSVE(int32_t numProbes, const int32_t* rows, const uint64_t* hashes, char** groups, const uint64_t* normalizeKey, KeyValue* table, uint64_t capacity_) {
+// void groupNormalizedKeyProbeSVE(int32_t numProbes, const int32_t* rows, const
+// uint64_t* hashes, char** groups, const uint64_t* normalizeKey, KeyValue*
+// table, uint64_t capacity_) {
 template <bool ignoreNullKeys>
-void HashTable<ignoreNullKeys>:: groupNormalizedKeyProbeSVE(HashLookup& lookup) {
+void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeSVE(HashLookup& lookup) {
+  constexpr int32_t kVectorWidth = 4;
+  constexpr int32_t kTagShiftBits = 38;
+  constexpr uint64_t kTagMask = 0x80;
+  constexpr int32_t kProbeStep = 32;
+  constexpr int32_t kBitsPerByte = 8;
+  constexpr int32_t kInvalidIndex = INT_MAX;
+  constexpr int32_t kPrefetchDistance = 8;
+
   int32_t numProbes = lookup.rows.size();
   const int32_t* rows = lookup.rows.data();
   auto hashes = lookup.hashes.data();
   auto groups = lookup.hits.data();
-  auto normalizeKey = lookup.normalizedKeys.data();
+  auto normalizedKeys = lookup.normalizedKeys.data();
 
-  auto* table = reinterpret_cast<sveht::KeyValue*>(table_);
+  bool all = false;
+  if (lookup.rows.size() - 1 == lookup.rows[numProbes - 1]) {
+    all = true;
+  }
 
   // Core vector build loop for this group
-  svbool_t inv_mask = svptrue_b64();
-  svuint64_t key_vec = svdup_n_u64(0);
-  svuint64_t val_vec = svdup_n_u64(0);
-  svuint64_t tab_key = svdup_n_u64(0);
+  // svuint64_t keyVec = svdup_n_u64(0);
+  svuint64_t valVec = svdup_n_u64(0);
+  // svuint64_t tabKey = svdup_n_u64(0);
 
-
-  svuint64_t curr_index = svdup_n_u64(0);
-  svuint64_t index_vec = svindex_u64(0, 1);
+  svuint64_t currIndex = svdup_n_u64(0);
+  // svuint64_t indexVec = svindex_u64(0, 1);
   svint64_t rowId = svdup_n_s64(0);
-  svbool_t index_mask = svptrue_b64();
-  svbool_t empty_mask = svptrue_b64();
+  svbool_t indexMask = svptrue_b64();
+  svbool_t emptyMask = svptrue_b64();
+  // svuint8_t zeroMask = svdup_n_u8(0);
 
-  // 取第i行并标记hash值
-  // auto row = rows[i];
-  // uint64_t index = hashes[row] & (capacity_ - 1);
 
-  int i = 0;
-  // LOG(ERROR) << "000000000000000";
-  // VELOX_FAIL("Have looped through all the buckets in table111111111111111");
+  int32_t i = 0;
   while (i < numProbes) {
-    svbool_t pgTrue = svptrue_b64();
-    svbool_t pgI = svwhilelt_b64(i, numProbes);
-
-    svbool_t active_mask = svnot_b_z(pgTrue, inv_mask);
-    active_mask = svand_b_z(pgTrue, active_mask, pgI);
-    inv_mask = svand_b_z(pgTrue, inv_mask, pgI);
-    curr_index = svadd_n_u64_m(active_mask, curr_index, 1); // 线性探测法,TODO要考虑到重复的情况
-
-    svint64_t rowId_new = svld1sw_s64(inv_mask, rows + i);
-    rowId = svorr_z(pgI, rowId, rowId_new);
-    svuint64_t new_h = svld1_gather_index(inv_mask, hashes, rowId);
-    curr_index = svorr_z(pgI, curr_index, new_h);
-    curr_index = svand_n_u64_z(pgI, curr_index, capacity_ - 1);
-
-    step3_gather_build(table, curr_index, tab_key);
-    step3_gather_build_value(table, curr_index, val_vec); // load value判空
-    key_vec = svld1_gather_u64index_u64(svptrue_b64(), normalizeKey, svreinterpret_u64(rowId));
-
-
-    empty_mask = svcmpeq_n_u64(pgI, val_vec, 0);
-    index_mask = get_uniq_mask(pgI, curr_index); // 选出index可以不重复的地方，如果重复了，剩下的点置位0
-    svbool_t to_write_mask = svand_z(pgI, index_mask, empty_mask); // 选出需要写入的地方
-    // 更新hash表中的key
-    svuint64_t byte_off = svlsl_n_u64_z(pgI, curr_index, 4);
-    // step1_load_keys(normalizeKey + i, inv_mask,key_vec); // normalizekey在key_vec里面
-    svst1_scatter_u64offset_u64(to_write_mask, &table[0].key, byte_off, key_vec);
-
-    // 空的地方要执行insertEntry
-    svuint64_t compacted_indices = svcompact_u64(to_write_mask, index_vec);
-    uint32_t active_count = svcntp_b64(svptrue_b64(), to_write_mask);
-    uint32_t active_indices[4]; // 使用svcntw()获取当前矢量宽度下32位元素的最大数量，这是一种安全的做法。
-    svst1w(svptrue_b32(), active_indices, compacted_indices);
-
-    uint64_t indices[4] = {0}; // 使用svcntw()获取当前矢量宽度下32位元素的最大数量，这是一种安全的做法。
-    svst1(to_write_mask, indices, curr_index);
-
-    int64_t rows_[4] = {0}; // 使用svcntw()获取当前矢量宽度下32位元素的最大数量，这是一种安全的做法。
-    svst1(to_write_mask, rows_, rowId);
-
-    for (int j = 0; j < active_count; j++) {
-      // LOG(ERROR) << "index is " << i + active_indices[j] << " i is " << i << " offset is " << active_indices[j] << " rows id is " << rows_[active_indices[j]];
-      table[indices[active_indices[j]]].value = insertEntryforSVE(lookup, indices[active_indices[j]], rows_[active_indices[j]]);
-      groups[rows_[active_indices[j]]] = table[indices[active_indices[j]]].value;
+    if (i + kVectorWidth + kPrefetchDistance < numProbes) {
+      for (int32_t p = 0; p < kVectorWidth; ++p) {
+        int32_t prefetchRow = i + kVectorWidth + kPrefetchDistance + p;
+        uint64_t prefetchIdx = hashes[prefetchRow] & (capacity_ - 1);
+        // 使用SVE prefetch或标准prefetch
+        svprfb(svptrue_b8(), getTagPtr() + prefetchIdx, SV_PLDL1STRM);
+        svprfd(svptrue_b64(), getValuePtr() + prefetchIdx, SV_PLDL1STRM);
+        svprfd(svptrue_b64(), getKeyPtr() + prefetchIdx, SV_PLDL1STRM);
+      }
     }
 
-    // 处理位置非空的地方，直接在hits中存group
-    svbool_t not_empty = svnot_b_z(pgI, empty_mask);
+    svbool_t predicateMask = svwhilelt_b64(i, numProbes);
+    // load normalized keys and curr_index
+    if (all) {
+      currIndex = svld1(predicateMask, hashes + i);
+    } else {
+      rowId = svld1sw_s64(predicateMask, rows + i); // 这一次循环处理的row
+      svint64_t rowOffset = svlsl_n_s64_z(predicateMask, rowId, 3);
+      currIndex = svld1_gather_offset(
+          predicateMask, hashes, svreinterpret_u64(rowOffset));
+    }
 
-    svbool_t match = svcmpeq(not_empty, tab_key, key_vec); // TODO:match直接赋值进hits就好
+    // calc tag
+    svuint64_t currTagTmp =
+        svlsr_n_u64_x(predicateMask, currIndex, kTagShiftBits);
+    svuint64_t currTag = svorr_n_u64_z(
+        predicateMask,
+        currTagTmp,
+        kTagMask); // 4个tag的位置0 8 16
+                   // 24，svreinterpret_u8_u64(svorr_n_u64_z(predicateMask,
+                   // currTagTmp, kTagMask));
 
-    svst1_scatter_u64index_u64(match, reinterpret_cast<uint64_t*>(groups), svreinterpret_u64(rowId), val_vec);
+    // 计算在hashtable中的index
+    currIndex = svand_n_u64_z(predicateMask, currIndex, capacity_ - 1);
+    svuint64_t htOffset = svlsl_n_u64_z(predicateMask, currIndex, 3);
+    valVec = svld1_gather_u64offset_u64(
+        predicateMask,
+        reinterpret_cast<uint64_t*>(getValuePtr()),
+        htOffset); // hash表的value
 
-    inv_mask = svorr_b_z(pgI, match, to_write_mask);
-    svbool_t still_active_mask = svnot_b_z(pgI, inv_mask);
+    emptyMask = svcmpeq_n_u64(predicateMask, valVec, 0);
+    if (svptest_any(predicateMask, emptyMask)) {
+      indexMask = get_uniq_mask2(
+          emptyMask,
+          currIndex); // 选出index可以不重复的地方，如果重复了，剩下的点置位0
+    } else {
+      indexMask = emptyMask;
+    }
 
-    svbool_t next_process = svbic_b_z(pgI, empty_mask, index_mask); // 此次处理为空
-    curr_index = svsub_n_u64_m(next_process, curr_index, 1); // 下一个处理位置
+    // HashTable为空，需要写入的地方
+    svbool_t toWriteMask =
+        svand_z(predicateMask, indexMask, emptyMask); // 选出需要写入的地方
 
-    curr_index = svcompact(still_active_mask, curr_index);
-    key_vec = svcompact(still_active_mask, key_vec);
-    rowId = svcompact(still_active_mask, rowId);
-    int num = svcntp_b64(pgI, inv_mask);
-    svbool_t active_lanes = svwhilelt_b64_s64(0, 4 - num);
-    inv_mask = svnot_b_z(pgI, active_lanes);
-    i += num;
+    // 当前在hash表中的位置
+    uint64_t htIndices[kVectorWidth] = {0, 0, 0, 0};
+    svst1(svptrue_b64(), htIndices, currIndex);
 
+    // 当前的tag值
+    uint64_t tags[kVectorWidth] = {0, 0, 0, 0}; // 使用svcntw()获取当前矢量宽度下32位元素的最大数量，这是一种安全的做法。
+    svst1(svptrue_b64(), tags, currTag);
+
+    uint32_t flag = 0;
+    __asm__("str %1, [%0]"
+                         :
+                         : "r"(&flag), "Upl"(toWriteMask)
+                         : "memory");
+    uint32_t flag1 = flag;
+    while (flag1) {
+      int32_t offset = __builtin_ctz(flag1);
+      int32_t idx = offset / kBitsPerByte;
+      uint64_t htIdx = htIndices[idx];
+
+      getKeyPtr()[htIdx] = normalizedKeys[i + idx];
+      getValuePtr()[htIdx] =
+          insertEntryforSVE(lookup, htIdx, i + idx);
+      groups[i + idx] = getValuePtr()[htIdx];
+      getTagPtr()[htIdx] = tags[idx];
+
+      flag1 &= (flag1 - 1);
+    }
+
+
+    uint32_t conflictFlag = ~flag & 0x01010101;
+    // 水平向量化插入，每个键都必插入
+    while (conflictFlag) {
+      int32_t offset = __builtin_ctz(conflictFlag);
+      int32_t idx = offset / kBitsPerByte;
+      int32_t rowIdx = i + idx;
+
+      bool processSuccess = false;
+      int64_t htStartIdx = htIndices[idx];
+
+
+      // 这里循环到数据找到为止
+      while (!processSuccess) {
+        // 这里要考虑tag到尾部的情况，从0开始；idx要+1，之前的前面比较过了
+        svbool_t tagPredicate = svwhilelt_b8(htStartIdx, capacity_);
+        svuint8_t htTag =
+            svld1_u8(tagPredicate, getTagPtr() + htStartIdx); // ht_tag
+
+        svuint8_t conflictTag =
+            svdup_lane(svreinterpret_u8_u64(currTag), offset);
+
+        svbool_t matchZero = svcmpeq_n_u8(tagPredicate, htTag, 0);
+        svbool_t conflictMatch = svcmpeq_u8(tagPredicate, htTag, conflictTag);
+        uint32_t zeroMask = 0;
+        uint32_t conflictMask = 0;
+        __asm__("str %1, [%0]"
+                             :
+                             : "r"(&zeroMask), "Upl"(matchZero)
+                             : "memory");
+        __asm__("str %1, [%0]"
+                             :
+                             : "r"(&conflictMask), "Upl"(conflictMatch)
+                             : "memory");
+        int32_t zeroBefore = kInvalidIndex;
+        int32_t htZeroIdx = kInvalidIndex;
+        if (zeroMask) {
+          zeroBefore = __builtin_ctz(zeroMask);
+          htZeroIdx = htStartIdx + zeroBefore;
+        }
+        // 拿到当前的key
+
+        uint64_t currNormalizedKey = normalizedKeys[rowIdx];
+        while (conflictMask) {
+          int32_t conflictIdx = __builtin_ctz(conflictMask);
+          //
+          if (conflictIdx > zeroBefore) {
+            // insert new
+            getKeyPtr()[htZeroIdx] = currNormalizedKey;
+            getValuePtr()[htZeroIdx] =
+                insertEntryforSVE(lookup, htZeroIdx, rowIdx);
+            groups[rowIdx] = getValuePtr()[htZeroIdx];
+            getTagPtr()[htZeroIdx] = tags[idx];
+            // 走到下一个conflict
+            processSuccess = true;
+            break;
+          } else {
+            // compare normalize key
+            int32_t htIdx =
+                htStartIdx + conflictIdx; // 从hash表中拿到key，和当前的key比较
+            if (currNormalizedKey == getKeyPtr()[htIdx]) {
+              groups[rowIdx] = getValuePtr()[htIdx];
+              // 走到下一个conflict
+              processSuccess = true;
+              break;
+            }
+          }
+          conflictMask = conflictMask & (conflictMask - 1);
+        }
+        if (zeroMask && !processSuccess) {
+          getKeyPtr()[htZeroIdx] = currNormalizedKey;
+          getValuePtr()[htZeroIdx] =
+              insertEntryforSVE(lookup, htZeroIdx, rowIdx);
+          groups[rowIdx] = getValuePtr()[htZeroIdx];
+          getTagPtr()[htZeroIdx] = tags[idx];
+          processSuccess = true;
+        }
+
+        htStartIdx =
+            capacity_ - htStartIdx > kProbeStep ? htStartIdx + kProbeStep : 0;
+      }
+      conflictFlag &= (conflictFlag - 1);
+    }
+    i += kVectorWidth;
   }
 }
 
@@ -707,7 +873,8 @@ void HashTable<ignoreNullKeys>::groupProbe(
 }
 
 template <bool ignoreNullKeys>
-void HashTable<ignoreNullKeys>:: groupNormalizedKeyProbeScalar(HashLookup& lookup) {
+void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeScalar(
+    HashLookup& lookup) {
   // TODO scalar2
   // TODO 暂时不管ignoreNullKeys
 
@@ -733,26 +900,32 @@ void HashTable<ignoreNullKeys>:: groupNormalizedKeyProbeScalar(HashLookup& looku
     // 标量线性探测：
     uint64_t start = index;
     while (true) {
-      char* group  = table[index].value;
-      if (UNLIKELY(!table[index].value)) { // 空桶标记 用char*空指针来判断 TODO scalar2 unlikely?
-        group = insertEntry(lookup, index, row); // key来自lookup&hasher->decodedVector()&row
+      char* group = table[index].value;
+      if (UNLIKELY(!table[index].value)) { // 空桶标记 用char*空指针来判断 TODO
+                                           // scalar2 unlikely?
+        group = insertEntry(
+            lookup, index, row); // key来自lookup&hasher->decodedVector()&row
         break;
       }
-      // if (RowContainer::normalizedKey(group) == lookup.normalizedKeys[row]) { // 直接比较normalizedKey
-	  if (table[index].key == lookup.normalizedKeys[row]) { // 直接比较normalizedKey，而且直接从table里取出来，而不是从group里
+      // if (RowContainer::normalizedKey(group) == lookup.normalizedKeys[row]) {
+      // // 直接比较normalizedKey
+      if (table[index].key ==
+          lookup.normalizedKeys
+              [row]) { // 直接比较normalizedKey，而且直接从table里取出来，而不是从group里
         groups[row] = group; // NOLINT
         break;
       }
       index = (index + 1) & (capacity_ - 1); // 线性探测
       if (index == start) {
-        VELOX_FAIL("Have looped through all the buckets in table: {}", (*this).toString());
-        LOG(ERROR) << "Have looped through all the buckets in table: {}", (*this).toString();
+        VELOX_FAIL(
+            "Have looped through all the buckets in table: {}",
+            (*this).toString());
+        LOG(ERROR) << "Have looped through all the buckets in table: {}",
+            (*this).toString();
       }
     }
   }
 }
-
-
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::groupNormalizedKeyProbe(HashLookup& lookup) {
@@ -974,15 +1147,22 @@ void HashTable<ignoreNullKeys>::joinNormalizedKeyProbe(HashLookup& lookup) {
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::allocateTables(
     uint64_t size,
-    int8_t spillInputStartPartitionBit) { // TODO scala2 NOTE this function is used by both HashAgg and HashJoin
+    int8_t spillInputStartPartitionBit) { // TODO scala2 NOTE this function is
+                                          // used by both HashAgg and HashJoin
   VELOX_CHECK(bits::isPowerOfTwo(size), "Size is not a power of two: {}", size);
   VELOX_CHECK_GT(size, 0);
   capacity_ = size;
   size_t slotSize; // TODO scalar2
-  if (hashMode_ == HashMode::kNormalizedKey && normalizedKeyMode_ != NormalizedKeyMode::nativeVelox && !isJoinBuild_) {
+  if (hashMode_ == HashMode::kNormalizedKey &&
+      normalizedKeyMode_ == NormalizedKeyMode::scalar && !isJoinBuild_) {
     slotSize = 16; // 8-byte normalizedKey + 8-byte group ptr
+  } else if (
+      hashMode_ == HashMode::kNormalizedKey &&
+      normalizedKeyMode_ == NormalizedKeyMode::sve && !isJoinBuild_) {
+    slotSize = 17;
   } else {
-    slotSize = tableSlotSize(); // BaseHashTable method has no hashMode_ attribute
+    slotSize =
+        tableSlotSize(); // BaseHashTable method has no hashMode_ attribute
   } // ATTENTION: DO NOT USE tableSlotSize() below, use slotSize instead!!!!
   const uint64_t byteSize = capacity_ * slotSize;
   VELOX_CHECK_EQ(byteSize % kBucketSize, 0);
@@ -1209,11 +1389,12 @@ void HashTable<ignoreNullKeys>::parallelJoinBuild() {
   // The parallel table partitioning step.
   for (auto i = 0; i < numPartitions; ++i) {
     auto* table = getTable(i);
-    partitionSteps.push_back(std::make_shared<AsyncSource<bool>>(
-        [this, table, rawRowPartitions = rowPartitions[i].get()]() {
-          partitionRows(*table, *rawRowPartitions);
-          return std::make_unique<bool>(true);
-        }));
+    partitionSteps.push_back(
+        std::make_shared<AsyncSource<bool>>(
+            [this, table, rawRowPartitions = rowPartitions[i].get()]() {
+              partitionRows(*table, *rawRowPartitions);
+              return std::make_unique<bool>(true);
+            }));
     VELOX_CHECK(!partitionSteps.empty());
     buildExecutor_->add([driverCtx, step = partitionSteps.back()]() {
       ScopedDriverThreadContext scopedDriverThreadContext(driverCtx);
@@ -1236,11 +1417,12 @@ void HashTable<ignoreNullKeys>::parallelJoinBuild() {
   }
   std::vector<std::vector<char*>> overflowPerPartition(numPartitions);
   for (auto i = 0; i < numPartitions; ++i) {
-    buildSteps.push_back(std::make_shared<AsyncSource<bool>>(
-        [this, i, &overflowPerPartition, &rowPartitions]() {
-          buildJoinPartition(i, rowPartitions, overflowPerPartition[i]);
-          return std::make_unique<bool>(true);
-        }));
+    buildSteps.push_back(
+        std::make_shared<AsyncSource<bool>>(
+            [this, i, &overflowPerPartition, &rowPartitions]() {
+              buildJoinPartition(i, rowPartitions, overflowPerPartition[i]);
+              return std::make_unique<bool>(true);
+            }));
     VELOX_CHECK(!buildSteps.empty());
     buildExecutor_->add([driverCtx, step = buildSteps.back()]() {
       ScopedDriverThreadContext scopedDriverThreadContext(driverCtx);
@@ -1383,6 +1565,21 @@ bool HashTable<ignoreNullKeys>::insertBatch(
 }
 
 template <bool ignoreNullKeys>
+FOLLY_ALWAYS_INLINE uint64_t* HashTable<ignoreNullKeys>::getKeyPtr() {
+  return reinterpret_cast<uint64_t*>(table_);
+}
+
+template <bool ignoreNullKeys>
+FOLLY_ALWAYS_INLINE char** HashTable<ignoreNullKeys>::getValuePtr() {
+  return reinterpret_cast<char**>(table_ + capacity_);
+}
+
+template <bool ignoreNullKeys>
+FOLLY_ALWAYS_INLINE uint8_t* HashTable<ignoreNullKeys>::getTagPtr() {
+  return reinterpret_cast<uint8_t*>(table_ + 2 * capacity_);
+}
+
+template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::insertForGroupBy(
     char** groups,
     uint64_t* hashes,
@@ -1394,30 +1591,177 @@ void HashTable<ignoreNullKeys>::insertForGroupBy(
       VELOX_CHECK_NULL(table_[index]);
       table_[index] = groups[i];
     }
-  }
-  else if (hashMode_ == HashMode::kNormalizedKey && normalizedKeyMode_ != NormalizedKeyMode::nativeVelox) { // TODO scalar2
+  } else if (
+      hashMode_ == HashMode::kNormalizedKey &&
+      normalizedKeyMode_ == NormalizedKeyMode::scalar) {
     // 假设不会二次切换哈希模式，即哈希表里没有旧数据要迁移(numDistinct_=0)，假设不需要扩容的假设，于是此处暂时scalar实现，未来再向量化
     auto* table = reinterpret_cast<sveht::KeyValue*>(table_);
     for (auto i = 0; i < numGroups; ++i) {
       uint64_t index = hashes[i] & (capacity_ - 1);
       uint64_t start = index;
       while (true) {
-        char* group  = table[index].value;
+        char* group = table[index].value;
         if (UNLIKELY(!table[index].value)) { // 空桶插入
           // NOTE 现在空指针就可以判断空桶，不需要initialize empty table
-          // NOTE 此处不必线性探测对非空桶判断是否键相等，因为此处是把旧表数据迁移到新表，而旧的哈希表里的分组都是unique的，因此这里只需要为每个分组数据找到空桶插入即可。
-          table[index].key = reinterpret_cast<normalized_key_t*>(groups[i])[-1]; // 从group -1位置取出normalizedKey放到hash table里
+          // NOTE
+          // 此处不必线性探测对非空桶判断是否键相等，因为此处是把旧表数据迁移到新表，而旧的哈希表里的分组都是unique的，因此这里只需要为每个分组数据找到空桶插入即可。
+          table[index].key = reinterpret_cast<normalized_key_t*>(
+              groups[i])[-1]; // 从group -1位置取出normalizedKey放到hash table里
           table[index].value = groups[i];
           break;
         }
         index = (index + 1) & (capacity_ - 1); // linear probing
         if (index == start) {
-          VELOX_FAIL("Have looped through all the buckets in table: {}", (*this).toString());
+          VELOX_FAIL(
+              "Have looped through all the buckets in table: {}",
+              (*this).toString());
         }
       }
     }
-  }
-  else {
+  } else if (
+      hashMode_ == HashMode::kNormalizedKey &&
+      normalizedKeyMode_ == NormalizedKeyMode::sve) {
+    constexpr int32_t kVectorWidth = 4;
+    constexpr int32_t kTagShiftBits = 38;
+    constexpr uint64_t kTagMask = 0x80;
+    constexpr int32_t kProbeStep = 32;
+    constexpr int32_t kBitsPerByte = 8;
+    constexpr int32_t kInvalidIndex = INT_MAX;
+    constexpr int32_t kPrefetchDistance = 8;
+
+    int32_t numProbes = numGroups;
+
+    // Core vector build loop for this group
+    // svuint64_t keyVec = svdup_n_u64(0);
+    svuint64_t valVec = svdup_n_u64(0);
+    // svuint64_t tabKey = svdup_n_u64(0);
+
+    svuint64_t currIndex = svdup_n_u64(0);
+    // svuint64_t indexVec = svindex_u64(0, 1);
+    svint64_t rowId = svdup_n_s64(0);
+    svbool_t indexMask = svptrue_b64();
+    svbool_t emptyMask = svptrue_b64();
+    // svuint8_t zeroMask = svdup_n_u8(0);
+
+    int32_t i = 0;
+    while (i < numProbes) {
+      if (i + kVectorWidth + kPrefetchDistance < numProbes) {
+        for (int32_t p = 0; p < kVectorWidth; ++p) {
+          int32_t prefetchRow = i + kVectorWidth + kPrefetchDistance + p;
+          uint64_t prefetchIdx = hashes[prefetchRow] & (capacity_ - 1);
+          // 使用SVE prefetch或标准prefetch
+          svprfb(svptrue_b8(), getTagPtr() + prefetchIdx, SV_PLDL1STRM);
+          svprfd(svptrue_b64(), getValuePtr() + prefetchIdx, SV_PLDL1STRM);
+          svprfd(svptrue_b64(), getKeyPtr() + prefetchIdx, SV_PLDL1STRM);
+        }
+      }
+
+      svbool_t predicateMask = svwhilelt_b64(i, numProbes);
+      // load normalized keys and curr_index
+      currIndex = svld1(predicateMask, hashes + i);
+
+      // calc tag
+      svuint64_t currTagTmp =
+          svlsr_n_u64_x(predicateMask, currIndex, kTagShiftBits);
+      svuint64_t currTag = svorr_n_u64_z(
+          predicateMask,
+          currTagTmp,
+          kTagMask);
+
+      // 计算在hashtable中的index
+      currIndex = svand_n_u64_z(predicateMask, currIndex, capacity_ - 1);
+      svuint64_t htOffset = svlsl_n_u64_z(predicateMask, currIndex, 3);
+      valVec = svld1_gather_u64offset_u64(
+          predicateMask,
+          reinterpret_cast<uint64_t*>(getValuePtr()),
+          htOffset); // hash表的value
+
+      emptyMask = svcmpeq_n_u64(predicateMask, valVec, 0);
+      if (svptest_any(predicateMask, emptyMask)) {
+        indexMask = get_uniq_mask2(
+            emptyMask,
+            currIndex); // 选出index可以不重复的地方，如果重复了，剩下的点置位0
+      } else {
+        indexMask = emptyMask;
+      }
+
+      // HashTable为空，需要写入的地方
+      svbool_t toWriteMask =
+          svand_z(predicateMask, indexMask, emptyMask); // 选出需要写入的地方
+
+      // 当前在hash表中的位置
+      uint64_t htIndices[kVectorWidth] = {0, 0, 0, 0};
+      svst1(svptrue_b64(), htIndices, currIndex);
+
+      // 当前的tag值
+      uint64_t tags[kVectorWidth] = {
+          0,
+          0,
+          0,
+          0}; // 使用svcntw()获取当前矢量宽度下32位元素的最大数量，这是一种安全的做法。
+      svst1(svptrue_b64(), tags, currTag);
+
+      uint32_t flag = 0;
+      __asm__("str %1, [%0]" : : "r"(&flag), "Upl"(toWriteMask) : "memory");
+      uint32_t flag1 = flag;
+      while (flag1) {
+        int32_t offset = __builtin_ctz(flag1);
+        int32_t idx = offset / kBitsPerByte;
+        uint64_t htIdx = htIndices[idx];
+
+        getKeyPtr()[htIdx] = reinterpret_cast<uint64_t*>(groups[i + idx])[-1];
+        getValuePtr()[htIdx] = groups[i + idx];
+        getTagPtr()[htIdx] = tags[idx];
+
+        flag1 &= (flag1 - 1);
+      }
+
+      uint32_t conflictFlag = ~flag & 0x01010101;
+      // 水平向量化插入，每个键都必插入
+      while (conflictFlag) {
+        int32_t offset = __builtin_ctz(conflictFlag);
+        int32_t idx = offset / kBitsPerByte;
+        int32_t rowIdx = i + idx;
+
+
+        int64_t htStartIdx = htIndices[idx];
+
+        // 这里循环到数据找到为止
+        while (true) {
+          // 这里要考虑tag到尾部的情况，从0开始；idx要+1，之前的前面比较过了
+          svbool_t tagPredicate = svwhilelt_b8(htStartIdx, capacity_);
+          svuint8_t htTag =
+              svld1_u8(tagPredicate, getTagPtr() + htStartIdx); // ht_tag
+
+
+          svbool_t matchZero = svcmpeq_n_u8(tagPredicate, htTag, 0);
+
+          uint32_t zeroMask = 0;
+          __asm__("str %1, [%0]"
+                  :
+                  : "r"(&zeroMask), "Upl"(matchZero)
+                  : "memory");
+
+          int32_t zeroBefore = kInvalidIndex;
+          int32_t htZeroIdx = kInvalidIndex;
+          if (zeroMask) {
+            zeroBefore = __builtin_ctz(zeroMask);
+            htZeroIdx = htStartIdx + zeroBefore;
+
+            getKeyPtr()[htZeroIdx] = reinterpret_cast<uint64_t*>(groups[rowIdx])[-1];
+            getValuePtr()[htZeroIdx] = groups[rowIdx];
+            getTagPtr()[htZeroIdx] = tags[idx];
+            break;
+          }
+
+          htStartIdx =
+              capacity_ - htStartIdx > kProbeStep ? htStartIdx + kProbeStep : 0;
+        }
+        conflictFlag &= (conflictFlag - 1);
+      }
+      i += kVectorWidth;
+    }
+  } else {
     constexpr int32_t kPrefetchDistance = 10;
     for (int32_t i = 0; i < numGroups; ++i) {
       auto hash = hashes[i];
@@ -1647,6 +1991,7 @@ void HashTable<ignoreNullKeys>::rehash(
       }
     } while (numGroups > 0);
   }
+
 }
 
 template <bool ignoreNullKeys>
@@ -2043,8 +2388,9 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
   buildExecutor_ = executor;
   otherTables_.reserve(tables.size());
   for (auto& table : tables) {
-    otherTables_.emplace_back(std::unique_ptr<HashTable<ignoreNullKeys>>(
-        dynamic_cast<HashTable<ignoreNullKeys>*>(table.release())));
+    otherTables_.emplace_back(
+        std::unique_ptr<HashTable<ignoreNullKeys>>(
+            dynamic_cast<HashTable<ignoreNullKeys>*>(table.release())));
   }
 
   // If there are multiple tables, we need to merge the 'columnHasNulls' flags
@@ -2512,6 +2858,23 @@ void HashTable<ignoreNullKeys>::prepareForGroupProbe(
 
   bool rehash = false;
   const auto mode = hashMode();
+
+  // LOG(ERROR) << "3. [DEBUG] Current HashMode before computeValueIds/hash this batch of input:";
+  // switch(mode) {
+  //   case BaseHashTable::HashMode::kHash:
+  //     LOG(ERROR) << "kHash";
+  //     break;
+  //   case BaseHashTable::HashMode::kNormalizedKey:
+  //     LOG(ERROR) << "kNormalizedKey";
+  //     break;
+  //   case BaseHashTable::HashMode::kArray:
+  //     LOG(ERROR) << "kArray";
+  //     break;
+  //   default:
+  //     LOG(ERROR) << "Unknown(" << static_cast<int>(mode) << ")";
+  // }
+  // LOG(ERROR) << std::endl;
+
   for (auto i = 0; i < hashers.size(); ++i) {
     auto& hasher = hashers[i];
     if (mode != BaseHashTable::HashMode::kHash) {
