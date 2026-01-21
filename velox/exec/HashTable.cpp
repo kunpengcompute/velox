@@ -650,7 +650,8 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeSVE(HashLookup& lookup) {
 
 
   int32_t i = 0;
-  while (i < numProbes) {
+  svbool_t predicateMask = svptrue_b64();
+  while (i + kVectorWidth < numProbes) {
     if (i + kVectorWidth + kPrefetchDistance < numProbes) {
       for (int32_t p = 0; p < kVectorWidth; ++p) {
         int32_t prefetchRow = i + kVectorWidth + kPrefetchDistance + p;
@@ -662,7 +663,6 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeSVE(HashLookup& lookup) {
       }
     }
 
-    svbool_t predicateMask = svwhilelt_b64(i, numProbes);
     // load normalized keys and curr_index
     if (all) {
       currIndex = svld1(predicateMask, hashes + i);
@@ -734,6 +734,7 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeSVE(HashLookup& lookup) {
 
 
     uint32_t conflictFlag = ~flag & 0x01010101;
+
     // 水平向量化插入，每个键都必插入
     while (conflictFlag) {
       int32_t offset = __builtin_ctz(conflictFlag);
@@ -817,6 +818,162 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeSVE(HashLookup& lookup) {
     }
     i += kVectorWidth;
   }
+    predicateMask = svwhilelt_b64(i, numProbes);
+    // load normalized keys and curr_index
+    if (all) {
+      currIndex = svld1(predicateMask, hashes + i);
+    } else {
+      rowId = svld1sw_s64(predicateMask, rows + i); // 这一次循环处理的row
+      svint64_t rowOffset = svlsl_n_s64_z(predicateMask, rowId, 3);
+      currIndex = svld1_gather_offset(
+          predicateMask, hashes, svreinterpret_u64(rowOffset));
+    }
+
+    // calc tag
+    svuint64_t currTagTmp =
+        svlsr_n_u64_x(predicateMask, currIndex, kTagShiftBits);
+    svuint64_t currTag = svorr_n_u64_z(
+        predicateMask,
+        currTagTmp,
+        kTagMask); // 4个tag的位置0 8 16
+                   // 24，svreinterpret_u8_u64(svorr_n_u64_z(predicateMask,
+                   // currTagTmp, kTagMask));
+
+    // 计算在hashtable中的index
+    currIndex = svand_n_u64_z(predicateMask, currIndex, capacity_ - 1);
+    svuint64_t htOffset = svlsl_n_u64_z(predicateMask, currIndex, 3);
+    valVec = svld1_gather_u64offset_u64(
+        predicateMask,
+        reinterpret_cast<uint64_t*>(getValuePtr()),
+        htOffset); // hash表的value
+
+    emptyMask = svcmpeq_n_u64(predicateMask, valVec, 0);
+    if (svptest_any(predicateMask, emptyMask)) {
+      indexMask = get_uniq_mask2(
+          emptyMask,
+          currIndex); // 选出index可以不重复的地方，如果重复了，剩下的点置位0
+    } else {
+      indexMask = emptyMask;
+    }
+
+    // HashTable为空，需要写入的地方
+    svbool_t toWriteMask =
+        svand_z(predicateMask, indexMask, emptyMask); // 选出需要写入的地方
+
+    // 当前在hash表中的位置
+    uint64_t htIndices[kVectorWidth] = {0, 0, 0, 0};
+    svst1(svptrue_b64(), htIndices, currIndex);
+
+    // 当前的tag值
+    uint64_t tags[kVectorWidth] = {0, 0, 0, 0}; // 使用svcntw()获取当前矢量宽度下32位元素的最大数量，这是一种安全的做法。
+    svst1(svptrue_b64(), tags, currTag);
+
+    uint32_t flag = 0;
+    __asm__("str %1, [%0]"
+                         :
+                         : "r"(&flag), "Upl"(toWriteMask)
+                         : "memory");
+    uint32_t flag1 = flag;
+    while (flag1) {
+      int32_t offset = __builtin_ctz(flag1);
+      int32_t idx = offset / kBitsPerByte;
+      uint64_t htIdx = htIndices[idx];
+
+      getKeyPtr()[htIdx] = normalizedKeys[i + idx];
+      getValuePtr()[htIdx] =
+          insertEntryforSVE(lookup, htIdx, i + idx);
+      groups[i + idx] = getValuePtr()[htIdx];
+      getTagPtr()[htIdx] = tags[idx];
+
+      flag1 &= (flag1 - 1);
+    }
+
+
+
+  svbool_t conflictIndex = svnot_b_z(predicateMask, toWriteMask);
+  uint32_t conflictFlag = 0;
+  __asm__ __volatile__("str %1, [%0]" : : "r"(&conflictFlag), "Upl"(conflictIndex): "memory");
+    // 水平向量化插入，每个键都必插入
+    while (conflictFlag) {
+      int32_t offset = __builtin_ctz(conflictFlag);
+      int32_t idx = offset / kBitsPerByte;
+      int32_t rowIdx = i + idx;
+
+      bool processSuccess = false;
+      int64_t htStartIdx = htIndices[idx];
+
+
+      // 这里循环到数据找到为止
+      while (!processSuccess) {
+        // 这里要考虑tag到尾部的情况，从0开始；idx要+1，之前的前面比较过了
+        svbool_t tagPredicate = svwhilelt_b8(htStartIdx, capacity_);
+        svuint8_t htTag =
+            svld1_u8(tagPredicate, getTagPtr() + htStartIdx); // ht_tag
+
+        svuint8_t conflictTag =
+            svdup_lane(svreinterpret_u8_u64(currTag), offset);
+
+        svbool_t matchZero = svcmpeq_n_u8(tagPredicate, htTag, 0);
+        svbool_t conflictMatch = svcmpeq_u8(tagPredicate, htTag, conflictTag);
+        uint32_t zeroMask = 0;
+        uint32_t conflictMask = 0;
+        __asm__("str %1, [%0]"
+                             :
+                             : "r"(&zeroMask), "Upl"(matchZero)
+                             : "memory");
+        __asm__("str %1, [%0]"
+                             :
+                             : "r"(&conflictMask), "Upl"(conflictMatch)
+                             : "memory");
+        int32_t zeroBefore = kInvalidIndex;
+        int32_t htZeroIdx = kInvalidIndex;
+        if (zeroMask) {
+          zeroBefore = __builtin_ctz(zeroMask);
+          htZeroIdx = htStartIdx + zeroBefore;
+        }
+        // 拿到当前的key
+
+        uint64_t currNormalizedKey = normalizedKeys[rowIdx];
+        while (conflictMask) {
+          int32_t conflictIdx = __builtin_ctz(conflictMask);
+          //
+          if (conflictIdx > zeroBefore) {
+            // insert new
+            getKeyPtr()[htZeroIdx] = currNormalizedKey;
+            getValuePtr()[htZeroIdx] =
+                insertEntryforSVE(lookup, htZeroIdx, rowIdx);
+            groups[rowIdx] = getValuePtr()[htZeroIdx];
+            getTagPtr()[htZeroIdx] = tags[idx];
+            // 走到下一个conflict
+            processSuccess = true;
+            break;
+          } else {
+            // compare normalize key
+            int32_t htIdx =
+                htStartIdx + conflictIdx; // 从hash表中拿到key，和当前的key比较
+            if (currNormalizedKey == getKeyPtr()[htIdx]) {
+              groups[rowIdx] = getValuePtr()[htIdx];
+              // 走到下一个conflict
+              processSuccess = true;
+              break;
+            }
+          }
+          conflictMask = conflictMask & (conflictMask - 1);
+        }
+        if (zeroMask && !processSuccess) {
+          getKeyPtr()[htZeroIdx] = currNormalizedKey;
+          getValuePtr()[htZeroIdx] =
+              insertEntryforSVE(lookup, htZeroIdx, rowIdx);
+          groups[rowIdx] = getValuePtr()[htZeroIdx];
+          getTagPtr()[htZeroIdx] = tags[idx];
+          processSuccess = true;
+        }
+
+        htStartIdx =
+            capacity_ - htStartIdx > kProbeStep ? htStartIdx + kProbeStep : 0;
+      }
+      conflictFlag &= (conflictFlag - 1);
+    }
 }
 
 template <bool ignoreNullKeys>
@@ -1637,14 +1794,14 @@ void HashTable<ignoreNullKeys>::insertForGroupBy(
     // svuint64_t tabKey = svdup_n_u64(0);
 
     svuint64_t currIndex = svdup_n_u64(0);
-    // svuint64_t indexVec = svindex_u64(0, 1);
-    svint64_t rowId = svdup_n_s64(0);
+
     svbool_t indexMask = svptrue_b64();
     svbool_t emptyMask = svptrue_b64();
     // svuint8_t zeroMask = svdup_n_u8(0);
 
     int32_t i = 0;
-    while (i < numProbes) {
+    svbool_t predicateMask = svptrue_b64();
+    while (i + kVectorWidth < numProbes) {
       if (i + kVectorWidth + kPrefetchDistance < numProbes) {
         for (int32_t p = 0; p < kVectorWidth; ++p) {
           int32_t prefetchRow = i + kVectorWidth + kPrefetchDistance + p;
@@ -1656,7 +1813,6 @@ void HashTable<ignoreNullKeys>::insertForGroupBy(
         }
       }
 
-      svbool_t predicateMask = svwhilelt_b64(i, numProbes);
       // load normalized keys and curr_index
       currIndex = svld1(predicateMask, hashes + i);
 
@@ -1761,6 +1917,112 @@ void HashTable<ignoreNullKeys>::insertForGroupBy(
       }
       i += kVectorWidth;
     }
+
+    predicateMask = svwhilelt_b64(i, numProbes);
+      // load normalized keys and curr_index
+      currIndex = svld1(predicateMask, hashes + i);
+
+      // calc tag
+      svuint64_t currTagTmp =
+          svlsr_n_u64_x(predicateMask, currIndex, kTagShiftBits);
+      svuint64_t currTag = svorr_n_u64_z(
+          predicateMask,
+          currTagTmp,
+          kTagMask);
+
+      // 计算在hashtable中的index
+      currIndex = svand_n_u64_z(predicateMask, currIndex, capacity_ - 1);
+      svuint64_t htOffset = svlsl_n_u64_z(predicateMask, currIndex, 3);
+      valVec = svld1_gather_u64offset_u64(
+          predicateMask,
+          reinterpret_cast<uint64_t*>(getValuePtr()),
+          htOffset); // hash表的value
+
+      emptyMask = svcmpeq_n_u64(predicateMask, valVec, 0);
+      if (svptest_any(predicateMask, emptyMask)) {
+        indexMask = get_uniq_mask2(
+            emptyMask,
+            currIndex); // 选出index可以不重复的地方，如果重复了，剩下的点置位0
+      } else {
+        indexMask = emptyMask;
+      }
+
+      // HashTable为空，需要写入的地方
+      svbool_t toWriteMask =
+          svand_z(predicateMask, indexMask, emptyMask); // 选出需要写入的地方
+
+      // 当前在hash表中的位置
+      uint64_t htIndices[kVectorWidth] = {0, 0, 0, 0};
+      svst1(svptrue_b64(), htIndices, currIndex);
+
+      // 当前的tag值
+      uint64_t tags[kVectorWidth] = {
+          0,
+          0,
+          0,
+          0}; // 使用svcntw()获取当前矢量宽度下32位元素的最大数量，这是一种安全的做法。
+      svst1(svptrue_b64(), tags, currTag);
+
+      uint32_t flag = 0;
+      __asm__("str %1, [%0]" : : "r"(&flag), "Upl"(toWriteMask) : "memory");
+      uint32_t flag1 = flag;
+      while (flag1) {
+        int32_t offset = __builtin_ctz(flag1);
+        int32_t idx = offset / kBitsPerByte;
+        uint64_t htIdx = htIndices[idx];
+
+        getKeyPtr()[htIdx] = reinterpret_cast<uint64_t*>(groups[i + idx])[-1];
+        getValuePtr()[htIdx] = groups[i + idx];
+        getTagPtr()[htIdx] = tags[idx];
+
+        flag1 &= (flag1 - 1);
+      }
+
+    svbool_t conflictIndex = svnot_b_z(predicateMask, toWriteMask);
+    uint32_t conflictFlag = 0;
+    __asm__ __volatile__("str %1, [%0]" : : "r"(&conflictFlag), "Upl"(conflictIndex): "memory");
+      // 水平向量化插入，每个键都必插入
+      while (conflictFlag) {
+        int32_t offset = __builtin_ctz(conflictFlag);
+        int32_t idx = offset / kBitsPerByte;
+        int32_t rowIdx = i + idx;
+
+
+        int64_t htStartIdx = htIndices[idx];
+
+        // 这里循环到数据找到为止
+        while (true) {
+          // 这里要考虑tag到尾部的情况，从0开始；idx要+1，之前的前面比较过了
+          svbool_t tagPredicate = svwhilelt_b8(htStartIdx, capacity_);
+          svuint8_t htTag =
+              svld1_u8(tagPredicate, getTagPtr() + htStartIdx); // ht_tag
+
+
+          svbool_t matchZero = svcmpeq_n_u8(tagPredicate, htTag, 0);
+
+          uint32_t zeroMask = 0;
+          __asm__("str %1, [%0]"
+                  :
+                  : "r"(&zeroMask), "Upl"(matchZero)
+                  : "memory");
+
+          int32_t zeroBefore = kInvalidIndex;
+          int32_t htZeroIdx = kInvalidIndex;
+          if (zeroMask) {
+            zeroBefore = __builtin_ctz(zeroMask);
+            htZeroIdx = htStartIdx + zeroBefore;
+
+            getKeyPtr()[htZeroIdx] = reinterpret_cast<uint64_t*>(groups[rowIdx])[-1];
+            getValuePtr()[htZeroIdx] = groups[rowIdx];
+            getTagPtr()[htZeroIdx] = tags[idx];
+            break;
+          }
+
+          htStartIdx =
+              capacity_ - htStartIdx > kProbeStep ? htStartIdx + kProbeStep : 0;
+        }
+        conflictFlag &= (conflictFlag - 1);
+      }
   } else {
     constexpr int32_t kPrefetchDistance = 10;
     for (int32_t i = 0; i < numGroups; ++i) {
