@@ -23,6 +23,7 @@
 #include "velox/exec/VectorHasher.h"
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
+#include "functions/lib/aggregates/SumAggregateBase.h"
 
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <gmock/gmock-matchers.h>
@@ -985,6 +986,144 @@ TEST_P(HashTableTest, checkSizeValidation) {
   // the number of distinct entries that it stores.
   insertGroups(*vector3, *lookup, *table);
   ASSERT_EQ(table->capacity(), 512 << 10);
+}
+
+// --gtest_filter=HashTableTests/HashTableTest.addInput_getOutput_testClearNullSVE/0
+TEST_P(HashTableTest, addInput_getOutput_testClearNullSVE) {
+  // this test is to verify the bug-fix of
+  // https://gitcode.com/Oldli883/velox/issues/10 Spark SQL version with
+  // Overflow=true
+
+  // ========== 准备 input RowVectorPtr ==========
+  auto inputType = ROW({"key", "value"}, {BIGINT(), BIGINT()});
+
+  // 分组键列
+  std::vector<int32_t> ids = {1, 1, 1, 2, 2, 3};
+  auto idVector =
+      makeFlatVector<int64_t>(ids.size(), [&](auto row) { return ids[row]; });
+
+  // 被聚合列
+  std::vector<std::optional<long>> vals = {
+      10, std::nullopt, 20, std::nullopt, std::nullopt, 30};
+  auto valVector = makeNullableFlatVector<long>(vals);
+
+  // 组装 input RowVectorPtr
+  std::vector<VectorPtr> children = {idVector, valVector};
+  auto input = makeRowVector(
+      inputType->names(),
+      children); //  childAt(0): 分组键, childAt(1): 聚合输入值
+
+  // ========== 准备 SUM聚合函数 ==========
+  using SumAggregate =
+      functions::aggregate::SumAggregateBase<int64_t, int64_t, int64_t, true>;
+  auto sumAggregate = std::make_unique<SumAggregate>(BIGINT());
+
+  // ========== 准备 HashTable ==========
+  std::vector<std::unique_ptr<VectorHasher>> keyHashers;
+  keyHashers.emplace_back(
+      std::make_unique<VectorHasher>(inputType->childAt(0), 0));
+  auto tableWithAgg = HashTable<false>::createForAggregation(
+      std::move(keyHashers),
+      {Accumulator{sumAggregate.get(), nullptr}},
+      pool()); // 在这个过程中计算得到了rowColumn信息
+
+  // ========== 初始化 SUM聚合函数 ==========
+  RowContainer& row_container = *tableWithAgg->rows();
+  auto rowColumn = row_container.columnAt(1); // column 1 is aggregate
+  sumAggregate->setAllocator(&row_container.stringAllocator());
+  sumAggregate->setOffsets(
+      rowColumn.offset(),
+      rowColumn.nullByte(),
+      rowColumn.nullMask(),
+      rowColumn.initializedByte(),
+      rowColumn.initializedMask(),
+      row_container.rowSizeOffset()); // 把rowColumn里的信息传递给对应的function
+
+  // ========== 准备 lookup 和 rows ==========
+  auto lookup = std::make_unique<HashLookup>(tableWithAgg->hashers());
+  SelectivityVector rows(input->size());
+  rows.setAll();
+
+  // ========== 执行 prepareForGroupProbe ==========
+  tableWithAgg->prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  // ========== 执行 groupProbe ==========
+  tableWithAgg->groupProbe(
+      *lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  // ========== 拿到 分组映射结果 即每一行输入数据对应的所属分组行指针
+  // ==========
+  auto* groups = lookup->hits.data();
+
+  // ========== 初始化 分组聚合结果 ==========
+  const auto& newGroups = lookup->newGroups; // 本轮出现的所有新分组的下标
+  if (!newGroups.empty()) {
+    // 对newGroups索引的分组进行setAllNulls和initialize比特设置
+    sumAggregate->initializeNewGroups(
+        groups, newGroups); // 这里默认就是一个sum聚合函数
+  }
+
+  // ========== 根据输入数据到分组的映射关系，更新分组SUM聚合结果 ==========
+  std::vector<VectorPtr> args = {input->childAt(1)};
+  sumAggregate->addRawInput(groups, rows, args, false);
+
+  // ========== 拿到 分组聚合结果 output RowVectorPtr ==========
+  int32_t maxOutputRows = 1024;
+  int32_t maxOutputBytes = 100000;
+  RowContainerIterator resultIterator_;
+
+  // 创建 output RowVector
+  auto outputType = ROW({"key", "sumValue"}, {BIGINT(), BIGINT()});
+  RowVectorPtr output = std::static_pointer_cast<RowVector>(
+      BaseVector::create(outputType, input->size(), pool()));
+
+  while (true) {
+    char* groupResults[maxOutputRows];
+    const int32_t numGroups = tableWithAgg
+        ? tableWithAgg->rows()->listRows(
+              &resultIterator_, maxOutputRows, maxOutputBytes, groupResults)
+        : 0;
+    if (numGroups == 0) { // 结果全部取出
+      resultIterator_.reset();
+      break;
+    }
+
+    folly::Range<char**> results =
+        folly::Range<char**>(groupResults, numGroups);
+    output->resize(results.size());
+
+    // 提取分组键 (column 0)
+    auto& keyVector = output->childAt(0);
+    row_container.extractColumn(
+        results.data(),
+        numGroups,
+        0, // key column index in RowContainer
+        output->childAt(0));
+
+    // 提取聚合结果 (column 1)
+    auto& aggregateVector = output->childAt(1);
+    sumAggregate->extractValues(results.data(), numGroups, &aggregateVector);
+
+    // ========== 打印 分组聚合结果 output RowVectorPtr ==========
+    auto key_flat_vector = output->childAt(0)->asFlatVector<int64_t>();
+    auto aggregate_flat_vector = output->childAt(1)->asFlatVector<int64_t>();
+    std::cout << "Extracted " << numGroups << " groups:" << std::endl;
+    for (auto i = 0; i < numGroups; ++i) {
+      if (!aggregate_flat_vector->isNullAt(i)) {
+        std::cout << "Group " << key_flat_vector->valueAt(i)
+                  << " sum: " << aggregate_flat_vector->valueAt(i) << std::endl;
+      } else {
+        std::cout << "Group " << key_flat_vector->valueAt(i) << " sum: null"
+                  << std::endl;
+      }
+    }
+  }
+  // TODO 增加assert自动验证结果
+  // 正确结果是：
+  //   Group 1 sum: 30
+  //   Group 2 sum: NULL
+  //   Group 3 sum: 30
 }
 
 TEST_P(HashTableTest, NormalizedKeyMode_scalarExecution) { // normalized key mode
