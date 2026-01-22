@@ -273,20 +273,17 @@ class SumAggregateBase
           pg, ptr, this->nullByte_); // 这里要变
       svuint8_t group8 = svreinterpret_u8(group);
 
-      svuint8_t nullMasks = svdup_u8(this->nullMask_);
-      svuint8_t tmp = svand_u8_z(pg, group8, nullMasks);
-      svuint8_t zero = svdup_u8(0);
-      svbool_t test = svcmpne(svptrue_b8(), tmp, zero);
+      svuint8_t tmp = svand_n_u8_z(pg, group8, this->nullMask_);
+      svbool_t test = svcmpne_n_u8(svptrue_b8(), tmp, 0);
       if (svptest_any(svptrue_b8(), test)) {
-        svuint8_t negNullMasks = sveor_n_u8_m(svptrue_b8(), nullMasks, 0xFF);
-        svuint8_t adjust = svand_u8_m(test, group8, negNullMasks);
+        uint8_t negNull = ~this->nullMask_;
+
+        svuint8_t adjust = svand_n_u8_m(test, group8, negNull);
         svst1b_scatter_u64base_offset_s64(
             pg, ptr, this->nullByte_, svreinterpret_s64(adjust));
 
-        svuint8_t one = svdup_u8(1);
-        int num = svaddv(test, one);
+        int num = svcntp_b8(test, test);
         this->numNulls_ -= num;
-        this->numNulls_ = this->numNulls_ < 0 ? 0 : this->numNulls_;
         return true;
       }
     }
