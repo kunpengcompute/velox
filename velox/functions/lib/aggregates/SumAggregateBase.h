@@ -453,6 +453,24 @@ class SumAggregateBase
     }
   }
 
+  inline __attribute__((always_inline)) svbool_t
+  getUinqMask(svbool_t pg, const svuint64_t val) {
+    svuint64_t s1 = svext_u64(val, val, 1);
+    svbool_t mask2 = svcmpeq(svwhilelt_b64(0, 3), val, s1);
+
+    svuint64_t s2 = svext_u64(val, val, 2);
+    svbool_t mask3 = svcmpeq(svwhilelt_b64(0, 2), val, s2);
+    svbool_t mask12 = svorr_b_z(pg, mask2, mask3);
+
+    svuint64_t s3 = svext_u64(val, val, 3);
+    svbool_t mask4 = svcmpeq(svwhilelt_b64(0, 1), val, s3);
+
+    svbool_t mask = svorr_b_z(pg, mask4, mask12);
+    mask = svnot_b_z(pg, mask);
+
+    return mask;
+  }
+
     void hashAggUpdateSVEWithCharForNormal(
       char** result,
       uint64_t* bitmap1,
@@ -497,7 +515,8 @@ class SumAggregateBase
           if (svptest_any(svptrue_b64(), mask20)) {
             svuint64_t ptr =
                 svld1(mask20, reinterpret_cast<uint64_t*>(result + count));
-            clearNullSVE(ptr, mask20);
+            svbool_t m20 = getUinqMask(mask20, ptr);
+            clearNullSVE(ptr, m20);
             uint8_t flag0[4] = {0, 0, 0, 0};
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag0[0]), "Upl" (mask20) : "memory");
             for (int i = 0; i < 4; i++) {
@@ -510,7 +529,8 @@ class SumAggregateBase
           if (svptest_any(svptrue_b64(), mask21)) {
             svuint64_t ptr =
                 svld1(mask21, reinterpret_cast<uint64_t*>(result + count + 4));
-            clearNullSVE(ptr, mask21);
+            svbool_t m21 = getUinqMask(mask21, ptr);
+            clearNullSVE(ptr, m21);
             uint8_t flag1[4] = {0, 0, 0, 0};
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag1[0]), "Upl" (mask21) : "memory");
             for (int i = 0; i < 4; i++) {
@@ -527,7 +547,8 @@ class SumAggregateBase
           if (svptest_any(svptrue_b64(), mask22)) {
             svuint64_t ptr =
                 svld1(mask22, reinterpret_cast<uint64_t*>(result + count + 8));
-            clearNullSVE(ptr, mask22);
+            svbool_t m22 = getUinqMask(mask22, ptr);
+            clearNullSVE(ptr, m22);
             uint8_t flag2[4] = {0, 0, 0, 0};
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag2[0]), "Upl" (mask22) : "memory");
             for (int i = 0; i < 4; i++) {
@@ -540,7 +561,8 @@ class SumAggregateBase
           if (svptest_any(svptrue_b64(), mask23)) {
             svuint64_t ptr =
                 svld1(mask23, reinterpret_cast<uint64_t*>(result + count + 12));
-            clearNullSVE(ptr, mask23);
+            svbool_t m23 = getUinqMask(mask23, ptr);
+            clearNullSVE(ptr, m23);
             uint8_t flag3[4] = {0, 0, 0, 0};
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag3[0]), "Upl" (mask23) : "memory");
             for (int i = 0; i < 4; i++) {
@@ -561,7 +583,8 @@ class SumAggregateBase
           if (svptest_any(svptrue_b64(), mask24)) {
             svuint64_t ptr =
                 svld1(mask24, reinterpret_cast<uint64_t*>(result + count + 16));
-            clearNullSVE(ptr, mask24);
+            svbool_t m24 = getUinqMask(mask24, ptr);
+            clearNullSVE(ptr, m24);
             uint8_t flag4[4] = {0, 0, 0, 0};
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag4[0]), "Upl" (mask24) : "memory");
             for (int i = 0; i < 4; i++) {
@@ -574,7 +597,8 @@ class SumAggregateBase
           if (svptest_any(svptrue_b64(), mask25)) {
             svuint64_t ptr =
                 svld1(mask25, reinterpret_cast<uint64_t*>(result + count + 20));
-            clearNullSVE(ptr, mask25);
+            svbool_t m25 = getUinqMask(mask25, ptr);
+            clearNullSVE(ptr, m25);
             uint8_t flag5[4] = {0, 0, 0, 0};
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag5[0]), "Upl" (mask25) : "memory");
             for (int i = 0; i < 4; i++) {
@@ -592,7 +616,8 @@ class SumAggregateBase
           if (svptest_any(svptrue_b64(), mask26)) {
             svuint64_t ptr =
                 svld1(mask26, reinterpret_cast<uint64_t*>(result + count + 24));
-            clearNullSVE(ptr, mask26);
+            svbool_t m26 = getUinqMask(mask26, ptr);
+            clearNullSVE(ptr, m26);
             uint8_t flag6[4] = {0, 0, 0, 0};
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag6[0]), "Upl" (mask26) : "memory");
             for (int i = 0; i < 4; i++) {
@@ -605,7 +630,8 @@ class SumAggregateBase
           if (svptest_any(svptrue_b64(), mask27)) {
             svuint64_t ptr =
                 svld1(mask27, reinterpret_cast<uint64_t*>(result + count + 28));
-            clearNullSVE(ptr, mask27);
+            svbool_t m27 = getUinqMask(mask27, ptr);
+            clearNullSVE(ptr, m27);
             uint8_t flag7[4] = {0, 0, 0, 0};
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag7[0]), "Upl" (mask27) : "memory");
             for (int i = 0; i < 4; i++) {
