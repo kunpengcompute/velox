@@ -991,8 +991,8 @@ TEST_P(HashTableTest, checkSizeValidation) {
 // --gtest_filter=HashTableTests/HashTableTest.addInput_getOutput_testClearNullSVE/0
 TEST_P(HashTableTest, addInput_getOutput_testClearNullSVE) {
   // this test is to verify the bug-fix of
-  // https://gitcode.com/Oldli883/velox/issues/10 Spark SQL version with
-  // Overflow=true
+  // https://gitcode.com/Oldli883/velox/issues/10
+  // Spark SQL version with Overflow=true calls clearNullSVE.
 
   // ========== 准备 input RowVectorPtr ==========
   auto inputType = ROW({"key", "value"}, {BIGINT(), BIGINT()});
@@ -1118,12 +1118,424 @@ TEST_P(HashTableTest, addInput_getOutput_testClearNullSVE) {
                   << std::endl;
       }
     }
+    std::cout << "\nExpected result:" << std::endl;
+    std::cout << "Group 1 sum: 30\nGroup 2 sum: NULL\nGroup 3 sum: 30\n" << std::endl;
   }
-  // TODO 增加assert自动验证结果
-  // 正确结果是：
-  //   Group 1 sum: 30
-  //   Group 2 sum: NULL
-  //   Group 3 sum: 30
+}
+
+// ============================================================================
+// Test Cases: HashTable with String Keys in NormalizedKey Mode
+// ============================================================================
+// These tests demonstrate different scenarios where normalizedKey mode is used
+// with various combinations of useRange=true/false.
+// - twoString_normalizedRange: normalizedKey mode with range id (useRange=true) due to small rangeSize and distinctOverflow_
+// - twoString_normalizedDistinct_Over7Bytes: normalizedKey mode with distinct id (useRange=false) for long strings over 7 bytes
+// - twoString_normalizedMixed: normalizedKey mode with mixed range/distinct id due to rangeSize large but not extremely large
+// - twoString_normalizedDistinct_Within7Bytes: normalizedKey mode with distinct id (useRange=false) due to rangeSize too large
+
+TEST_P(HashTableTest, twoString_normalizedRange) {
+  /**
+   * Test Case: Two string keys with useRange=true in normalizedKey mode.
+   *
+   * Conditions:
+   * 1. Each string key is <= 7 bytes, allowing stringAsNumber() to map it to int64_t.
+   * 2. The product of two keys' rangeSize fits in int64_t, enabling encoding:
+   *    id = id2 + multiplier_ * id1
+   *    where id1 = stringAsNumber(str1) - min_ + 1
+   *          id2 = stringAsNumber(str2) - min_ + 1
+   *
+   * Example:
+   * - Both keys encode integers 0-2000000 as 7-byte binary strings.
+   * - Single key rangeSize = 4000003 (with reserve).
+   * - Combined rangeSize = 16000024000009 < kRangeTooLarge.
+   * - Each key has > 100K distinct values (distinctOverflow_ = true).
+   *
+   * Decision Path in decideHashMode():
+   * - rangesWithReserve != kRangeTooLarge, so enters:
+   *   if (rangesWithReserve != VectorHasher::kRangeTooLarge) branch.
+   * - Final decision: useRange=true normalizedKey mode.
+   * - id=id2+multiplier_*id1=(stringAsNumber(str2)-min_+1)+4000003*(stringAsNumber(str1)-min_+1)
+   *
+   * Why not use std::to_string(row)?
+   * - "2000000" is 7 bytes, which is acceptable for stringAsNumber
+   * - However, different string lengths map to different numeric ranges:
+   *   "0" (1 byte) -> stringAsNumber = (2^8 + 0x30)
+   *   "2000000" (7 bytes) -> stringAsNumber = (2^56 + 0x30303030303032)
+   * - This causes huge rangeSize, making rangeSize1 * rangeSize2 overflow.
+   */
+
+  // Setup
+  auto rowType = ROW({"a", "b"}, {VARCHAR(), VARCHAR()});
+  auto table_ptr = createHashTableForAggregation(rowType, 2);
+  HashTable<false>& table = *table_ptr;
+
+  constexpr int totalRows = 2000000;
+
+  // Prepare input: encode integers 0-2000000 as fixed 7-byte binary strings.
+  // Example: 2000000 (decimal) = 0x1E8480 (hex) = 3 bytes, padded to 7 bytes.
+  auto input = makeRowVector({
+      makeFlatVector<std::string>(totalRows, [](auto row) {
+          std::string str(7, '\0');
+          int64_t value = row;
+          // Little-endian encoding (consistent with loadPartialWord).
+          // This ensures stringAsNumber() produces the same decimal value.
+          for (int i = 0; i < 7; ++i) {
+              str[i] = static_cast<char>(value & 0xFF);
+              value >>= 8;
+          }
+          return str;
+      }),
+      makeFlatVector<std::string>(totalRows, [](auto row) {
+          std::string str(7, '\0');
+          int64_t value = row;
+          for (int i = 0; i < 7; ++i) {
+              str[i] = static_cast<char>(value & 0xFF);
+              value >>= 8;
+          }
+          return str;
+      })
+  });
+
+  // Prepare lookup
+  auto lookup_ptr = std::make_unique<HashLookup>(table.hashers());
+  HashLookup& lookup = *lookup_ptr;
+  SelectivityVector rows(input->size());
+
+  // Execute group probe
+  table.prepareForGroupProbe(
+      lookup,
+      input,
+      rows,
+      BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  // Verify results
+  std::cout << "Hash table mode: " << table.hashMode() << std::endl;
+
+  const auto& hashers = table.hashers();
+  std::cout << "\nVectorHasher Details:" << std::endl;
+  for (size_t i = 0; i < hashers.size(); ++i) {
+      std::cout << "VectorHasher[" << i << "]: " << hashers[i]->toString()
+                << std::endl;
+      std::cout << "  useRange: " << (hashers[i]->isRange() ? "true" : "false")
+                << std::endl;
+  }
+
+  // Decode and print first 5 rows
+  std::cout << "\nFirst 5 rows (decoded keys):" << std::endl;
+  auto decode = [](const StringView& sv) -> int64_t {
+      int64_t value = 0;
+      for (size_t j = 0; j < sv.size() && j < 7; ++j) {
+          value |= (static_cast<int64_t>(static_cast<unsigned char>(sv.data()[j]))
+                    << (j * 8));
+      }
+      return value;
+  };
+
+  for (auto i = 0; i < 5; ++i) {
+      std::cout << "  Row " << i << ": key0="
+                << decode(reinterpret_cast<StringView*>(lookup.hits[i])[0])
+                << ", key1="
+                << decode(reinterpret_cast<StringView*>(lookup.hits[i])[1])
+                << std::endl;
+  }
+
+  std::cout << "\nExpected: normalizedKey mode with useRange=true for both keys"
+            << std::endl;
+  std::cout << "--------------------------------------------------------------"
+            << std::endl;
+
+  ASSERT_EQ(table.hashMode(), BaseHashTable::HashMode::kNormalizedKey);
+  ASSERT_EQ(hashers.size(), 2);
+  ASSERT_TRUE(hashers[0]->isRange()) << "Key 0 should use range mode";
+  ASSERT_TRUE(hashers[1]->isRange()) << "Key 1 should use range mode";
+}
+
+TEST_P(HashTableTest, twoString_normalizedDistinct_Over7Bytes) {
+  /**
+   * Test Case: Two string keys > 7 bytes with useRange=false in normalizedKey mode.
+   *
+   * Conditions:
+   * 1. String length = 8 bytes (> kStringASRangeMaxSize=7), causing rangeOverflow.
+   * 2. Each key has 50K distinct values (< kMaxDistinct=100K), no distinctOverflow.
+   * 3. distinctSize = 50000 * (1 + 0.5) + 1 = 75001 (with reserve).
+   * 4. distinctSize1 * distinctSize2 < 2^64, fits in normalized key.
+   *
+   * Decision Path in decideHashMode():
+   * - rangeOverflow_ = true (strings > 7 bytes).
+   * - distinctOverflow_ = false (50K < 100K).
+   * - Final decision: useRange=false normalizedKey mode (distinct mode).
+   */
+
+  // Setup
+  auto rowType = ROW({"a", "b"}, {VARCHAR(), VARCHAR()});
+  auto table_ptr = createHashTableForAggregation(rowType, 2);
+  HashTable<false>& table = *table_ptr;
+
+  constexpr int numDistinctPerKey = 50000;  // Must be < 100K to avoid distinctOverflow
+  constexpr int totalRows = 2000000;
+
+  // Prepare input: 8-byte strings (exceeds 7-byte limit for stringAsNumber)
+  auto input = makeRowVector({
+      makeFlatVector<std::string>(totalRows, [numDistinctPerKey](auto row) {
+          std::string str(8, '\0');
+          int64_t value = row % numDistinctPerKey;
+          // Encode value in first 7 bytes (little-endian)
+          for (int i = 0; i < 7; ++i) {
+              str[i] = static_cast<char>(value & 0xFF);
+              value >>= 8;
+          }
+          // Set 8th byte to ensure total length is 8 bytes (triggers rangeOverflow)
+          str[7] = static_cast<char>('A');
+          return str;
+      }),
+      makeFlatVector<std::string>(totalRows, [numDistinctPerKey](auto row) {
+          std::string str(8, '\0');
+          int64_t value = row % numDistinctPerKey;
+          for (int i = 0; i < 7; ++i) {
+              str[i] = static_cast<char>(value & 0xFF);
+              value >>= 8;
+          }
+          str[7] = static_cast<char>('B');
+          return str;
+      })
+  });
+
+  // Prepare lookup
+  auto lookup_ptr = std::make_unique<HashLookup>(table.hashers());
+  HashLookup& lookup = *lookup_ptr;
+  SelectivityVector rows(input->size());
+
+  // Execute group probe
+  table.prepareForGroupProbe(
+      lookup,
+      input,
+      rows,
+      BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  // Verify results
+  std::cout << "Hash table mode: " << table.hashMode() << std::endl;
+
+  const auto& hashers = table.hashers();
+  std::cout << "\nVectorHasher Details:" << std::endl;
+  for (size_t i = 0; i < hashers.size(); ++i) {
+      std::cout << "VectorHasher[" << i << "]: " << hashers[i]->toString()
+                << std::endl;
+      std::cout << "  useRange: " << (hashers[i]->isRange() ? "true" : "false")
+                << std::endl;
+  }
+
+  // Print first 5 rows in hex format
+  std::cout << "\nFirst 5 rows (hex format):" << std::endl;
+  auto printKey = [](const StringView& sv) -> std::string {
+      std::ostringstream oss;
+      oss << "len=" << sv.size() << " hex=[";
+      for (size_t j = 0; j < std::min(sv.size(), size_t(8)); ++j) {
+          if (j > 0) {
+              oss << " ";
+          }
+          unsigned char byte = static_cast<unsigned char>(sv.data()[j]);
+          char hex[5];
+          snprintf(hex, sizeof(hex), "0x%02X", byte);
+          oss << hex;
+      }
+      oss << "]";
+      return oss.str();
+  };
+
+  for (auto i = 0; i < 5; ++i) {
+      std::cout << "  Row " << i << ": key0="
+                << printKey(reinterpret_cast<StringView*>(lookup.hits[i])[0])
+                << ", key1="
+                << printKey(reinterpret_cast<StringView*>(lookup.hits[i])[1])
+                << std::endl;
+  }
+
+  std::cout << "\nExpected: normalizedKey mode with useRange=false for both keys"
+            << std::endl;
+  std::cout << "--------------------------------------------------------------"
+            << std::endl;
+  ASSERT_EQ(table.hashMode(), BaseHashTable::HashMode::kNormalizedKey);
+  ASSERT_EQ(hashers.size(), 2);
+  ASSERT_FALSE(hashers[0]->isRange()) << "Key 0 should NOT use range mode";
+  ASSERT_FALSE(hashers[1]->isRange()) << "Key 1 should NOT use range mode";
+}
+
+TEST_P(HashTableTest, twoString_normalizedMixed) {
+  /**
+   * Test Case: Two string keys with mixed useRange (true/false) in normalizedKey mode.
+   *
+   * Conditions:
+   * 1. Use std::to_string(), producing strings of length 1-5 bytes.
+   * 2. Different string lengths map to different numeric ranges:
+   *    - "0" (1 byte) -> stringAsNumber = 304 (2^8 + 48)
+   *    - "20" (2 bytes) -> stringAsNumber = 77874 (2^16 + 12338)
+   *    - "49999" (5 bytes) -> stringAsNumber = 1345284815156 (2^40 + 245773187380)
+   * 3. This causes large rangeSize (but not extremely large), and distinctSize remains small (50K).
+   * 4. rangeSizes[0] * distinctSizes[1] < kRangeTooLarge.
+   *
+   * Decision Path in decideHashMode():
+   * - enableRangeWhereCan() is called to optimize.
+   * - Key 0: rangeSize is acceptable, useRange=true.
+   * - Key 1: switching to range would overflow, useRange=false.
+   * - Final decision: Key 0 useRange=true, Key 1 useRange=false.
+   */
+
+  // Setup
+  auto rowType = ROW({"a", "b"}, {VARCHAR(), VARCHAR()});
+  auto table_ptr = createHashTableForAggregation(rowType, 2);
+  HashTable<false>& table = *table_ptr;
+
+  constexpr int numDistinctPerKey = 50000;
+  constexpr int totalRows = 2000000;
+
+  // Prepare input: use std::to_string() to create variable-length strings
+  auto input = makeRowVector({
+      makeFlatVector<std::string>(totalRows, [numDistinctPerKey](auto row) {
+          return std::to_string(row % numDistinctPerKey);
+      }),
+      makeFlatVector<std::string>(totalRows, [numDistinctPerKey](auto row) {
+          return std::to_string(row % numDistinctPerKey);
+      })
+  });
+
+  // Prepare lookup
+  auto lookup_ptr = std::make_unique<HashLookup>(table.hashers());
+  HashLookup& lookup = *lookup_ptr;
+  SelectivityVector rows(input->size());
+
+  // Execute group probe
+  table.prepareForGroupProbe(
+      lookup,
+      input,
+      rows,
+      BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  // Verify results
+  std::cout << "Hash table mode: " << table.hashMode() << std::endl;
+
+  const auto& hashers = table.hashers();
+  std::cout << "\nVectorHasher Details:" << std::endl;
+  for (size_t i = 0; i < hashers.size(); ++i) {
+      std::cout << "VectorHasher[" << i << "]: " << hashers[i]->toString()
+                << std::endl;
+      std::cout << "  useRange: " << (hashers[i]->isRange() ? "true" : "false")
+                << std::endl;
+  }
+
+  // Print first 5 rows
+  std::cout << "\nFirst 5 rows:" << std::endl;
+  auto printKey = [](const StringView& sv) -> std::string {
+      std::ostringstream oss;
+      oss << "len=" << sv.size() << " str=\"" << sv.getString() << "\"";
+      return oss.str();
+  };
+
+  for (auto i = 0; i < 5; ++i) {
+      std::cout << "  Row " << i << ": key0="
+                << printKey(reinterpret_cast<StringView*>(lookup.hits[i])[0])
+                << ", key1="
+                << printKey(reinterpret_cast<StringView*>(lookup.hits[i])[1])
+                << std::endl;
+  }
+
+  std::cout << "\nExpected: normalizedKey mode with useRange=true for key0, "
+            << "useRange=false for key1" << std::endl;
+  std::cout << "--------------------------------------------------------------"
+            << std::endl;
+  ASSERT_EQ(table.hashMode(), BaseHashTable::HashMode::kNormalizedKey);
+  ASSERT_EQ(hashers.size(), 2);
+  ASSERT_TRUE(hashers[0]->isRange()) << "Key 0 should use range mode";
+  ASSERT_FALSE(hashers[1]->isRange()) << "Key 1 should NOT use range mode";
+}
+
+TEST_P(HashTableTest, twoString_normalizedDistinct_Within7Bytes) {
+  /**
+   * Test Case: Two string keys with useRange=false in normalizedKey mode.
+   *
+   * Conditions:
+   * 1. Use std::to_string() with multiplier, producing strings of length 1-7 bytes.
+   * 2. Different string lengths map to different numeric ranges, causing huge rangeSize:
+   *    - "0" (1 byte) -> stringAsNumber = 304 (2^8 + 48)
+   *    - "4999900" (7 bytes) -> stringAsNumber = 72057594037967936 (2^56 + ...)
+   * 3. Each key has 50K distinct values (< kMaxDistinct=100K).
+   * 4. rangeSizes[0] * distinctSizes[1] = kRangeTooLarge (overflow).
+   *
+   * Decision Path in decideHashMode():
+   * - rangeSizes[0] * distinctSizes[1] = kRangeTooLarge (overflow) prevents useRange=true.
+   * - distinctSize fits, so useRange=false normalizedKey mode is used.
+   */
+
+  // Setup
+  auto rowType = ROW({"a", "b"}, {VARCHAR(), VARCHAR()});
+  auto table_ptr = createHashTableForAggregation(rowType, 2);
+  HashTable<false>& table = *table_ptr;
+
+  constexpr int numDistinctPerKey = 50000;
+  constexpr int totalRows = 2000000;
+  constexpr int multiplier = 100;  // Multiply to create strings of length 1-7 bytes
+
+  // Prepare input: use std::to_string() with multiplier
+  auto input = makeRowVector({
+      makeFlatVector<std::string>(totalRows, [numDistinctPerKey, multiplier](auto row) {
+          return std::to_string((row % numDistinctPerKey) * multiplier);
+      }),
+      makeFlatVector<std::string>(totalRows, [numDistinctPerKey, multiplier](auto row) {
+          return std::to_string((row % numDistinctPerKey) * multiplier);
+      })
+  });
+
+  // Prepare lookup
+  auto lookup_ptr = std::make_unique<HashLookup>(table.hashers());
+  HashLookup& lookup = *lookup_ptr;
+  SelectivityVector rows(input->size());
+
+  // Execute group probe
+  table.prepareForGroupProbe(
+      lookup,
+      input,
+      rows,
+      BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  // Verify results
+  std::cout << "Hash table mode: " << table.hashMode() << std::endl;
+
+  const auto& hashers = table.hashers();
+  std::cout << "\nVectorHasher Details:" << std::endl;
+  for (size_t i = 0; i < hashers.size(); ++i) {
+      std::cout << "VectorHasher[" << i << "]: " << hashers[i]->toString()
+                << std::endl;
+      std::cout << "  useRange: " << (hashers[i]->isRange() ? "true" : "false")
+                << std::endl;
+  }
+
+  // Print first 5 rows
+  std::cout << "\nFirst 5 rows:" << std::endl;
+  auto printKey = [](const StringView& sv) -> std::string {
+      std::ostringstream oss;
+      oss << "len=" << sv.size() << " str=\"" << sv.getString() << "\"";
+      return oss.str();
+  };
+
+  for (auto i = 0; i < 5; ++i) {
+      std::cout << "  Row " << i << ": key0="
+                << printKey(reinterpret_cast<StringView*>(lookup.hits[i])[0])
+                << ", key1="
+                << printKey(reinterpret_cast<StringView*>(lookup.hits[i])[1])
+                << std::endl;
+  }
+
+  std::cout << "\nExpected: normalizedKey mode with useRange=false for both keys"
+            << std::endl;
+  std::cout << "--------------------------------------------------------------"
+            << std::endl;
+  ASSERT_EQ(table.hashMode(), BaseHashTable::HashMode::kNormalizedKey);
+  ASSERT_EQ(hashers.size(), 2);
+  ASSERT_FALSE(hashers[0]->isRange()) << "Key 0 should NOT use range mode";
+  ASSERT_FALSE(hashers[1]->isRange()) << "Key 1 should NOT use range mode";
 }
 
 TEST_P(HashTableTest, NormalizedKeyMode_scalarExecution) { // normalized key mode
