@@ -94,7 +94,11 @@ void SelectiveColumnReader::seekTo(int64_t offset, bool readsNullsOnly) {
 }
 
 void SelectiveColumnReader::initReturnReaderNulls(const RowSet& rows) {
+#if defined(__aarch64__) 
+  if (useArmBulkPath() && !scanSpec_->hasFilter()) {
+#else
   if (useBulkPath() && !scanSpec_->hasFilter()) {
+#endif
     anyNulls_ = nullsInReadRange_ != nullptr;
     const bool isDense = rows.back() == rows.size() - 1;
     returnReaderNulls_ = anyNulls_ && isDense;

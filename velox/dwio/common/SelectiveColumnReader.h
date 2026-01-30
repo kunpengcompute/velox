@@ -416,6 +416,16 @@ class SelectiveColumnReader {
          !scanSpec_->valueHook()->acceptsNulls());
   }
 
+  bool useArmBulkPath() const {
+    auto* filter = scanSpec_->filter();
+    return hasBulkPath() && 
+        (!filter ||
+         (filter->isDeterministic() &&
+          (!nullsInReadRange_ || !filter->testNull()))) &&
+        (!scanSpec_->valueHook() || !nullsInReadRange_ ||
+         !scanSpec_->valueHook()->acceptsNulls());
+  }
+
   // true if 'this' has a fast path.
   virtual bool hasBulkPath() const {
     return true;

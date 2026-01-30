@@ -403,6 +403,19 @@ bool nonNullRowsFromSparse(
       nulls, rows, innerRows, outerRows, resultNullBytes, tailSkip);
 }
 
+// See SelectiveColumnReader::useArmBulkPath.
+template <typename Visitor, bool hasNulls>
+bool useArmFastPath(Visitor& visitor) {
+  return (!std::is_same_v<typename Visitor::DataType, int128_t>) &&
+      Visitor::FilterType::deterministic &&
+      Visitor::kHasBulkPath &&
+      (std::
+           is_same_v<typename Visitor::FilterType, velox::common::AlwaysTrue> ||
+       !hasNulls || !visitor.allowNulls()) &&
+      (std::is_same_v<typename Visitor::HookType, NoHook> || !hasNulls ||
+       Visitor::HookType::kSkipNulls);
+}
+
 // See SelectiveColumnReader::useBulkPath.
 template <typename Visitor, bool hasNulls>
 bool useFastPath(Visitor& visitor) {
