@@ -619,12 +619,7 @@ struct Gather<T, int32_t, A, 4> {
   apply(const T* base, VIndexType vindex, const xsimd::sve&) {
     alignas(A::alignment()) int32_t indices[vindex.size];
     vindex.store_aligned(indices);
-    svint32_t hashes_vec = svld1_s32(svptrue_b32(), indices); 
-    return reinterpret_cast<typename xsimd::batch<T, A>::register_type>(
-          svld1_gather_s32index_s32(
-                svptrue_b32(), 
-                reinterpret_cast<const int32_t*>(base), 
-                hashes_vec));
+    return genericGather<T, A, kScale>(base, indices);
   }
 #endif
 
