@@ -159,6 +159,7 @@ class SumAggregateBase
       }
       return pg;
     } else if (mode == 3) {
+
       svuint32_t onc = svdup_u32(1);
       svuint32_t inv = svindex_u32(0, 1);
       svuint32_t pow = svlsl_m(svptrue_b32(), onc, inv);
@@ -167,12 +168,11 @@ class SumAggregateBase
 
       svuint32_t posv, idxbufv, bufv, offsetv;
       svbool_t nullvec, pg1;
+
+      // 处理第一个8元素块
       pg1 = svwhilelt_b32(index*8, length);
-      posv = svld1(
-          pg1,
-          dic +
-              (index *
-               8)); // 这里要从arr8的index，转成这个代表第几个元素，所以要乘8
+      // 使用安全的方式加载字典值，确保不会越界
+      posv = svld1(pg1, dic + index * 8);
       idxbufv = svlsr_x(pg1, posv, 5); // div 32 得到uint32 对应下标
       bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
       offsetv = svand_m(pg1, posv, 0b11111); // uint32内偏移，mod 32
@@ -186,7 +186,8 @@ class SumAggregateBase
         tmpNulls[0] = 0;
       }
 
-      pg1 = svwhilelt_b32(index*8, length);
+      // 处理第二个8元素块
+      pg1 = svwhilelt_b32(index*8 + 8, length);
       posv = svld1(pg1, dic + index*8 + 8);
       idxbufv = svlsr_x(pg1, posv, 5); // div 32 得到uint32 对应下标
       bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
@@ -201,7 +202,8 @@ class SumAggregateBase
         tmpNulls[1] = 0;
       }
 
-      pg1 = svwhilelt_b32(index*8, length);
+      // 处理第三个8元素块
+      pg1 = svwhilelt_b32(index*8 + 16, length);
       posv = svld1(pg1, dic + index*8 + 16);
       idxbufv = svlsr_x(pg1, posv, 5); // div 32 得到uint32 对应下标
       bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
@@ -216,7 +218,8 @@ class SumAggregateBase
         tmpNulls[2] = 0;
       }
 
-      pg1 = svwhilelt_b32(index*8, length);
+      // 处理第四个8元素块
+      pg1 = svwhilelt_b32(index*8 + 24, length);
       posv = svld1(pg1, dic + index*8 + 24);
       idxbufv = svlsr_x(pg1, posv, 5); // div 32 得到uint32 对应下标
       bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
@@ -230,13 +233,15 @@ class SumAggregateBase
       } else {
         tmpNulls[3] = 0;
       }
+
       __asm__ __volatile__("ldr %0, [%1]"
                            : "=Upl"(pg)
                            : "r"(tmpNulls)
                            : "memory");
       return pg;
     }
-    // 其实最后一种情况和第一个是一样的
+    // 默认返回全false掩码
+    pg = svpfalse();
     return pg;
   }
 
