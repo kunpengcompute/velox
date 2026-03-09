@@ -22,6 +22,7 @@
 
 #include "velox/common/memory/subOp/include/enhanced_hash_agg/EnhancedGroupingSet.h"
 #include "velox/common/memory/subOp/include/enhanced_hash_agg/EnhancedSumAggregateBase.h"
+#include "velox/exec/AggregateCompanionAdapter.h"
 #include "velox/exec/PrefixSort.h"
 #include "velox/exec/Task.h"
 #include "velox/expression/Expr.h"
@@ -81,53 +82,68 @@ void EnhancedHashAggregation::initialize() {
   std::vector<AggregateInfo> aggregateInfos = toAggregateInfo(
       *aggregationNode_, *operatorCtx_, numHashers, expressionEvaluator);
 
-  // Replace sum aggregate functions with SVE-optimized versions if applicable
-  // Match each AggregateInfo with the corresponding aggregate from AggregationNode
+  // Replace sum aggregate functions with SVE-optimized versions if applicable.
+  // Gluten Final stage uses sum_merge_extract / spark_sum_merge_extract (not
+  // sum_merge). See SubstraitToVeloxPlan: kFinal -> "_merge_extract" suffix.
   const auto& aggregates = aggregationNode_->aggregates();
+  auto isSumLikeForReplacement = [](const std::string& name) {
+    return name == "sum" || name == "sum_partial" || name == "sum_merge" ||
+           name == "sum_merge_extract" || name == "spark_sum" ||
+           name == "spark_sum_partial" || name == "spark_sum_merge" ||
+           name == "spark_sum_merge_extract" ||
+           name.rfind("sum_merge_extract", 0) == 0 ||
+           name.rfind("spark_sum_merge_extract", 0) == 0;
+  };
+
   for (size_t i = 0; i < aggregateInfos.size() && i < aggregates.size(); ++i) {
     if (aggregateInfos[i].function && aggregates[i].call) {
       const std::string& funcName = aggregates[i].call->name();
       const auto& rawInputTypes = aggregates[i].rawInputTypes;
       const auto& resultType = aggregateInfos[i].function->resultType();
-      
-      // Check if this is a sum function with BIGINT types that can use SVE optimization
-      if ((funcName == "sum" || funcName == "sum_partial") &&
-          !rawInputTypes.empty() && rawInputTypes[0]->isBigint() &&
-          resultType->isBigint()) {
-        // Determine Overflow parameter based on the original aggregate's type
-        // Spark SQL uses Overflow=true, Presto SQL uses Overflow=false
-        // We detect by checking the type name of the original aggregate
-        bool useOverflow = true; // Default to true for Spark SQL
-        
-        // Try to detect from the original aggregate's type name
-        // Note: typeid().name() is compiler-dependent, but should be consistent
-        // within the same build environment
-        const std::string typeName = typeid(*aggregateInfos[i].function).name();
-        
-        // Check if the type name contains indicators of Spark SQL or Presto SQL
-        // Spark SQL aggregates are typically in "sparksql" namespace
-        // Presto SQL aggregates are typically in "prestosql" namespace
-        // We search for these patterns in the mangled type name
-        if (typeName.find("sparksql") != std::string::npos ||
-            typeName.find("spark") != std::string::npos) {
-          useOverflow = true; // Spark SQL uses Overflow=true
-        } else if (typeName.find("prestosql") != std::string::npos ||
-                   typeName.find("presto") != std::string::npos) {
-          useOverflow = false; // Presto SQL uses Overflow=false
-        }
-        // If neither pattern is found, default to true (Spark SQL behavior)
-        
-        // Create SVE-optimized sum aggregate with detected Overflow setting
-        // Note: setOffsets will be called later by GroupingSet, so we don't need to copy state here
-        if (useOverflow) {
-          aggregateInfos[i].function = std::make_unique<
-              functions::aggregate::EnhancedSumAggregateBase<int64_t, int64_t, int64_t, true>>(
-              resultType);
-        } else {
-          aggregateInfos[i].function = std::make_unique<
-              functions::aggregate::EnhancedSumAggregateBase<int64_t, int64_t, int64_t, false>>(
-              resultType);
-        }
+
+      if (!isSumLikeForReplacement(funcName) || rawInputTypes.empty() ||
+          !rawInputTypes[0]->isBigint() || !resultType->isBigint()) {
+        continue;
+      }
+
+      // Determine Overflow: Spark SQL uses true, Presto SQL uses false
+      bool useOverflow = true;
+      const std::string typeName = typeid(*aggregateInfos[i].function).name();
+      if (typeName.find("prestosql") != std::string::npos ||
+          typeName.find("presto") != std::string::npos) {
+        useOverflow = false;
+      }
+
+      std::unique_ptr<Aggregate> baseAgg;
+      if (useOverflow) {
+        baseAgg = std::make_unique<
+            functions::aggregate::EnhancedSumAggregateBase<int64_t, int64_t,
+                                                          int64_t, true>>(
+            resultType);
+      } else {
+        baseAgg = std::make_unique<
+            functions::aggregate::EnhancedSumAggregateBase<int64_t, int64_t,
+                                                          int64_t, false>>(
+            resultType);
+      }
+
+      // sum_merge / spark_sum_merge: MergeFunction (intermediate stage).
+      // *_merge_extract*: MergeExtractFunction (Final stage, used by Gluten).
+      // sum / sum_partial: use base directly.
+      const bool isMergeExtract = (funcName.find("merge_extract") !=
+                                   std::string::npos);
+      const bool isMerge =
+          (funcName == "sum_merge" || funcName == "spark_sum_merge");
+      if (isMergeExtract) {
+        aggregateInfos[i].function = std::make_unique<
+            AggregateCompanionAdapter::MergeExtractFunction>(std::move(baseAgg),
+                                                            resultType);
+      } else if (isMerge) {
+        aggregateInfos[i].function = std::make_unique<
+            AggregateCompanionAdapter::MergeFunction>(std::move(baseAgg),
+                                                     resultType);
+      } else {
+        aggregateInfos[i].function = std::move(baseAgg);
       }
     }
   }
