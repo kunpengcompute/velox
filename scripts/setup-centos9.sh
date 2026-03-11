@@ -227,7 +227,7 @@ function install_cuda {
 
 function install_velox_deps {
   run_and_time install_velox_deps_from_dnf
-  run_and_time install_conda
+#  run_and_time install_conda
   run_and_time install_gflags
   run_and_time install_glog
   run_and_time install_lzo
@@ -274,7 +274,7 @@ function install_velox_deps {
       export CXX=/usr/bin/clang++-15
     else
       # Activate gcc12; enable errors on unset variables afterwards.
-      source /opt/rh/gcc-toolset-12/enable || exit 1
+      # source /opt/rh/gcc-toolset-12/enable || exit 1
       set -u
     fi
     install_velox_deps
