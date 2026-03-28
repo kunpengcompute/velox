@@ -1123,6 +1123,193 @@ TEST_P(HashTableTest, addInput_getOutput_testClearNullSVE) {
   }
 }
 
+/**
+ * @brief Test Case: sumInt32_SVE
+ *
+ * @details
+ * 本用例用于验证：
+ *   1. HashAggregation 场景下，SUM(int32_t) 能正确执行
+ *   2. 能命中自定义的 SVE 优化路径：
+ *        hashAggUpdateSVEWithCharForNormalInt32
+ *   3. 在包含 NULL 值的情况下，聚合结果正确
+ *
+ * @coverage
+ *   - Aggregation Function:
+ *       facebook::velox::functions::aggregate::SumAggregateBase<int32_t,...>
+ *   - 执行路径：
+ *       addRawInput()
+ *         → updateGroups()
+ *           → hashAggUpdateSVEWithCharForNormalInt32  (SVE路径)
+ *
+ * @input
+ *   key:   [1, 1, 1, 2, 2, 3]
+ *   value: [10, null, 20, null, null, 30]
+ *
+ * @expected output
+ *   key=1 → 10 + 20 = 30
+ *   key=2 → all null → 0（非 ANSI 模式）
+ *   key=3 → 30
+ *
+ * @test focus
+ *   - int32 输入类型 → 命中 SVE specialization
+ *   - nullable vector → 覆盖 null mask 逻辑
+ *   - 多 group → 覆盖 groupProbe + aggregation
+ *
+ * @note
+ *   若 SVE 未生效，可通过火焰图确认是否进入：
+ *     hashAggUpdateSVEWithCharForNormalInt32
+ */
+TEST_P(HashTableTest, sumInt32_SVE) {
+  // =========================
+  // 1. 构造输入类型 (key, value)
+  // =========================
+  auto inputType = ROW({"key", "value"}, {INTEGER(), INTEGER()});
+
+  // 构造分组键列（int32）
+  std::vector<int32_t> ids = {1, 1, 1, 2, 2, 3};
+  auto idVector =
+      makeFlatVector<int32_t>(ids.size(), [&](auto row) { return ids[row]; });
+
+  // 构造聚合列（含 NULL）
+  std::vector<std::optional<int32_t>> vals = {
+      10, std::nullopt, 20, std::nullopt, std::nullopt, 30};
+
+  auto valVector = makeNullableFlatVector<int32_t>(vals);
+
+  // 构造 RowVector (输入数据)
+  auto input =
+      makeRowVector(inputType->names(), {idVector, valVector});
+
+  // =========================
+  // 2. 构造 SUM(int32) 聚合函数
+  // =========================
+  // 输入类型: int32_t
+  // 中间/输出类型: int64_t（防止溢出）
+  using SumAggregate =
+      functions::aggregate::SumAggregateBase<int32_t, int64_t, int64_t, true>;
+
+  auto sumAggregate = std::make_unique<SumAggregate>(BIGINT());
+
+  // =========================
+  // 3. 构造 HashAggregation Table
+  // =========================
+  std::vector<std::unique_ptr<VectorHasher>> keyHashers;
+
+  // key 列 hash
+  keyHashers.emplace_back(
+      std::make_unique<VectorHasher>(inputType->childAt(0), 0));
+
+  // 创建 HashTable（核心聚合结构）
+  auto tableWithAgg = HashTable<false>::createForAggregation(
+      std::move(keyHashers),
+      {Accumulator{sumAggregate.get(), nullptr}},
+      pool());
+
+  // =========================
+  // 4. 初始化聚合函数内存布局
+  // =========================
+  RowContainer& row_container = *tableWithAgg->rows();
+  auto rowColumn = row_container.columnAt(1); // 第1列为聚合结果
+
+  // 设置字符串分配器（虽然 SUM 不用，但框架要求）
+  sumAggregate->setAllocator(&row_container.stringAllocator());
+
+  // 关键：设置聚合值在 row 内存中的 offset / null bit 等信息
+  sumAggregate->setOffsets(
+      rowColumn.offset(),
+      rowColumn.nullByte(),
+      rowColumn.nullMask(),
+      rowColumn.initializedByte(),
+      rowColumn.initializedMask(),
+      row_container.rowSizeOffset());
+
+  // =========================
+  // 5. 构造 lookup & rows
+  // =========================
+  auto lookup = std::make_unique<HashLookup>(tableWithAgg->hashers());
+
+  SelectivityVector rows(input->size());
+  rows.setAll(); // 所有行参与计算
+
+  // =========================
+  // 6. 构建 group mapping
+  // =========================
+  // step1: 根据 key 查找或创建 group
+  tableWithAgg->prepareForGroupProbe(
+      *lookup, input, rows,
+      BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  // step2: 建立 row → group 的映射关系
+  tableWithAgg->groupProbe(
+      *lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  // 每一行对应的 group 指针
+  auto* groups = lookup->hits.data();
+
+  // 新创建的 group
+  const auto& newGroups = lookup->newGroups;
+
+  // =========================
+  // 7. 初始化新 group 的聚合状态
+  // =========================
+  if (!newGroups.empty()) {
+    sumAggregate->initializeNewGroups(groups, newGroups);
+  }
+
+  // =========================
+  // 8. 执行聚合（核心路径）
+  // =========================
+  std::vector<VectorPtr> args = {input->childAt(1)};
+
+  /**
+   * 🔥 核心调用链：
+   *
+   * addRawInput()
+   *   → updateGroups()
+   *     → (TValue == int32_t)
+   *       → hashAggUpdateSVEWithCharForNormalInt32  ← SVE优化路径
+   *
+   * 这里会：
+   *   - 读取 bitmask（rows + nulls）
+   *   - 使用 SVE 指令做批量累加
+   */
+  sumAggregate->addRawInput(groups, rows, args, false);
+
+  // =========================
+  // 9. 读取聚合结果
+  // =========================
+  RowContainerIterator it;
+
+  char* groupResults[10];
+
+  int32_t numGroups = tableWithAgg->rows()->listRows(
+      &it, 10, 100000, groupResults);
+
+  ASSERT_EQ(numGroups, 3);
+
+  // =========================
+  // 10. 校验结果
+  // =========================
+  for (int i = 0; i < numGroups; i++) {
+    // 读取 key
+    auto key = *reinterpret_cast<int32_t*>(
+        groupResults[i] + row_container.columnAt(0).offset());
+
+    // 读取 sum（int64）
+    auto sum = *reinterpret_cast<int64_t*>(
+        groupResults[i] + row_container.columnAt(1).offset());
+
+    if (key == 1) {
+      ASSERT_EQ(sum, 30);
+    } else if (key == 2) {
+      // 两个 NULL → 默认结果为 0（非 ANSI）
+      ASSERT_EQ(sum, 0);
+    } else if (key == 3) {
+      ASSERT_EQ(sum, 30);
+    }
+  }
+}
+
 // ============================================================================
 // Test Cases: HashTable with String Keys in NormalizedKey Mode
 // ============================================================================
