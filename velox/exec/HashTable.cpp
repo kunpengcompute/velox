@@ -395,6 +395,85 @@ char* HashTable<ignoreNullKeys>::insertEntryforSVE(
   return group;
 }
 
+namespace {
+ 	 
+// Type-specialized column equality functions for fastCompareKeys.
+// Resolved once per probe batch via function pointer, eliminating
+// the per-row VELOX_DYNAMIC_TEMPLATE_TYPE_DISPATCH switch.
+
+template <TypeKind Kind>
+bool scalarColEquals(
+    const char* row,
+    int32_t offset,
+    const DecodedVector& decoded,
+    vector_size_t index) {
+  using T = typename KindToFlatVector<Kind>::HashRowType;
+  return *reinterpret_cast<const T*>(row + offset) ==
+      decoded.valueAt<T>(index);
+}
+
+bool varcharColEquals(
+    const char* row,
+    int32_t offset,
+    const DecodedVector& decoded,
+    vector_size_t index) {
+  auto rowSv = *reinterpret_cast<const StringView*>(row + offset);
+  auto probeSv = decoded.valueAt<StringView>(index);
+
+  if (rowSv.size() != probeSv.size()) {
+    return false;
+  }
+
+  if (rowSv.isInline()) {
+    return rowSv == probeSv;
+  }
+
+  if (memcmp(rowSv.data(), probeSv.data(), StringView::kPrefixSize) != 0) {
+    return false;
+  }
+
+  std::string storage;
+  auto contiguous =
+      HashStringAllocator::contiguousString(rowSv, storage);
+  return contiguous == probeSv;
+}
+
+using GenericColEqualsFn = bool (*)(
+    const char* row,
+    int32_t offset,
+    const DecodedVector& decoded,
+    vector_size_t index);
+
+GenericColEqualsFn getColEqualsFn(TypeKind typeKind) {
+  switch (typeKind) {
+    case TypeKind::BOOLEAN:
+      return scalarColEquals<TypeKind::BOOLEAN>;
+    case TypeKind::TINYINT:
+      return scalarColEquals<TypeKind::TINYINT>;
+    case TypeKind::SMALLINT:
+      return scalarColEquals<TypeKind::SMALLINT>;
+    case TypeKind::INTEGER:
+      return scalarColEquals<TypeKind::INTEGER>;
+    case TypeKind::BIGINT:
+      return scalarColEquals<TypeKind::BIGINT>;
+    case TypeKind::HUGEINT:
+      return scalarColEquals<TypeKind::HUGEINT>;
+    case TypeKind::REAL:
+      return scalarColEquals<TypeKind::REAL>;
+    case TypeKind::DOUBLE:
+      return scalarColEquals<TypeKind::DOUBLE>;
+    case TypeKind::TIMESTAMP:
+      return scalarColEquals<TypeKind::TIMESTAMP>;
+    case TypeKind::VARCHAR:
+    case TypeKind::VARBINARY:
+      return varcharColEquals;
+    default:
+      return nullptr;
+  }
+}
+
+} // namespace
+
 template <bool ignoreNullKeys>
 bool HashTable<ignoreNullKeys>::compareKeys(
     const char* group,
@@ -429,6 +508,56 @@ bool HashTable<ignoreNullKeys>::compareKeys(
 }
 
 template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::buildCompareInfos(
+    const std::vector<std::unique_ptr<VectorHasher>>& hashers) {
+  auto numKeys = static_cast<int32_t>(hashers.size());
+  compareInfos_.resize(numKeys);
+  for (int32_t i = 0; i < numKeys; ++i) {
+    auto& decoded = hashers[i]->decodedVector();
+    auto column = rows_->columnAt(i);
+    auto& ci = compareInfos_[i];
+    ci.offset = column.offset();
+    ci.nullByte = column.nullByte();
+    ci.nullMask = column.nullMask();
+    ci.decoded = &decoded;
+    ci.equalsFn = getColEqualsFn(decoded.base()->typeKind());
+  }
+}
+
+template <bool ignoreNullKeys>
+FOLLY_ALWAYS_INLINE bool HashTable<ignoreNullKeys>::fastCompareKeys(
+    const char* group,
+    vector_size_t row) {
+  const auto numKeys = static_cast<int32_t>(compareInfos_.size());
+  for (int32_t i = 0; i < numKeys; ++i) {
+    auto& ci = compareInfos_[i];
+
+    if constexpr (!ignoreNullKeys) {
+      bool rowIsNull = (group[ci.nullByte] & ci.nullMask) != 0;
+      bool probeIsNull = ci.decoded->isNullAt(row);
+      if (UNLIKELY(rowIsNull || probeIsNull)) {
+        if (rowIsNull != probeIsNull) {
+          return false;
+        }
+        continue;
+      }
+    }
+
+    if (LIKELY(ci.equalsFn != nullptr)) {
+      if (!ci.equalsFn(group, ci.offset, *ci.decoded, row)) {
+        return false;
+      }
+    } else {
+      if (!rows_->equals<!ignoreNullKeys>(
+              group, rows_->columnAt(i), *ci.decoded, row)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+template <bool ignoreNullKeys>
 template <bool isJoin, bool isNormalizedKey>
 FOLLY_ALWAYS_INLINE void HashTable<ignoreNullKeys>::fullProbe(
     HashLookup& lookup,
@@ -456,6 +585,9 @@ FOLLY_ALWAYS_INLINE void HashTable<ignoreNullKeys>::fullProbe(
       *this,
       0,
       [&](char* group, int32_t row) INLINE_LAMBDA {
+        if (LIKELY(!compareInfos_.empty())) {
+          return fastCompareKeys(group, row);
+        }
         return compareKeys(group, lookup, row);
       },
       [&](int32_t row, uint64_t index) {
@@ -3721,6 +3853,7 @@ void HashTable<ignoreNullKeys>::prepareForGroupProbe(
 
   if (mode == BaseHashTable::HashMode::kHash) {
     computeXXHashFromDecodedVectors(hashers, rows, lookup.hashes);
+    buildCompareInfos(hashers);
   } else {
     for (auto i = 0; i < hashers.size(); ++i) {
       if (!hashers[i]->computeValueIds(rows, lookup.hashes)) {
@@ -3770,6 +3903,7 @@ void HashTable<ignoreNullKeys>::prepareForJoinProbe(
       }
     }
     computeXXHashFromDecodedVectors(hashers, rows, lookup.hashes);
+    buildCompareInfos(hashers);
   } else {
     for (auto i = 0; i < hashers.size(); ++i) {
       auto& key = input->childAt(hashers[i]->channel());

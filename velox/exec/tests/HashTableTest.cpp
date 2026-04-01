@@ -2411,6 +2411,175 @@ TEST_P(HashTableTest, xxhashPureVarcharMixedPath) {
   ASSERT_EQ(static_cast<int>(lookup->newGroups.size()), eraseCount);
 }
 
+// Tests for fastCompareKeys type-specialized comparison in kHash mode.
+// These exercise scalarColEquals<Kind> and varcharColEquals function
+// pointers resolved by buildCompareInfos, covering type paths that
+// the original compareKeys didn't specialize on.
+TEST_P(HashTableTest, fastCompareKeysMixedScalarTypes) {
+  auto rowType = ROW(
+      {"k1", "k2", "k3", "k4", "k5", "k6"},
+      {BIGINT(), BIGINT(), BIGINT(), INTEGER(), DOUBLE(), REAL()});
+  auto table_ptr = createHashTableForAggregation(rowType, 6);
+  auto& table = *table_ptr;
+
+  const int numRows = 10'000;
+  auto input = makeRowVector({
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 1000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 2000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 3000; }),
+      makeFlatVector<int32_t>(numRows, [](auto row) { return row * 100; }),
+      makeFlatVector<double>(numRows, [](auto row) { return row * 1.5; }),
+      makeFlatVector<float>(numRows, [](auto row) { return row * 2.5f; }),
+  });
+
+  auto lookup = std::make_unique<HashLookup>(table.hashers());
+  SelectivityVector rows(input->size());
+
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table.hashMode(), BaseHashTable::HashMode::kHash);
+  ASSERT_EQ(table.numDistinct(), numRows);
+
+  auto prevHits = lookup->hits;
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  ASSERT_EQ(table.numDistinct(), numRows);
+  ASSERT_TRUE(lookup->newGroups.empty());
+  for (int i = 0; i < numRows; ++i) {
+    ASSERT_EQ(lookup->hits[i], prevHits[i]);
+  }
+}
+
+TEST_P(HashTableTest, fastCompareKeysLongVarchar) {
+  auto rowType = ROW(
+      {"k1", "k2", "k3", "k4", "k5", "k6"},
+      {BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT(), VARCHAR()});
+  auto table_ptr = createHashTableForAggregation(rowType, 6);
+  auto& table = *table_ptr;
+
+  const int numRows = 10'000;
+  auto input = makeRowVector({
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 1000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 2000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 3000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 4000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 5000; }),
+      makeFlatVector<std::string>(numRows, [](auto row) {
+        return "long_prefix_string_for_test_" + std::to_string(row);
+      }),
+  });
+
+  auto lookup = std::make_unique<HashLookup>(table.hashers());
+  SelectivityVector rows(input->size());
+
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table.hashMode(), BaseHashTable::HashMode::kHash);
+  ASSERT_EQ(table.numDistinct(), numRows);
+
+  auto prevHits = lookup->hits;
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  ASSERT_EQ(table.numDistinct(), numRows);
+  ASSERT_TRUE(lookup->newGroups.empty());
+  for (int i = 0; i < numRows; ++i) {
+    ASSERT_EQ(lookup->hits[i], prevHits[i]);
+  }
+}
+
+TEST_P(HashTableTest, fastCompareKeysNullsMixedTypes) {
+  auto rowType = ROW(
+      {"k1", "k2", "k3", "k4", "k5", "k6"},
+      {BIGINT(), INTEGER(), DOUBLE(), BIGINT(), BIGINT(), VARCHAR()});
+  auto table_ptr = createHashTableForAggregation(rowType, 6);
+  auto& table = *table_ptr;
+
+  const int numRows = 10'000;
+  auto input = makeRowVector({
+      makeFlatVector<int64_t>(
+          numRows,
+          [](auto row) { return row * 1000; },
+          [](auto row) { return row % 7 == 0; }),
+      makeFlatVector<int32_t>(
+          numRows,
+          [](auto row) { return row * 100; },
+          [](auto row) { return row % 11 == 0; }),
+      makeFlatVector<double>(
+          numRows,
+          [](auto row) { return row * 1.5; },
+          [](auto row) { return row % 13 == 0; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 4000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 5000; }),
+      makeFlatVector<std::string>(
+          numRows, [](auto row) { return std::to_string(row * 1000); }),
+  });
+
+  auto lookup = std::make_unique<HashLookup>(table.hashers());
+  SelectivityVector rows(input->size());
+
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table.hashMode(), BaseHashTable::HashMode::kHash);
+  const auto numDistinct = table.numDistinct();
+  ASSERT_GT(numDistinct, 0);
+
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  ASSERT_EQ(table.numDistinct(), numDistinct);
+  ASSERT_TRUE(lookup->newGroups.empty());
+}
+
+TEST_P(HashTableTest, fastCompareKeysSmallIntTypes) {
+  auto rowType = ROW(
+      {"k1", "k2", "k3", "k4", "k5", "k6"},
+      {BIGINT(), BIGINT(), BIGINT(), BIGINT(), SMALLINT(), TINYINT()});
+  auto table_ptr = createHashTableForAggregation(rowType, 6);
+  auto& table = *table_ptr;
+
+  const int numRows = 10'000;
+  auto input = makeRowVector({
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 1000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 2000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 3000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 4000; }),
+      makeFlatVector<int16_t>(numRows, [](auto row) {
+        return static_cast<int16_t>(row % 30000);
+      }),
+      makeFlatVector<int8_t>(numRows, [](auto row) {
+        return static_cast<int8_t>(row % 200 - 100);
+      }),
+  });
+
+  auto lookup = std::make_unique<HashLookup>(table.hashers());
+  SelectivityVector rows(input->size());
+
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table.hashMode(), BaseHashTable::HashMode::kHash);
+  ASSERT_EQ(table.numDistinct(), numRows);
+
+  auto prevHits = lookup->hits;
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  ASSERT_EQ(table.numDistinct(), numRows);
+  ASSERT_TRUE(lookup->newGroups.empty());
+  for (int i = 0; i < numRows; ++i) {
+    ASSERT_EQ(lookup->hits[i], prevHits[i]);
+  }
+}
+
 TEST(HashTableTest, tableInsertPartitionInfo) {
   std::vector<char*> overflows;
   const auto testFn = [&](PartitionBoundIndexType start,

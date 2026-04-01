@@ -889,6 +889,25 @@ class HashTable : public BaseHashTable {
 
   bool compareKeys(const char* group, const char* inserted);
 
+  // Pre-extracted per-column comparison metadata for optimized compareKeys.
+  using ColEqualsFn = bool (*)(
+      const char* row,
+      int32_t offset,
+      const DecodedVector& decoded,
+      vector_size_t index);
+
+  struct CompareColumnInfo {
+    int32_t offset;
+    int32_t nullByte;
+    uint8_t nullMask;
+    const DecodedVector* decoded;
+    ColEqualsFn equalsFn;
+  };
+
+  void buildCompareInfos(const std::vector<std::unique_ptr<VectorHasher>>& hashers);
+
+  bool fastCompareKeys(const char* group, vector_size_t row);
+
   template <bool isJoin, bool isNormalizedKey = false>
   void fullProbe(HashLookup& lookup, ProbeState& state, bool extraCheck);
 
@@ -1065,6 +1084,9 @@ class HashTable : public BaseHashTable {
   int64_t numRehashes_{0};
   HashMode hashMode_ = HashMode::kArray;
   NormalizedKeyMode normalizedKeyMode_ = NormalizedKeyMode::sve ; // TODO scalar2，NormalizedKeyMode::sve\NormalizedKeyMode::scalar
+  // Pre-built per-column comparison info for kHash mode fastCompareKeys.
+  // Rebuilt per probe batch in prepareForGroupProbe / prepareForJoinProbe.
+  std::vector<CompareColumnInfo> compareInfos_;
   // Owns the memory of multiple build side hash join tables that are
   // combined into a single probe hash table.
   std::vector<std::unique_ptr<HashTable<ignoreNullKeys>>> otherTables_;
