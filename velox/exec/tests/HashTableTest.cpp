@@ -255,22 +255,32 @@ class HashTableTest : public testing::TestWithParam<bool>,
       const SelectivityVector& rows,
       HashLookup& lookup,
       HashTable<false>& table) {
+    if (table.hashMode() == BaseHashTable::HashMode::kHash) {
+      // kHash mode uses XXH3 for hashing. Use prepareForGroupProbe which
+      // computes XXH3 hashes, consistent with the production code path.
+      auto inputPtr = std::shared_ptr<RowVector>(
+          const_cast<RowVector*>(&input), [](RowVector*) {});
+      SelectivityVector mutableRows(rows);
+      table.prepareForGroupProbe(
+          lookup,
+          inputPtr,
+          mutableRows,
+          BaseHashTable::kNoSpillInputStartPartitionBit);
+      table.groupProbe(lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+      return;
+    }
+
     lookup.reset(rows.end());
     lookup.rows.clear();
     rows.applyToSelected([&](auto row) { lookup.rows.push_back(row); });
 
     auto& hashers = table.hashers();
-    auto mode = table.hashMode();
     bool rehash = false;
     for (int32_t i = 0; i < hashers.size(); ++i) {
       auto key = input.childAt(hashers[i]->channel());
       hashers[i]->decode(*key, rows);
-      if (mode != BaseHashTable::HashMode::kHash) {
-        if (!hashers[i]->computeValueIds(rows, lookup.hashes)) {
-          rehash = true;
-        }
-      } else {
-        hashers[i]->hash(rows, i > 0, lookup.hashes);
+      if (!hashers[i]->computeValueIds(rows, lookup.hashes)) {
+        rehash = true;
       }
     }
 
@@ -466,37 +476,39 @@ class HashTableTest : public testing::TestWithParam<bool>,
     VectorHasher::ScratchMemory scratchMemory;
     for (auto batchIndex = 0; batchIndex < batches_.size(); ++batchIndex) {
       const auto& batch = batches_[batchIndex];
-      lookup->reset(batch->size());
       rows.setAll();
-      {
-        SelectivityTimer timer(hashTime, 0);
-        for (auto i = 0; i < hashers.size(); ++i) {
-          auto& key = batch->childAt(i);
-          if (mode != BaseHashTable::HashMode::kHash) {
+
+      if (mode == BaseHashTable::HashMode::kHash) {
+        // kHash mode uses XXH3 for hashing. Use prepareForJoinProbe which
+        // computes XXH3 hashes, consistent with the build-side hashRows path.
+        topTable_->prepareForJoinProbe(*lookup, batch, rows, true);
+      } else {
+        lookup->reset(batch->size());
+        {
+          SelectivityTimer timer(hashTime, 0);
+          for (auto i = 0; i < hashers.size(); ++i) {
+            auto& key = batch->childAt(i);
             hashers[i]->lookupValueIds(
                 *key, rows, scratchMemory, lookup->hashes);
-          } else {
-            hashers[i]->decode(*key, rows);
-            hashers[i]->hash(rows, i > 0, lookup->hashes);
           }
         }
-      }
 
-      lookup->rows.clear();
-      if (rows.isAllSelected()) {
-        lookup->rows.resize(rows.size());
-        std::iota(lookup->rows.begin(), lookup->rows.end(), 0);
-      } else {
-        constexpr int32_t kPadding = simd::kPadding / sizeof(int32_t);
-        lookup->rows.resize(bits::roundUp(rows.size() + kPadding, kPadding));
-        const auto numRows = simd::indicesOfSetBits(
-            rows.asRange().bits(), 0, batch->size(), lookup->rows.data());
-        lookup->rows.resize(numRows);
+        lookup->rows.clear();
+        if (rows.isAllSelected()) {
+          lookup->rows.resize(rows.size());
+          std::iota(lookup->rows.begin(), lookup->rows.end(), 0);
+        } else {
+          constexpr int32_t kPadding = simd::kPadding / sizeof(int32_t);
+          lookup->rows.resize(
+              bits::roundUp(rows.size() + kPadding, kPadding));
+          const auto numRows = simd::indicesOfSetBits(
+              rows.asRange().bits(), 0, batch->size(), lookup->rows.data());
+          lookup->rows.resize(numRows);
+        }
       }
 
       const auto startOffset = batchIndex * batchSize;
       if (lookup->rows.empty()) {
-        // the keys disqualify all entries. The table is not consulted.
         for (auto i = startOffset; i < startOffset + batch->size(); ++i) {
           ASSERT_EQ(nullptr, rowOfKey_[i]);
         }
@@ -1847,6 +1859,556 @@ TEST_P(HashTableTest, toStringMultipleKeys) {
   table->prepareJoinTable({}, BaseHashTable::kNoSpillInputStartPartitionBit);
 
   ASSERT_NO_THROW(table->toString());
+}
+
+// Tests for XXH3 hashing in kHash mode.
+// These exercise the new code paths:
+// - computeXXHashFromDecodedVectors: XXH3 from decoded input vectors
+// - xxhashRowKeysBatch: XXH3 from RowContainer rows (used in hashRows/erase)
+
+TEST_P(HashTableTest, xxhashGroupProbeKHashMode) {
+  // 6 scalar keys with large ranges force kHash mode because the combined
+  // range/distinct count overflows uint64 in decideHashMode.
+  auto rowType = ROW(
+      {"k1", "k2", "k3", "k4", "k5", "k6"},
+      {BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT(), VARCHAR()});
+  auto table_ptr = createHashTableForAggregation(rowType, 6);
+  auto& table = *table_ptr;
+
+  const int numRows = 100'000;
+  auto input = makeRowVector({
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 1000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 2000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 3000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 4000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 5000; }),
+      makeFlatVector<std::string>(
+          numRows, [](auto row) { return std::to_string(row * 1000); }),
+  });
+
+  auto lookup = std::make_unique<HashLookup>(table.hashers());
+  SelectivityVector rows(input->size());
+
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table.hashMode(), BaseHashTable::HashMode::kHash);
+  ASSERT_EQ(table.numDistinct(), numRows);
+  ASSERT_EQ(static_cast<int>(lookup->newGroups.size()), numRows);
+
+  // Re-insert same data: should find all existing groups.
+  auto prevHits = lookup->hits;
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  ASSERT_EQ(table.numDistinct(), numRows);
+  ASSERT_TRUE(lookup->newGroups.empty());
+  for (int i = 0; i < numRows; ++i) {
+    ASSERT_EQ(lookup->hits[i], prevHits[i]);
+  }
+}
+
+TEST_P(HashTableTest, xxhashGroupProbeWithNullsKHashMode) {
+  auto rowType = ROW(
+      {"k1", "k2", "k3", "k4", "k5", "k6"},
+      {BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT(), VARCHAR()});
+  auto table_ptr = createHashTableForAggregation(rowType, 6);
+  auto& table = *table_ptr;
+
+  const int numRows = 10'000;
+  // k1: every 7th row is null. k2: every 11th row is null.
+  // Null serialization in XXH3 uses a distinct encoding so
+  // (null, 2000) and (0, 2000) hash to different values.
+  auto input = makeRowVector({
+      makeFlatVector<int64_t>(
+          numRows,
+          [](auto row) { return row * 1000; },
+          [](auto row) { return row % 7 == 0; }),
+      makeFlatVector<int64_t>(
+          numRows,
+          [](auto row) { return row * 2000; },
+          [](auto row) { return row % 11 == 0; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 3000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 4000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 5000; }),
+      makeFlatVector<std::string>(
+          numRows, [](auto row) { return std::to_string(row * 1000); }),
+  });
+
+  auto lookup = std::make_unique<HashLookup>(table.hashers());
+  SelectivityVector rows(input->size());
+
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table.hashMode(), BaseHashTable::HashMode::kHash);
+  const auto numDistinct = table.numDistinct();
+  ASSERT_GT(numDistinct, 0);
+
+  // Re-insert: all should find existing groups.
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  ASSERT_EQ(table.numDistinct(), numDistinct);
+  ASSERT_TRUE(lookup->newGroups.empty());
+}
+
+// Verifies consistency between computeXXHashFromDecodedVectors (used during
+// insert via prepareForGroupProbe) and xxhashRowKeys (used during erase).
+TEST_P(HashTableTest, xxhashEraseKHashMode) {
+  auto rowType = ROW(
+      {"k1", "k2", "k3", "k4", "k5", "k6"},
+      {BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT(), VARCHAR()});
+  auto table_ptr = createHashTableForAggregation(rowType, 6);
+  auto& table = *table_ptr;
+
+  const int numRows = 10'000;
+  auto input = makeRowVector({
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 1000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 2000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 3000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 4000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 5000; }),
+      makeFlatVector<std::string>(
+          numRows, [](auto row) { return std::to_string(row * 1000); }),
+  });
+
+  auto lookup = std::make_unique<HashLookup>(table.hashers());
+  SelectivityVector rows(input->size());
+
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table.hashMode(), BaseHashTable::HashMode::kHash);
+  ASSERT_EQ(table.numDistinct(), numRows);
+
+  // Erase every other row. erase() internally uses xxhashRowKeys which must
+  // produce hashes consistent with computeXXHashFromDecodedVectors.
+  std::vector<char*> toErase;
+  for (int i = 0; i < numRows; i += 2) {
+    toErase.push_back(lookup->hits[i]);
+  }
+  const auto eraseCount = static_cast<int>(toErase.size());
+  table.erase(folly::Range<char**>(toErase.data(), toErase.size()));
+  ASSERT_EQ(table.numDistinct(), numRows - eraseCount);
+
+  // Re-insert all rows: erased ones become new groups, others match existing.
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  ASSERT_EQ(table.numDistinct(), numRows);
+  ASSERT_EQ(static_cast<int>(lookup->newGroups.size()), eraseCount);
+}
+
+// Tests for XXH3 with composite (ROW/struct) key types in kHash mode.
+// Struct keys always go to kHash mode since VectorHasher doesn't support
+// valueId computation for complex types. These tests exercise:
+// - computeXXHashFromDecodedVectors with complex type columns (hashValueAt)
+// - xxhashRowKeys with complex type columns (ContainerRowSerde::hash)
+// - Consistency between the two paths for insert/probe/erase
+
+TEST_P(HashTableTest, xxhashGroupProbeStructKey) {
+  // Single ROW key forces kHash mode.
+  auto keyType = ROW({"k1", "k2", "k3"}, {BIGINT(), VARCHAR(), BIGINT()});
+  auto rowType = ROW({"key"}, {keyType});
+  auto table_ptr = createHashTableForAggregation(rowType, 1);
+  auto& table = *table_ptr;
+
+  const int numRows = 10'000;
+  auto input = makeRowVector({
+      makeRowVector({
+          makeFlatVector<int64_t>(numRows, [](auto row) { return row; }),
+          makeFlatVector<std::string>(
+              numRows, [](auto row) { return std::to_string(row * 100); }),
+          makeFlatVector<int64_t>(
+              numRows, [](auto row) { return row * 1000; }),
+      }),
+  });
+
+  auto lookup = std::make_unique<HashLookup>(table.hashers());
+  SelectivityVector rows(input->size());
+
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table.hashMode(), BaseHashTable::HashMode::kHash);
+  ASSERT_EQ(table.numDistinct(), numRows);
+
+  // Re-insert same data: should match, no new groups.
+  auto prevHits = lookup->hits;
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  ASSERT_EQ(table.numDistinct(), numRows);
+  ASSERT_TRUE(lookup->newGroups.empty());
+  for (int i = 0; i < numRows; ++i) {
+    ASSERT_EQ(lookup->hits[i], prevHits[i]);
+  }
+}
+
+TEST_P(HashTableTest, xxhashGroupProbeStructKeyWithNulls) {
+  auto keyType = ROW({"k1", "k2"}, {BIGINT(), VARCHAR()});
+  auto rowType = ROW({"key"}, {keyType});
+  auto table_ptr = createHashTableForAggregation(rowType, 1);
+  auto& table = *table_ptr;
+
+  const int numRows = 5'000;
+  auto input = makeRowVector({
+      makeRowVector({
+          makeFlatVector<int64_t>(
+              numRows,
+              [](auto row) { return row; },
+              [](auto row) { return row % 7 == 0; }),
+          makeFlatVector<std::string>(
+              numRows, [](auto row) { return std::to_string(row); }),
+      }),
+  });
+
+  auto lookup = std::make_unique<HashLookup>(table.hashers());
+  SelectivityVector rows(input->size());
+
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table.hashMode(), BaseHashTable::HashMode::kHash);
+  const auto numDistinct = table.numDistinct();
+  ASSERT_GT(numDistinct, 0);
+
+  // Re-insert: all should find existing groups.
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  ASSERT_EQ(table.numDistinct(), numDistinct);
+  ASSERT_TRUE(lookup->newGroups.empty());
+}
+
+// Verifies hash consistency between computeXXHashFromDecodedVectors
+// (hashValueAt for complex type) and xxhashRowKeys
+// (ContainerRowSerde::hash) during insert and erase.
+TEST_P(HashTableTest, xxhashEraseStructKey) {
+  auto keyType = ROW({"k1", "k2", "k3"}, {BIGINT(), VARCHAR(), BIGINT()});
+  auto rowType = ROW({"key"}, {keyType});
+  auto table_ptr = createHashTableForAggregation(rowType, 1);
+  auto& table = *table_ptr;
+
+  const int numRows = 5'000;
+  auto input = makeRowVector({
+      makeRowVector({
+          makeFlatVector<int64_t>(numRows, [](auto row) { return row; }),
+          makeFlatVector<std::string>(
+              numRows, [](auto row) { return std::to_string(row * 10); }),
+          makeFlatVector<int64_t>(
+              numRows, [](auto row) { return row * 100; }),
+      }),
+  });
+
+  auto lookup = std::make_unique<HashLookup>(table.hashers());
+  SelectivityVector rows(input->size());
+
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table.hashMode(), BaseHashTable::HashMode::kHash);
+  ASSERT_EQ(table.numDistinct(), numRows);
+
+  // Erase every other row.
+  std::vector<char*> toErase;
+  for (int i = 0; i < numRows; i += 2) {
+    toErase.push_back(lookup->hits[i]);
+  }
+  const auto eraseCount = static_cast<int>(toErase.size());
+  table.erase(folly::Range<char**>(toErase.data(), toErase.size()));
+  ASSERT_EQ(table.numDistinct(), numRows - eraseCount);
+
+  // Re-insert all rows: erased ones become new groups, others match existing.
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  ASSERT_EQ(table.numDistinct(), numRows);
+  ASSERT_EQ(static_cast<int>(lookup->newGroups.size()), eraseCount);
+}
+
+// Join build + probe cycle with struct key (similar to existing structKey test)
+// but exercises the new XXH3 paths end-to-end.
+TEST_P(HashTableTest, xxhashJoinStructKey) {
+  auto type =
+      ROW({"key"}, {ROW({"k1", "k2", "k3"}, {BIGINT(), VARCHAR(), BIGINT()})});
+  keySpacing_ = 1000;
+  testCycle(BaseHashTable::HashMode::kHash, 10'000, 2, type, 1);
+}
+
+// Exercises the fast path in computeXXHashFromDecodedVectors (all fixed-width,
+// identity-mapped, no nulls) and xxhashRowKeysBatch (all fixed-width).
+TEST_P(HashTableTest, xxhashAllFixedWidthFastPath) {
+  auto rowType = ROW(
+      {"k1", "k2", "k3", "k4", "k5", "k6"},
+      {BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT()});
+  auto table = createHashTableForAggregation(rowType, 6);
+
+  const int numRows = 10'000;
+  auto input = makeRowVector({
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 1000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 2000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 3000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 4000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 5000; }),
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row * 6000; }),
+  });
+
+  auto lookup = std::make_unique<HashLookup>(table->hashers());
+  SelectivityVector rows(input->size());
+
+  table->prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table->hashMode(), BaseHashTable::HashMode::kHash);
+  ASSERT_EQ(table->numDistinct(), numRows);
+  ASSERT_EQ(static_cast<int>(lookup->newGroups.size()), numRows);
+
+  // Re-insert: all rows should match existing groups.
+  auto prevHits = lookup->hits;
+  table->prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  ASSERT_EQ(table->numDistinct(), numRows);
+  ASSERT_TRUE(lookup->newGroups.empty());
+  for (int i = 0; i < numRows; ++i) {
+    ASSERT_EQ(lookup->hits[i], prevHits[i]);
+  }
+
+  // Erase half the rows, then re-probe: erased rows should yield new groups.
+  // This exercises xxhashRowKeysBatch fast path.
+  std::vector<char*> toErase;
+  for (int i = 0; i < numRows; i += 2) {
+    toErase.push_back(lookup->hits[i]);
+  }
+  table->erase(folly::Range<char**>(toErase.data(), toErase.size()));
+
+  table->prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  ASSERT_EQ(
+      static_cast<int>(lookup->newGroups.size()),
+      static_cast<int>(toErase.size()));
+}
+
+// Exercises the pre-resolved indices path (non-identity mapping) in
+// resolveIndex/resolveIsNull via dictionary-wrapped input vectors.
+TEST_P(HashTableTest, xxhashDictionaryEncodedKeys) {
+  auto rowType = ROW(
+      {"k1", "k2", "k3", "k4", "k5", "k6"},
+      {BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT(), VARCHAR()});
+  auto table = createHashTableForAggregation(rowType, 6);
+
+  const int baseSize = 5'000;
+  auto baseVectors = std::vector<VectorPtr>{
+      makeFlatVector<int64_t>(baseSize, [](auto row) { return row * 1000; }),
+      makeFlatVector<int64_t>(baseSize, [](auto row) { return row * 2000; }),
+      makeFlatVector<int64_t>(baseSize, [](auto row) { return row * 3000; }),
+      makeFlatVector<int64_t>(baseSize, [](auto row) { return row * 4000; }),
+      makeFlatVector<int64_t>(baseSize, [](auto row) { return row * 5000; }),
+      makeFlatVector<std::string>(
+          baseSize, [](auto row) { return std::to_string(row * 1000); }),
+  };
+
+  // First, insert flat data to populate the table.
+  auto flatInput = makeRowVector(baseVectors);
+  auto lookup = std::make_unique<HashLookup>(table->hashers());
+  SelectivityVector rows(flatInput->size());
+
+  table->prepareForGroupProbe(
+      *lookup, flatInput, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table->hashMode(), BaseHashTable::HashMode::kHash);
+  ASSERT_EQ(table->numDistinct(), baseSize);
+  auto prevHits = lookup->hits;
+
+  // Now create a dictionary-wrapped input that maps back to the same data in
+  // shuffled order. This exercises resolveIndex (col.indices[row]) and
+  // resolveIsNull with non-identity mapping.
+  const int dictSize = baseSize;
+  auto indices = makeIndices(dictSize, [&](auto i) {
+    return (i * 37) % baseSize;
+  });
+
+  std::vector<VectorPtr> dictChildren;
+  for (auto& base : baseVectors) {
+    dictChildren.push_back(
+        BaseVector::wrapInDictionary(nullptr, indices, dictSize, base));
+  }
+  auto dictInput = makeRowVector(dictChildren);
+  rows.resize(dictSize);
+  rows.setAll();
+
+  table->prepareForGroupProbe(
+      *lookup, dictInput, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  // All rows should match existing groups (no new inserts).
+  ASSERT_EQ(table->numDistinct(), baseSize);
+  ASSERT_TRUE(lookup->newGroups.empty());
+
+  // Verify that each dictionary row maps to the correct group.
+  for (int i = 0; i < dictSize; ++i) {
+    auto origIdx = (i * 37) % baseSize;
+    ASSERT_EQ(lookup->hits[i], prevHits[origIdx])
+        << "Mismatch at dict row " << i << " (original " << origIdx << ")";
+  }
+}
+
+// Exercises xxhashAllFixedAnyMapping — all fixed-width columns but with
+// dictionary encoding so allFixedIdentity is false.
+TEST_P(HashTableTest, xxhashAllFixedDictionaryEncoded) {
+  auto rowType = ROW(
+      {"k1", "k2", "k3", "k4", "k5", "k6"},
+      {BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT()});
+  auto table = createHashTableForAggregation(rowType, 6);
+
+  const int baseSize = 5'000;
+  auto baseVectors = std::vector<VectorPtr>{
+      makeFlatVector<int64_t>(baseSize, [](auto row) { return row * 1000; }),
+      makeFlatVector<int64_t>(baseSize, [](auto row) { return row * 2000; }),
+      makeFlatVector<int64_t>(baseSize, [](auto row) { return row * 3000; }),
+      makeFlatVector<int64_t>(baseSize, [](auto row) { return row * 4000; }),
+      makeFlatVector<int64_t>(baseSize, [](auto row) { return row * 5000; }),
+      makeFlatVector<int64_t>(baseSize, [](auto row) { return row * 6000; }),
+  };
+
+  // Insert flat data first.
+  auto flatInput = makeRowVector(baseVectors);
+  auto lookup = std::make_unique<HashLookup>(table->hashers());
+  SelectivityVector rows(flatInput->size());
+
+  table->prepareForGroupProbe(
+      *lookup, flatInput, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table->hashMode(), BaseHashTable::HashMode::kHash);
+  ASSERT_EQ(table->numDistinct(), baseSize);
+  auto prevHits = lookup->hits;
+
+  // Re-probe with dictionary-wrapped vectors (shuffled order).
+  // This forces allFixedIdentity = false, triggering xxhashAllFixedAnyMapping.
+  const int dictSize = baseSize;
+  auto indices = makeIndices(dictSize, [&](auto i) {
+    return (i * 37) % baseSize;
+  });
+
+  std::vector<VectorPtr> dictChildren;
+  for (auto& base : baseVectors) {
+    dictChildren.push_back(
+        BaseVector::wrapInDictionary(nullptr, indices, dictSize, base));
+  }
+  auto dictInput = makeRowVector(dictChildren);
+  rows.resize(dictSize);
+  rows.setAll();
+
+  table->prepareForGroupProbe(
+      *lookup, dictInput, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table->numDistinct(), baseSize);
+  ASSERT_TRUE(lookup->newGroups.empty());
+
+  for (int i = 0; i < dictSize; ++i) {
+    auto origIdx = (i * 37) % baseSize;
+    ASSERT_EQ(lookup->hits[i], prevHits[origIdx])
+        << "Mismatch at dict row " << i << " (original " << origIdx << ")";
+  }
+
+  // Erase half and re-insert to verify build-side hash consistency.
+  std::vector<char*> toErase;
+  for (int i = 0; i < baseSize; i += 2) {
+    toErase.push_back(prevHits[i]);
+  }
+  table->erase(folly::Range<char**>(toErase.data(), toErase.size()));
+  ASSERT_EQ(
+      table->numDistinct(), baseSize - static_cast<int>(toErase.size()));
+
+  table->prepareForGroupProbe(
+      *lookup, flatInput, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  ASSERT_EQ(table->numDistinct(), baseSize);
+  ASSERT_EQ(
+      static_cast<int>(lookup->newGroups.size()),
+      static_cast<int>(toErase.size()));
+}
+
+// Exercises the per-column hash mixed path with only VARCHAR keys (no
+// fixed-width columns). Simulates TPC-DS-like scenarios where group-by keys
+// are predominantly string columns.
+// Uses 6 VARCHAR keys with strings > 7 bytes (disabling stringAsNumber range
+// encoding) and enough distinct values to overflow the combined product,
+// guaranteeing kHash mode.
+TEST_P(HashTableTest, xxhashPureVarcharMixedPath) {
+  auto rowType = ROW(
+      {"k1", "k2", "k3", "k4", "k5", "k6"},
+      {VARCHAR(), VARCHAR(), VARCHAR(), VARCHAR(), VARCHAR(), VARCHAR()});
+  auto table = createHashTableForAggregation(rowType, 6);
+
+  const int numRows = 10'000;
+  auto input = makeRowVector({
+      makeFlatVector<std::string>(
+          numRows, [](auto row) { return fmt::format("identifier_{}", row); }),
+      makeFlatVector<std::string>(
+          numRows,
+          [](auto row) { return fmt::format("firstname_{}", row % 5000); }),
+      makeFlatVector<std::string>(
+          numRows,
+          [](auto row) { return fmt::format("lastname_{}", row % 3000); }),
+      makeFlatVector<std::string>(
+          numRows,
+          [](auto row) { return fmt::format("city_name_{}", row % 2000); }),
+      makeFlatVector<std::string>(
+          numRows,
+          [](auto row) { return fmt::format("region_id_{}", row % 1000); }),
+      makeFlatVector<std::string>(
+          numRows, [](auto row) { return fmt::format("zip_code_{}", row); }),
+  });
+
+  auto lookup = std::make_unique<HashLookup>(table->hashers());
+  SelectivityVector rows(input->size());
+
+  table->prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table->hashMode(), BaseHashTable::HashMode::kHash);
+  ASSERT_EQ(table->numDistinct(), numRows);
+
+  // Re-insert: all should match existing groups.
+  auto prevHits = lookup->hits;
+  table->prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  ASSERT_EQ(table->numDistinct(), numRows);
+  ASSERT_TRUE(lookup->newGroups.empty());
+  for (int i = 0; i < numRows; ++i) {
+    ASSERT_EQ(lookup->hits[i], prevHits[i]);
+  }
+
+  // Erase + re-insert to verify probe/build hash consistency.
+  std::vector<char*> toErase;
+  for (int i = 0; i < numRows; i += 2) {
+    toErase.push_back(lookup->hits[i]);
+  }
+  const auto eraseCount = static_cast<int>(toErase.size());
+  table->erase(folly::Range<char**>(toErase.data(), toErase.size()));
+  ASSERT_EQ(table->numDistinct(), numRows - eraseCount);
+
+  table->prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  ASSERT_EQ(table->numDistinct(), numRows);
+  ASSERT_EQ(static_cast<int>(lookup->newGroups.size()), eraseCount);
 }
 
 TEST(HashTableTest, tableInsertPartitionInfo) {
