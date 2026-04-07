@@ -1673,46 +1673,132 @@ void HashTable<ignoreNullKeys>::groupProbe(
     arrayGroupProbe(lookup);
     return;
   }
-  // Do size-based rehash before mixing hashes from normalized keys
-  // because the size of the table affects the mixing.
   checkSize(lookup.rows.size(), false, spillInputStartPartitionBit);
   if (hashMode_ == HashMode::kNormalizedKey) {
     populateNormalizedKeys(lookup, sizeBits_);
     groupNormalizedKeyProbe(lookup);
     return;
   }
-  ProbeState state1;
-  ProbeState state2;
-  ProbeState state3;
-  ProbeState state4;
+
+  // --- kHash mode: 8-way batched pipeline with prefetch optimizations ---
+  constexpr int32_t kBatchWidth = 8;
+  constexpr int32_t kHashPrefetchAhead = 16;
+
   int32_t probeIndex = 0;
-  int32_t numProbes = lookup.rows.size();
-  auto rows = lookup.rows.data();
-  for (; probeIndex + 4 <= numProbes; probeIndex += 4) {
-    int32_t row = rows[probeIndex];
-    state1.preProbe(*this, lookup.hashes[row], row);
-    row = rows[probeIndex + 1];
-    state2.preProbe(*this, lookup.hashes[row], row);
-    row = rows[probeIndex + 2];
-    state3.preProbe(*this, lookup.hashes[row], row);
-    row = rows[probeIndex + 3];
-    state4.preProbe(*this, lookup.hashes[row], row);
+  const int32_t numProbes = lookup.rows.size();
+  const auto* rows = lookup.rows.data();
+  const auto* hashes = lookup.hashes.data();
+ 
+  // Contiguous probe rows: {rowStart, rowStart+1, ..., rowStart+numProbes-1}.
+  // populateLookupRows enumerates selected rows in ascending order; if first
+  // and last differ by numProbes-1, all rows are consecutive (no gaps).
+  const bool isContiguousRowRange =
+      numProbes > 0 &&
+      rows[numProbes - 1] - rows[0] == numProbes - 1;
+  const int32_t rowStart = isContiguousRowRange ? rows[0] : 0;
 
-    state1.firstProbe<ProbeState::Operation::kInsert>(*this, 0);
-    state2.firstProbe<ProbeState::Operation::kInsert>(*this, 0);
-    state3.firstProbe<ProbeState::Operation::kInsert>(*this, 0);
-    state4.firstProbe<ProbeState::Operation::kInsert>(*this, 0);
+  ProbeState bufA[kBatchWidth];
+  ProbeState bufB[kBatchWidth];
+  ProbeState* cur = bufA;
+  ProbeState* nxt = bufB;
 
-    fullProbe<false>(lookup, state1, false);
-    fullProbe<false>(lookup, state2, true);
-    fullProbe<false>(lookup, state3, true);
-    fullProbe<false>(lookup, state4, true);
-  }
-  for (; probeIndex < numProbes; ++probeIndex) {
-    int32_t row = rows[probeIndex];
-    state1.preProbe(*this, lookup.hashes[row], row);
-    state1.firstProbe(*this, 0);
-    fullProbe<false>(lookup, state1, false);
+  if (isContiguousRowRange) {
+    // ===== Contiguous row range fast path =====
+    // Direct hashes[rowStart + probeSlot] without rows[] indirection per slot.
+    // Scheme E: two-stage pipeline — prefetch batch N+1 while processing N.
+
+    auto prefetchBatch = [&](ProbeState* st, int32_t probeBase) {
+      for (int32_t k = 0; k < kBatchWidth && probeBase + k < numProbes; ++k) {
+        const int32_t row = rowStart + probeBase + k;
+        st[k].preProbe(*this, hashes[row], row);
+      }
+    };
+
+    // Seed pipeline: prefetch batch 0.
+    prefetchBatch(cur, probeIndex);
+
+    for (; probeIndex + kBatchWidth <= numProbes;
+        probeIndex += kBatchWidth) {
+      // Scheme D: prefetch hashes for a future batch.
+      if (probeIndex + kBatchWidth + kHashPrefetchAhead < numProbes) {
+        for (int32_t p = 0; p < kBatchWidth; p += 2) {
+          __builtin_prefetch(&hashes[rowStart + probeIndex + kBatchWidth +
+              kHashPrefetchAhead + p]);
+        }
+      }
+
+      // Pipeline stage 1: issue prefetch for next batch.
+      if (probeIndex + 2 * kBatchWidth <= numProbes) {
+        prefetchBatch(nxt, probeIndex + kBatchWidth);
+      }
+
+      // Pipeline stage 2: firstProbe + fullProbe for current batch.
+      for (int32_t k = 0; k < kBatchWidth; ++k) {
+        cur[k].firstProbe<ProbeState::Operation::kInsert>(*this, 0);
+      }
+      fullProbe<false>(lookup, cur[0], false);
+      for (int32_t k = 1; k < kBatchWidth; ++k) {
+        fullProbe<false>(lookup, cur[k], true);
+      }
+
+      std::swap(cur, nxt);
+    }
+
+    // Tail: remaining rows.
+    for (; probeIndex < numProbes; ++probeIndex) {
+      const int32_t row = rowStart + probeIndex;
+      bufA[0].preProbe(*this, hashes[row], row);
+      bufA[0].firstProbe(*this, 0);
+      fullProbe<false>(lookup, bufA[0], false);
+    }
+
+  } else {
+    // ===== Sparse path (with rows[] indirection) =====
+
+    auto prefetchBatch = [&](ProbeState* st, int32_t base) {
+      for (int32_t k = 0; k < kBatchWidth && base + k < numProbes; ++k) {
+        int32_t r = rows[base + k];
+        st[k].preProbe(*this, hashes[r], r);
+      }
+    };
+
+    // Seed pipeline: prefetch batch 0.
+    prefetchBatch(cur, probeIndex);
+
+    for (; probeIndex + kBatchWidth <= numProbes;
+        probeIndex += kBatchWidth) {
+      // Scheme D: prefetch hashes for a future batch via rows indirection.
+      if (probeIndex + kBatchWidth + kHashPrefetchAhead < numProbes) {
+        for (int32_t p = 0; p < kBatchWidth; p += 2) {
+          __builtin_prefetch(
+              &hashes[rows[probeIndex + kBatchWidth + kHashPrefetchAhead + p]]);
+        }
+      }
+
+      // Pipeline stage 1: issue prefetch for next batch.
+      if (probeIndex + 2 * kBatchWidth <= numProbes) {
+        prefetchBatch(nxt, probeIndex + kBatchWidth);
+      }
+
+      // Pipeline stage 2: firstProbe + fullProbe for current batch.
+      for (int32_t k = 0; k < kBatchWidth; ++k) {
+        cur[k].firstProbe<ProbeState::Operation::kInsert>(*this, 0);
+      }
+      fullProbe<false>(lookup, cur[0], false);
+      for (int32_t k = 1; k < kBatchWidth; ++k) {
+        fullProbe<false>(lookup, cur[k], true);
+      }
+
+      std::swap(cur, nxt);
+    }
+
+    // Tail: remaining rows.
+    for (; probeIndex < numProbes; ++probeIndex) {
+      int32_t r = rows[probeIndex];
+      bufA[0].preProbe(*this, hashes[r], r);
+      bufA[0].firstProbe(*this, 0);
+      fullProbe<false>(lookup, bufA[0], false);
+    }
   }
 }
 

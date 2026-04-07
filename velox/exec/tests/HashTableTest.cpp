@@ -2580,6 +2580,244 @@ TEST_P(HashTableTest, fastCompareKeysSmallIntTypes) {
   }
 }
 
+// Tests the 8-way batched groupProbe dense fast path in kHash mode with
+// various row counts around the kBatchWidth=8 boundary: exact multiples (no
+// tail), below-batch (tail only), and mixed (main loop + tail).
+//
+// Small batches would otherwise pick kNormalizedKey via decideHashMode; we
+// force kHash so this exercises the kHash groupProbe path (XXH3 + batched
+// pipeline), not groupNormalizedKeyProbe.
+TEST_P(HashTableTest, groupProbeKHashDenseBatchBoundaries) {
+  auto rowType = ROW(
+      {"k1", "k2", "k3", "k4", "k5", "k6"},
+      {BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT(), VARCHAR()});
+
+  const int totalRows = 100;
+  auto input = makeRowVector({
+      makeFlatVector<int64_t>(totalRows, [](auto row) { return row * 1000; }),
+      makeFlatVector<int64_t>(totalRows, [](auto row) { return row * 2000; }),
+      makeFlatVector<int64_t>(totalRows, [](auto row) { return row * 3000; }),
+      makeFlatVector<int64_t>(totalRows, [](auto row) { return row * 4000; }),
+      makeFlatVector<int64_t>(totalRows, [](auto row) { return row * 5000; }),
+      makeFlatVector<std::string>(
+          totalRows, [](auto row) { return std::to_string(row * 1000); }),
+  });
+
+  auto table = createHashTableForAggregation(rowType, 6);
+  HashTableTestHelper<false>::create(table.get()).setHashMode(
+      BaseHashTable::HashMode::kHash, totalRows);
+  auto lookup = std::make_unique<HashLookup>(table->hashers());
+  SelectivityVector allRows(totalRows);
+
+  table->prepareForGroupProbe(
+      *lookup, input, allRows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table->hashMode(), BaseHashTable::HashMode::kHash);
+  ASSERT_EQ(table->numDistinct(), totalRows);
+  auto prevHits = lookup->hits;
+
+  // Re-probe with the first N rows for various N values.
+  // lookup.rows = {0, 1, ..., N-1} is a contiguous range (starts at 0).
+  for (int numSelected : {1, 3, 7, 8, 9, 15, 16, 17, 24, 25, 50, 100}) {
+    SCOPED_TRACE(fmt::format("numSelected={}", numSelected));
+    SelectivityVector rows(numSelected);
+
+    table->prepareForGroupProbe(
+        *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+    table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+    ASSERT_EQ(table->numDistinct(), totalRows);
+    ASSERT_TRUE(lookup->newGroups.empty());
+    for (int i = 0; i < numSelected; ++i) {
+      ASSERT_EQ(lookup->hits[i], prevHits[i]);
+    }
+  }
+
+  // Contiguous ranges [rowStart, rowStart + len - 1] with rowStart > 0
+  // (e.g. {1..N}, {10..29}) — exercises generalized contiguous fast path.
+  for (const auto& range : std::vector<std::pair<int, int>>{
+           {1, 40},   // rows 1 .. 40
+           {10, 25},  // rows 10 .. 34
+           {50, 30},  // rows 50 .. 79
+           {88, 12},  // rows 88 .. 99 (end of batch)
+       }) {
+    const int rowStart = range.first;
+    const int len = range.second;
+    SCOPED_TRACE(fmt::format("contiguous=[{},{}]", rowStart, rowStart + len - 1));
+    SelectivityVector rows(totalRows, false);
+    for (int r = rowStart; r < rowStart + len; ++r) {
+      rows.setValid(r, true);
+    }
+    rows.updateBounds();
+
+    table->prepareForGroupProbe(
+        *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+    table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+    ASSERT_EQ(table->numDistinct(), totalRows);
+    ASSERT_TRUE(lookup->newGroups.empty());
+    for (int r = rowStart; r < rowStart + len; ++r) {
+      ASSERT_EQ(lookup->hits[r], prevHits[r]);
+    }
+  }
+}
+
+// Tests the sparse (non-contiguous rows) path in 8-way batched groupProbe
+// in kHash mode, when rows[last] - rows[0] != numProbes - 1 (gaps / non-range),
+// so the contiguous-range fast path is not used.
+//
+// Force kHash (see groupProbeKHashDenseBatchBoundaries) so we don't hit
+// groupNormalizedKeyProbe.
+TEST_P(HashTableTest, groupProbeKHashSparsePath) {
+  auto rowType = ROW(
+      {"k1", "k2", "k3", "k4", "k5", "k6"},
+      {BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT(), VARCHAR()});
+
+  const int totalRows = 100;
+  auto input = makeRowVector({
+      makeFlatVector<int64_t>(totalRows, [](auto row) { return row * 1000; }),
+      makeFlatVector<int64_t>(totalRows, [](auto row) { return row * 2000; }),
+      makeFlatVector<int64_t>(totalRows, [](auto row) { return row * 3000; }),
+      makeFlatVector<int64_t>(totalRows, [](auto row) { return row * 4000; }),
+      makeFlatVector<int64_t>(totalRows, [](auto row) { return row * 5000; }),
+      makeFlatVector<std::string>(
+          totalRows, [](auto row) { return std::to_string(row * 1000); }),
+  });
+
+  auto table = createHashTableForAggregation(rowType, 6);
+  HashTableTestHelper<false>::create(table.get()).setHashMode(
+      BaseHashTable::HashMode::kHash, totalRows);
+  auto lookup = std::make_unique<HashLookup>(table->hashers());
+  SelectivityVector allRows(totalRows);
+
+  table->prepareForGroupProbe(
+      *lookup, input, allRows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table->hashMode(), BaseHashTable::HashMode::kHash);
+  ASSERT_EQ(table->numDistinct(), totalRows);
+  auto prevHits = lookup->hits;
+
+  auto runSparse = [&](const std::string& label,
+                       const std::vector<int>& selected) {
+    SCOPED_TRACE(label);
+    SelectivityVector rows(totalRows, false);
+    for (auto idx : selected) {
+      rows.setValid(idx, true);
+    }
+    rows.updateBounds();
+
+    table->prepareForGroupProbe(
+        *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+    table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+    ASSERT_EQ(table->numDistinct(), totalRows);
+    ASSERT_TRUE(lookup->newGroups.empty());
+    for (auto idx : selected) {
+      ASSERT_EQ(lookup->hits[idx], prevHits[idx]);
+    }
+  };
+
+  // Pattern 1: every 2nd row — 50 selected, exercises multiple full batches
+  // plus tail in sparse path.
+  {
+    std::vector<int> sel;
+    for (int i = 0; i < totalRows; i += 2) {
+      sel.push_back(i);
+    }
+    runSparse("every 2nd row", sel);
+  }
+
+  // Pattern 2: every 3rd row — 34 selected (34 % 8 == 2 tail rows).
+  {
+    std::vector<int> sel;
+    for (int i = 0; i < totalRows; i += 3) {
+      sel.push_back(i);
+    }
+    runSparse("every 3rd row", sel);
+  }
+
+  // Pattern 3: fewer than 8 scattered rows — tail-only sparse path.
+  runSparse("5 scattered rows", {3, 17, 42, 68, 91});
+
+  // Pattern 4: exactly 8 scattered rows — one full batch, no tail.
+  runSparse("8 scattered rows", {5, 12, 23, 37, 48, 61, 79, 95});
+
+  // Pattern 5: 9 scattered rows — one full batch + 1 tail row.
+  runSparse("9 scattered rows", {2, 11, 22, 33, 44, 55, 66, 77, 88});
+
+  // Pattern 6: 16 scattered rows — two full batches, no tail, exercises the
+  // pipeline stage that prefetches batch N+1 while probing batch N.
+  {
+    std::vector<int> sel;
+    for (int i = 0; i < 16; ++i) {
+      sel.push_back(i * 6 + 1);
+    }
+    runSparse("16 scattered rows", sel);
+  }
+}
+
+// Tests insertion (not just re-probe) through the 8-way batched groupProbe in
+// kHash mode with incremental batches of various sizes. The first batch
+// (contiguous from row 0) take the contiguous-range fast path; subsequent
+// batches are also contiguous ranges (e.g. 8..16) and use the same fast path.
+//
+// Same as dense/sparse tests: force kHash so inserts use kHash groupProbe,
+// not groupNormalizedKeyProbe.
+TEST_P(HashTableTest, groupProbeKHashIncrementalInsert) {
+  auto rowType = ROW(
+      {"k1", "k2", "k3", "k4", "k5", "k6"},
+      {BIGINT(), BIGINT(), BIGINT(), BIGINT(), BIGINT(), VARCHAR()});
+  auto table = createHashTableForAggregation(rowType, 6);
+
+  const int totalRows = 100;
+  HashTableTestHelper<false>::create(table.get()).setHashMode(
+      BaseHashTable::HashMode::kHash, totalRows);
+  auto lookup = std::make_unique<HashLookup>(table->hashers());
+  auto input = makeRowVector({
+      makeFlatVector<int64_t>(totalRows, [](auto row) { return row * 1000; }),
+      makeFlatVector<int64_t>(totalRows, [](auto row) { return row * 2000; }),
+      makeFlatVector<int64_t>(totalRows, [](auto row) { return row * 3000; }),
+      makeFlatVector<int64_t>(totalRows, [](auto row) { return row * 4000; }),
+      makeFlatVector<int64_t>(totalRows, [](auto row) { return row * 5000; }),
+      makeFlatVector<std::string>(
+          totalRows, [](auto row) { return std::to_string(row * 1000); }),
+  });
+
+  // Batch sizes sum to 100, covering exact-8, above-8, below-8, and single-row
+  // boundaries: 8 + 9 + 7 + 16 + 1 + 15 + 17 + 3 + 24 = 100.
+  int insertedSoFar = 0;
+  for (int batchSize : {8, 9, 7, 16, 1, 15, 17, 3, 24}) {
+    SCOPED_TRACE(
+        fmt::format("batch={}, offset={}", batchSize, insertedSoFar));
+    SelectivityVector rows(totalRows, false);
+    for (int i = insertedSoFar; i < insertedSoFar + batchSize; ++i) {
+      rows.setValid(i, true);
+    }
+    rows.updateBounds();
+
+    table->prepareForGroupProbe(
+        *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+    table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+    insertedSoFar += batchSize;
+    ASSERT_EQ(table->numDistinct(), insertedSoFar);
+    ASSERT_EQ(static_cast<int>(lookup->newGroups.size()), batchSize);
+  }
+
+  ASSERT_EQ(table->hashMode(), BaseHashTable::HashMode::kHash);
+  ASSERT_EQ(table->numDistinct(), totalRows);
+
+  // Final re-probe of all rows: everything should be an existing match.
+  SelectivityVector allRows(totalRows);
+  table->prepareForGroupProbe(
+      *lookup, input, allRows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table->groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  ASSERT_EQ(table->numDistinct(), totalRows);
+  ASSERT_TRUE(lookup->newGroups.empty());
+}
+
 TEST(HashTableTest, tableInsertPartitionInfo) {
   std::vector<char*> overflows;
   const auto testFn = [&](PartitionBoundIndexType start,
