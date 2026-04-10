@@ -28,6 +28,7 @@
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
+#include <map>
 #include <memory>
 
 using namespace facebook::velox;
@@ -581,6 +582,71 @@ class HashTableTest : public testing::TestWithParam<bool>,
   // Base string for varchar fields when making string vector.
   std::string baseString_;
   std::unique_ptr<folly::CPUThreadPoolExecutor> executor_;
+
+  std::map<int32_t, int64_t> runSumInt32Agg(
+      const std::vector<int32_t>& keys,
+      const std::vector<std::optional<int32_t>>& vals) {
+    VELOX_CHECK_EQ(keys.size(), vals.size());
+
+    auto inputType = ROW({"key", "value"}, {INTEGER(), INTEGER()});
+    auto idVector = makeFlatVector<int32_t>(
+        keys.size(), [&](auto row) { return keys[row]; });
+    auto valVector = makeNullableFlatVector<int32_t>(vals);
+    auto input = makeRowVector(inputType->names(), {idVector, valVector});
+
+    using SumAggregate =
+        functions::aggregate::SumAggregateBase<int32_t, int64_t, int64_t, true>;
+    auto sumAggregate = std::make_unique<SumAggregate>(BIGINT());
+
+    std::vector<std::unique_ptr<VectorHasher>> keyHashers;
+    keyHashers.emplace_back(
+        std::make_unique<VectorHasher>(inputType->childAt(0), 0));
+    auto tableWithAgg = HashTable<false>::createForAggregation(
+        std::move(keyHashers),
+        {Accumulator{sumAggregate.get(), nullptr}},
+        pool());
+
+    RowContainer& rc = *tableWithAgg->rows();
+    auto rowColumn = rc.columnAt(1);
+    sumAggregate->setAllocator(&rc.stringAllocator());
+    sumAggregate->setOffsets(
+        rowColumn.offset(), rowColumn.nullByte(), rowColumn.nullMask(),
+        rowColumn.initializedByte(), rowColumn.initializedMask(),
+        rc.rowSizeOffset());
+
+    auto lookup = std::make_unique<HashLookup>(tableWithAgg->hashers());
+    SelectivityVector rows(input->size());
+    rows.setAll();
+
+    tableWithAgg->prepareForGroupProbe(
+        *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+    tableWithAgg->groupProbe(
+        *lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+    auto* groups = lookup->hits.data();
+    if (!lookup->newGroups.empty()) {
+      sumAggregate->initializeNewGroups(groups, lookup->newGroups);
+    }
+
+    std::vector<VectorPtr> args = {input->childAt(1)};
+    sumAggregate->addRawInput(groups, rows, args, false);
+
+    RowContainerIterator it;
+    constexpr int kMaxGroups = 10000;
+    std::vector<char*> groupResults(kMaxGroups);
+    int32_t numGroups = tableWithAgg->rows()->listRows(
+        &it, kMaxGroups, 10000000, groupResults.data());
+
+    std::map<int32_t, int64_t> result;
+    for (int i = 0; i < numGroups; i++) {
+      auto key = *reinterpret_cast<int32_t*>(
+          groupResults[i] + rc.columnAt(0).offset());
+      auto sum = *reinterpret_cast<int64_t*>(
+          groupResults[i] + rc.columnAt(1).offset());
+      result[key] = sum;
+    }
+    return result;
+  }
 };
 
 TEST_P(HashTableTest, int2DenseArray) {
@@ -1123,190 +1189,294 @@ TEST_P(HashTableTest, addInput_getOutput_testClearNullSVE) {
   }
 }
 
-/**
- * @brief Test Case: sumInt32_SVE
- *
- * @details
- * 本用例用于验证：
- *   1. HashAggregation 场景下，SUM(int32_t) 能正确执行
- *   2. 能命中自定义的 SVE 优化路径：
- *        hashAggUpdateSVEWithCharForNormalInt32
- *   3. 在包含 NULL 值的情况下，聚合结果正确
- *
- * @coverage
- *   - Aggregation Function:
- *       facebook::velox::functions::aggregate::SumAggregateBase<int32_t,...>
- *   - 执行路径：
- *       addRawInput()
- *         → updateGroups()
- *           → hashAggUpdateSVEWithCharForNormalInt32  (SVE路径)
- *
- * @input
- *   key:   [1, 1, 1, 2, 2, 3]
- *   value: [10, null, 20, null, null, 30]
- *
- * @expected output
- *   key=1 → 10 + 20 = 30
- *   key=2 → all null → 0（非 ANSI 模式）
- *   key=3 → 30
- *
- * @test focus
- *   - int32 输入类型 → 命中 SVE specialization
- *   - nullable vector → 覆盖 null mask 逻辑
- *   - 多 group → 覆盖 groupProbe + aggregation
- *
- * @note
- *   若 SVE 未生效，可通过火焰图确认是否进入：
- *     hashAggUpdateSVEWithCharForNormalInt32
- */
-TEST_P(HashTableTest, sumInt32_SVE) {
-  // =========================
-  // 1. 构造输入类型 (key, value)
-  // =========================
-  auto inputType = ROW({"key", "value"}, {INTEGER(), INTEGER()});
-
-  // 构造分组键列（int32）
-  std::vector<int32_t> ids = {1, 1, 1, 2, 2, 3};
-  auto idVector =
-      makeFlatVector<int32_t>(ids.size(), [&](auto row) { return ids[row]; });
-
-  // 构造聚合列（含 NULL）
+// ---------------------------------------------------------------------------
+// Basic correctness: mixed values and NULLs (original test, now with proper
+// NULL-group validation).
+// ---------------------------------------------------------------------------
+TEST_P(HashTableTest, sumInt32_BasicMixedNulls) {
+  // key=1: 10 + NULL + 20 = 30
+  // key=2: NULL + NULL = 0 (all-null group, accumulator untouched)
+  // key=3: 30
+  std::vector<int32_t> keys = {1, 1, 1, 2, 2, 3};
   std::vector<std::optional<int32_t>> vals = {
       10, std::nullopt, 20, std::nullopt, std::nullopt, 30};
 
-  auto valVector = makeNullableFlatVector<int32_t>(vals);
+  auto result = runSumInt32Agg(keys, vals);
+  ASSERT_EQ(result.size(), 3);
+  ASSERT_EQ(result[1], 30);
+  ASSERT_EQ(result[2], 0);
+  ASSERT_EQ(result[3], 30);
+}
 
-  // 构造 RowVector (输入数据)
-  auto input =
-      makeRowVector(inputType->names(), {idVector, valVector});
-
-  // =========================
-  // 2. 构造 SUM(int32) 聚合函数
-  // =========================
-  // 输入类型: int32_t
-  // 中间/输出类型: int64_t（防止溢出）
-  using SumAggregate =
-      functions::aggregate::SumAggregateBase<int32_t, int64_t, int64_t, true>;
-
-  auto sumAggregate = std::make_unique<SumAggregate>(BIGINT());
-
-  // =========================
-  // 3. 构造 HashAggregation Table
-  // =========================
-  std::vector<std::unique_ptr<VectorHasher>> keyHashers;
-
-  // key 列 hash
-  keyHashers.emplace_back(
-      std::make_unique<VectorHasher>(inputType->childAt(0), 0));
-
-  // 创建 HashTable（核心聚合结构）
-  auto tableWithAgg = HashTable<false>::createForAggregation(
-      std::move(keyHashers),
-      {Accumulator{sumAggregate.get(), nullptr}},
-      pool());
-
-  // =========================
-  // 4. 初始化聚合函数内存布局
-  // =========================
-  RowContainer& row_container = *tableWithAgg->rows();
-  auto rowColumn = row_container.columnAt(1); // 第1列为聚合结果
-
-  // 设置字符串分配器（虽然 SUM 不用，但框架要求）
-  sumAggregate->setAllocator(&row_container.stringAllocator());
-
-  // 关键：设置聚合值在 row 内存中的 offset / null bit 等信息
-  sumAggregate->setOffsets(
-      rowColumn.offset(),
-      rowColumn.nullByte(),
-      rowColumn.nullMask(),
-      rowColumn.initializedByte(),
-      rowColumn.initializedMask(),
-      row_container.rowSizeOffset());
-
-  // =========================
-  // 5. 构造 lookup & rows
-  // =========================
-  auto lookup = std::make_unique<HashLookup>(tableWithAgg->hashers());
-
-  SelectivityVector rows(input->size());
-  rows.setAll(); // 所有行参与计算
-
-  // =========================
-  // 6. 构建 group mapping
-  // =========================
-  // step1: 根据 key 查找或创建 group
-  tableWithAgg->prepareForGroupProbe(
-      *lookup, input, rows,
-      BaseHashTable::kNoSpillInputStartPartitionBit);
-
-  // step2: 建立 row → group 的映射关系
-  tableWithAgg->groupProbe(
-      *lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
-
-  // 每一行对应的 group 指针
-  auto* groups = lookup->hits.data();
-
-  // 新创建的 group
-  const auto& newGroups = lookup->newGroups;
-
-  // =========================
-  // 7. 初始化新 group 的聚合状态
-  // =========================
-  if (!newGroups.empty()) {
-    sumAggregate->initializeNewGroups(groups, newGroups);
+// ---------------------------------------------------------------------------
+// All values non-NULL: exercises the dense path (popcount == 64 per word).
+// ---------------------------------------------------------------------------
+TEST_P(HashTableTest, sumInt32_AllNonNull) {
+  constexpr int N = 200;
+  std::vector<int32_t> keys(N);
+  std::vector<std::optional<int32_t>> vals(N);
+  // 10 groups, 20 rows each, value = row index
+  for (int i = 0; i < N; ++i) {
+    keys[i] = i % 10;
+    vals[i] = i;
   }
-
-  // =========================
-  // 8. 执行聚合（核心路径）
-  // =========================
-  std::vector<VectorPtr> args = {input->childAt(1)};
-
-  /**
-   * 🔥 核心调用链：
-   *
-   * addRawInput()
-   *   → updateGroups()
-   *     → (TValue == int32_t)
-   *       → hashAggUpdateSVEWithCharForNormalInt32  ← SVE优化路径
-   *
-   * 这里会：
-   *   - 读取 bitmask（rows + nulls）
-   *   - 使用 SVE 指令做批量累加
-   */
-  sumAggregate->addRawInput(groups, rows, args, false);
-
-  // =========================
-  // 9. 读取聚合结果
-  // =========================
-  RowContainerIterator it;
-
-  char* groupResults[10];
-
-  int32_t numGroups = tableWithAgg->rows()->listRows(
-      &it, 10, 100000, groupResults);
-
-  ASSERT_EQ(numGroups, 3);
-
-  // =========================
-  // 10. 校验结果
-  // =========================
-  for (int i = 0; i < numGroups; i++) {
-    // 读取 key
-    auto key = *reinterpret_cast<int32_t*>(
-        groupResults[i] + row_container.columnAt(0).offset());
-
-    // 读取 sum（int64）
-    auto sum = *reinterpret_cast<int64_t*>(
-        groupResults[i] + row_container.columnAt(1).offset());
-
-    if (key == 1) {
-      ASSERT_EQ(sum, 30);
-    } else if (key == 2) {
-      // 两个 NULL → 默认结果为 0（非 ANSI）
-      ASSERT_EQ(sum, 0);
-    } else if (key == 3) {
-      ASSERT_EQ(sum, 30);
+  auto result = runSumInt32Agg(keys, vals);
+  ASSERT_EQ(result.size(), 10);
+  for (int g = 0; g < 10; ++g) {
+    int64_t expected = 0;
+    for (int i = g; i < N; i += 10) {
+      expected += i;
     }
+    ASSERT_EQ(result[g], expected) << "group " << g;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// All values NULL: every group should have sum=0 (accumulator init value).
+// ---------------------------------------------------------------------------
+TEST_P(HashTableTest, sumInt32_AllNull) {
+  constexpr int N = 100;
+  std::vector<int32_t> keys(N);
+  std::vector<std::optional<int32_t>> vals(N, std::nullopt);
+  for (int i = 0; i < N; ++i) {
+    keys[i] = i % 5;
+  }
+  auto result = runSumInt32Agg(keys, vals);
+  ASSERT_EQ(result.size(), 5);
+  for (auto& [k, v] : result) {
+    ASSERT_EQ(v, 0) << "all-null group " << k << " should be 0";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Alternating NULL pattern: every other row is NULL. This creates a sparse
+// bitmap (popcount ~32/64) ensuring the ctz-scan path is exercised.
+// ---------------------------------------------------------------------------
+TEST_P(HashTableTest, sumInt32_AlternatingNulls) {
+  constexpr int N = 256;
+  std::vector<int32_t> keys(N);
+  std::vector<std::optional<int32_t>> vals(N);
+  for (int i = 0; i < N; ++i) {
+    keys[i] = i % 8;
+    vals[i] = (i % 2 == 0) ? std::optional<int32_t>(i) : std::nullopt;
+  }
+  auto result = runSumInt32Agg(keys, vals);
+  ASSERT_EQ(result.size(), 8);
+  for (int g = 0; g < 8; ++g) {
+    int64_t expected = 0;
+    for (int i = g; i < N; i += 8) {
+      if (i % 2 == 0)
+        expected += i;
+    }
+    ASSERT_EQ(result[g], expected) << "group " << g;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Dense with rare NULLs (~3% null rate): exercises the dense path where
+// most nibbles == 0xF but a few have gaps.
+// ---------------------------------------------------------------------------
+TEST_P(HashTableTest, sumInt32_DenseRareNulls) {
+  constexpr int N = 1024;
+  std::vector<int32_t> keys(N);
+  std::vector<std::optional<int32_t>> vals(N);
+  for (int i = 0; i < N; ++i) {
+    keys[i] = i % 16;
+    vals[i] = (i % 37 == 0) ? std::nullopt : std::optional<int32_t>(i);
+  }
+  auto result = runSumInt32Agg(keys, vals);
+  ASSERT_EQ(result.size(), 16);
+  for (int g = 0; g < 16; ++g) {
+    int64_t expected = 0;
+    for (int i = g; i < N; i += 16) {
+      if (i % 37 != 0)
+        expected += i;
+    }
+    ASSERT_EQ(result[g], expected) << "group " << g;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Highly sparse NULLs (~90% null rate): most bits are zero, ctz path skips
+// quickly, and only a few rows actually accumulate.
+// ---------------------------------------------------------------------------
+TEST_P(HashTableTest, sumInt32_HighlySpare) {
+  constexpr int N = 512;
+  std::vector<int32_t> keys(N);
+  std::vector<std::optional<int32_t>> vals(N);
+  for (int i = 0; i < N; ++i) {
+    keys[i] = i % 4;
+    vals[i] = (i % 10 == 0) ? std::optional<int32_t>(i * 3) : std::nullopt;
+  }
+  auto result = runSumInt32Agg(keys, vals);
+  ASSERT_EQ(result.size(), 4);
+  for (int g = 0; g < 4; ++g) {
+    int64_t expected = 0;
+    for (int i = g; i < N; i += 4) {
+      if (i % 10 == 0)
+        expected += i * 3;
+    }
+    ASSERT_EQ(result[g], expected) << "group " << g;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Large dataset crossing multiple 64-bit bitmap words. With 2000 rows and
+// mixed nulls, this exercises multi-word iteration, boundary clipping, and
+// the adaptive dense/sparse dispatch across many words.
+// ---------------------------------------------------------------------------
+TEST_P(HashTableTest, sumInt32_LargeMultiWord) {
+  constexpr int N = 2000;
+  std::vector<int32_t> keys(N);
+  std::vector<std::optional<int32_t>> vals(N);
+  for (int i = 0; i < N; ++i) {
+    keys[i] = i % 50;
+    vals[i] = (i % 7 == 0) ? std::nullopt : std::optional<int32_t>(i - 500);
+  }
+  auto result = runSumInt32Agg(keys, vals);
+  ASSERT_EQ(result.size(), 50);
+  for (int g = 0; g < 50; ++g) {
+    int64_t expected = 0;
+    for (int i = g; i < N; i += 50) {
+      if (i % 7 != 0)
+        expected += (i - 500);
+    }
+    ASSERT_EQ(result[g], expected) << "group " << g;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Int32 overflow into int64: values near INT32_MAX that would overflow int32
+// but fit in int64 accumulator. Validates the int32→int64 widening is correct.
+// ---------------------------------------------------------------------------
+TEST_P(HashTableTest, sumInt32_OverflowIntoInt64) {
+  constexpr int32_t kBig = std::numeric_limits<int32_t>::max();
+  std::vector<int32_t> keys = {1, 1, 1, 2, 2};
+  std::vector<std::optional<int32_t>> vals = {kBig, kBig, kBig, kBig, 1};
+
+  auto result = runSumInt32Agg(keys, vals);
+  ASSERT_EQ(result.size(), 2);
+  ASSERT_EQ(result[1], static_cast<int64_t>(kBig) * 3);
+  ASSERT_EQ(result[2], static_cast<int64_t>(kBig) + 1);
+}
+
+// ---------------------------------------------------------------------------
+// Negative values and mixed signs: ensures signed int32 → int64 promotion
+// handles negative numbers correctly, including cancellation to zero.
+// ---------------------------------------------------------------------------
+TEST_P(HashTableTest, sumInt32_NegativeValues) {
+  constexpr int32_t kMin = std::numeric_limits<int32_t>::min();
+  constexpr int32_t kMax = std::numeric_limits<int32_t>::max();
+
+  std::vector<int32_t> keys = {1, 1, 2, 2, 3, 3, 3};
+  std::vector<std::optional<int32_t>> vals = {
+      -100, 100,     // group 1: cancels to 0
+      kMin, kMax,    // group 2: kMin + kMax = -1
+      -1, -2, -3};  // group 3: -6
+
+  auto result = runSumInt32Agg(keys, vals);
+  ASSERT_EQ(result.size(), 3);
+  ASSERT_EQ(result[1], 0);
+  ASSERT_EQ(result[2], static_cast<int64_t>(kMin) + kMax);
+  ASSERT_EQ(result[3], -6);
+}
+
+// ---------------------------------------------------------------------------
+// Single row per group: boundary case with minimal data, verifies no
+// off-by-one in bitmap iteration when each word has very few active bits.
+// ---------------------------------------------------------------------------
+TEST_P(HashTableTest, sumInt32_SingleRowPerGroup) {
+  constexpr int N = 100;
+  std::vector<int32_t> keys(N);
+  std::vector<std::optional<int32_t>> vals(N);
+  for (int i = 0; i < N; ++i) {
+    keys[i] = i;
+    vals[i] = i * 7;
+  }
+  auto result = runSumInt32Agg(keys, vals);
+  ASSERT_EQ(result.size(), N);
+  for (int i = 0; i < N; ++i) {
+    ASSERT_EQ(result[i], i * 7) << "group " << i;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Single group, many rows: all rows map to the same group, stressing the
+// accumulator with repeated read-modify-write to the same memory location.
+// ---------------------------------------------------------------------------
+TEST_P(HashTableTest, sumInt32_SingleGroupManyRows) {
+  constexpr int N = 500;
+  std::vector<int32_t> keys(N, 42);
+  std::vector<std::optional<int32_t>> vals(N);
+  int64_t expected = 0;
+  for (int i = 0; i < N; ++i) {
+    vals[i] = (i % 11 == 0) ? std::nullopt : std::optional<int32_t>(i);
+    if (i % 11 != 0)
+      expected += i;
+  }
+  auto result = runSumInt32Agg(keys, vals);
+  ASSERT_EQ(result.size(), 1);
+  ASSERT_EQ(result[42], expected);
+}
+
+// ---------------------------------------------------------------------------
+// Exact 64-row boundary: exactly one 64-bit word, no boundary clipping
+// needed. Verifies the simple single-word case.
+// ---------------------------------------------------------------------------
+TEST_P(HashTableTest, sumInt32_Exact64Rows) {
+  constexpr int N = 64;
+  std::vector<int32_t> keys(N);
+  std::vector<std::optional<int32_t>> vals(N);
+  for (int i = 0; i < N; ++i) {
+    keys[i] = i % 4;
+    vals[i] = i + 1;
+  }
+  auto result = runSumInt32Agg(keys, vals);
+  ASSERT_EQ(result.size(), 4);
+  for (int g = 0; g < 4; ++g) {
+    int64_t expected = 0;
+    for (int i = g; i < N; i += 4)
+      expected += (i + 1);
+    ASSERT_EQ(result[g], expected) << "group " << g;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 65 rows: crosses the first 64-bit word boundary by exactly 1 row. Tests
+// clipBitsToRange on the trailing partial word.
+// ---------------------------------------------------------------------------
+TEST_P(HashTableTest, sumInt32_CrossWordBoundary65) {
+  constexpr int N = 65;
+  std::vector<int32_t> keys(N);
+  std::vector<std::optional<int32_t>> vals(N);
+  for (int i = 0; i < N; ++i) {
+    keys[i] = i % 3;
+    vals[i] = (i == 64) ? std::optional<int32_t>(9999) : std::optional<int32_t>(i);
+  }
+  auto result = runSumInt32Agg(keys, vals);
+  ASSERT_EQ(result.size(), 3);
+  for (int g = 0; g < 3; ++g) {
+    int64_t expected = 0;
+    for (int i = g; i < N; i += 3) {
+      expected += (i == 64) ? 9999 : i;
+    }
+    ASSERT_EQ(result[g], expected) << "group " << g;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// All zeros: accumulating 0 values should still clear null flags and produce 0.
+// ---------------------------------------------------------------------------
+TEST_P(HashTableTest, sumInt32_AllZeros) {
+  constexpr int N = 128;
+  std::vector<int32_t> keys(N);
+  std::vector<std::optional<int32_t>> vals(N, 0);
+  for (int i = 0; i < N; ++i)
+    keys[i] = i % 6;
+  auto result = runSumInt32Agg(keys, vals);
+  ASSERT_EQ(result.size(), 6);
+  for (auto& [k, v] : result) {
+    ASSERT_EQ(v, 0) << "group " << k;
   }
 }
 
