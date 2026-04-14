@@ -95,25 +95,42 @@ void VectorHasher::hashValues(
       rows.countSelected() > decoded_.base()->size()) {
     cachedHashes_.resize(decoded_.base()->size());
     std::fill(cachedHashes_.begin(), cachedHashes_.end(), kNullHash);
+    if (decoded_.mayHaveNulls()) {
+      rows.applyToSelected([&](vector_size_t row) {
+        if (decoded_.isNullAt(row)) {
+          result[row] = mix ? bits::hashMix(result[row], kNullHash) : kNullHash;
+          return;
+        }
+        auto baseIndex = decoded_.index(row);
+        uint64_t hash = cachedHashes_[baseIndex];
+        if (hash == kNullHash) {
+          hash = hashOne<typeProvidesCustomComparison, Kind>(decoded_, row);
+          cachedHashes_[baseIndex] = hash;
+        }
+        result[row] = mix ? bits::hashMix(result[row], hash) : hash;
+      });
+    } else {
+      rows.applyToSelected([&](vector_size_t row) {
+        auto baseIndex = decoded_.index(row);
+        uint64_t hash = cachedHashes_[baseIndex];
+        if (hash == kNullHash) {
+          hash = hashOne<typeProvidesCustomComparison, Kind>(decoded_, row);
+          cachedHashes_[baseIndex] = hash;
+        }
+        result[row] = mix ? bits::hashMix(result[row], hash) : hash;
+      });
+    }
+  } else if (decoded_.mayHaveNulls()) {
     rows.applyToSelected([&](vector_size_t row) {
       if (decoded_.isNullAt(row)) {
         result[row] = mix ? bits::hashMix(result[row], kNullHash) : kNullHash;
         return;
       }
-      auto baseIndex = decoded_.index(row);
-      uint64_t hash = cachedHashes_[baseIndex];
-      if (hash == kNullHash) {
-        hash = hashOne<typeProvidesCustomComparison, Kind>(decoded_, row);
-        cachedHashes_[baseIndex] = hash;
-      }
+      auto hash = hashOne<typeProvidesCustomComparison, Kind>(decoded_, row);
       result[row] = mix ? bits::hashMix(result[row], hash) : hash;
     });
   } else {
     rows.applyToSelected([&](vector_size_t row) {
-      if (decoded_.isNullAt(row)) {
-        result[row] = mix ? bits::hashMix(result[row], kNullHash) : kNullHash;
-        return;
-      }
       auto hash = hashOne<typeProvidesCustomComparison, Kind>(decoded_, row);
       result[row] = mix ? bits::hashMix(result[row], hash) : hash;
     });
@@ -270,10 +287,15 @@ bool VectorHasher::makeValueIdsDecoded(
   cachedHashes_.resize(decoded_.base()->size());
   std::fill(cachedHashes_.begin(), cachedHashes_.end(), 0);
 
+  const uint64_t* rawNulls = nullptr;
+  if constexpr (mayHaveNulls) {
+    rawNulls = decoded_.nulls(&rows);
+  }
+
   int numCachedHashes = 0;
   rows.testSelected([&](vector_size_t row) INLINE_LAMBDA {
     if constexpr (mayHaveNulls) {
-      if (decoded_.isNullAt(row)) {
+      if (rawNulls && bits::isBitNull(rawNulls, row)) {
         if (multiplier_ == 1) {
           result[row] = 0;
         }
