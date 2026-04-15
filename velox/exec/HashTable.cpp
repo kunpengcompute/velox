@@ -23,8 +23,13 @@
 #include "velox/common/process/ProcessBase.h"
 #include "velox/common/process/TraceContext.h"
 #include "velox/common/testutil/TestValue.h"
+#include "velox/exec/ContainerRowSerde.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/vector/VectorTypeUtils.h"
+
+#define XXH_INLINE_ALL
+#define XXH_STATIC_LINKING_ONLY
+#include "velox/external/xxhash/xxhash.h"
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -447,11 +452,12 @@ FOLLY_ALWAYS_INLINE void HashTable<ignoreNullKeys>::fullProbe(
         !isJoin && extraCheck);
     return;
   }
-  // NOLINT
   lookup.hits[state.row()] = state.fullProbe<op>(
       *this,
       0,
-      [&](char* group, int32_t row) { return compareKeys(group, lookup, row); },
+      [&](char* group, int32_t row) INLINE_LAMBDA {
+        return compareKeys(group, lookup, row);
+      },
       [&](int32_t row, uint64_t index) {
         return isJoin ? nullptr : insertEntry(lookup, index, row);
       },
@@ -491,6 +497,555 @@ void populateNormalizedKeys(HashLookup& lookup, int8_t sizeBits) {
     hashes[row] = mixNormalizedKey(hash, sizeBits);
   }
 }
+// Per-column metadata extracted once to avoid repeated virtual calls.
+struct XXHashColumnInfo {
+  int32_t elementSize;
+  const char* rawData;
+  const DecodedVector* decoded;
+  // 0 = fixed-width, 1 = var-length (VARCHAR/VARBINARY), 2 = complex type
+  uint8_t colType;
+  const uint64_t* nulls;
+  // Pre-resolved index mapping: nullptr = identity (use row directly).
+  const vector_size_t* indices;
+  bool isConstant;
+  vector_size_t constantIndex;
+  // Null-check mode (pre-resolved from DecodedVector flags):
+  //   0 = no nulls
+  //   1 = check nulls[row]       (identity or hasExtraNulls)
+  //   2 = check nulls[indices[row]] (pure dictionary, no extra nulls)
+  //   3 = constant (pre-determined, check constantIsNull)
+  uint8_t nullMode;
+  bool constantIsNull;
+};
+
+constexpr int32_t kXXHashInlineBufSize = 256;
+constexpr int32_t kXXHashTargetChunkBytes = 32 * 1024;
+constexpr uint64_t kNullColumnHash = 0;
+
+// Resolve base-vector index and null flag from pre-resolved column metadata.
+inline void resolveIndexAndNull(
+    const XXHashColumnInfo& col,
+    vector_size_t row,
+    vector_size_t& idx,
+    bool& isNull) {
+  if (col.isConstant) {
+    idx = col.constantIndex;
+    isNull = col.constantIsNull;
+  } else {
+    idx = col.indices ? col.indices[row] : row;
+    if (col.nullMode == 0) {
+      isNull = false;
+    } else if (col.nullMode == 1) {
+      isNull = bits::isBitNull(col.nulls, row);
+    } else {
+      isNull = bits::isBitNull(col.nulls, idx);
+    }
+  }
+}
+
+struct XXHashColumnBuildResult {
+  std::vector<XXHashColumnInfo> cols;
+  bool allFixedIdentity;
+  bool allFixed;
+  int32_t totalFixedBytes;
+};
+
+// Extracts per-column metadata from decoded hashers.
+inline XXHashColumnBuildResult buildXXHashColumnInfos(
+    const std::vector<std::unique_ptr<VectorHasher>>& hashers) {
+  const int32_t numCols = hashers.size();
+  XXHashColumnBuildResult result;
+  result.cols.resize(numCols);
+  result.allFixedIdentity = true;
+  result.allFixed = true;
+  result.totalFixedBytes = 0;
+
+  for (int32_t i = 0; i < numCols; ++i) {
+    auto& decoded = hashers[i]->decodedVector();
+    auto typeKind = decoded.base()->typeKind();
+    bool isVarLen =
+        (typeKind == TypeKind::VARCHAR || typeKind == TypeKind::VARBINARY);
+    bool isComplex = (typeKind == TypeKind::ROW || typeKind == TypeKind::ARRAY ||
+                      typeKind == TypeKind::MAP);
+    auto& ci = result.cols[i];
+    ci.colType = isComplex ? 2 : (isVarLen ? 1 : 0);
+    ci.elementSize =
+        (isVarLen || isComplex) ? 0 : decoded.base()->type()->cppSizeInBytes();
+    ci.rawData = isComplex ? nullptr : decoded.data<char>();
+    ci.decoded = &decoded;
+    ci.nulls =
+        decoded.mayHaveNulls()
+        ? const_cast<DecodedVector&>(decoded).getNulls()
+        : nullptr;
+
+    ci.isConstant = decoded.isConstantMapping();
+    if (ci.isConstant) {
+      ci.indices = nullptr;
+      ci.constantIndex = decoded.index(0);
+    } else if (decoded.isIdentityMapping()) {
+      ci.indices = nullptr;
+      ci.constantIndex = 0;
+    } else {
+      ci.indices = const_cast<DecodedVector&>(decoded).indices();
+      ci.constantIndex = 0;
+    }
+
+    if (!ci.nulls) {
+      ci.nullMode = 0;
+      ci.constantIsNull = false;
+    } else if (ci.isConstant) {
+      ci.nullMode = 3;
+      ci.constantIsNull = bits::isBitNull(ci.nulls, 0);
+    } else if (decoded.isIdentityMapping() || decoded.hasExtraNulls()) {
+      ci.nullMode = 1;
+      ci.constantIsNull = false;
+    } else {
+      ci.nullMode = 2;
+      ci.constantIsNull = false;
+    }
+
+    if (ci.colType != 0) {
+      result.allFixed = false;
+      result.allFixedIdentity = false;
+    } else {
+      result.totalFixedBytes += 1 + ci.elementSize;
+      if (!decoded.isIdentityMapping()) {
+        result.allFixedIdentity = false;
+      }
+    }
+  }
+  return result;
+}
+
+// Column-major fill for one identity-mapped fixed-width column in a chunk.
+inline void fillChunkColumnIdentity(
+    const XXHashColumnInfo& col,
+    const vector_size_t* selected,
+    int32_t chunkStart,
+    int32_t chunkSize,
+    char* chunkBuf,
+    int32_t totalRowSize,
+    int32_t colOffset) {
+  int32_t elemSize = col.elementSize;
+  const char* data = col.rawData;
+  const uint64_t* nulls = col.nulls;
+
+  if (nulls) {
+    for (int32_t i = 0; i < chunkSize; ++i) {
+      auto row = selected[chunkStart + i];
+      char* dst = chunkBuf + i * totalRowSize + colOffset;
+      if (UNLIKELY(bits::isBitNull(nulls, row))) {
+        dst[0] = 0;
+        memset(dst + 1, 0, elemSize);
+      } else {
+        dst[0] = 1;
+        memcpy(
+            dst + 1,
+            data + static_cast<int64_t>(row) * elemSize,
+            elemSize);
+      }
+    }
+  } else {
+    for (int32_t i = 0; i < chunkSize; ++i) {
+      auto row = selected[chunkStart + i];
+      char* dst = chunkBuf + i * totalRowSize + colOffset;
+      dst[0] = 1;
+      memcpy(
+          dst + 1,
+          data + static_cast<int64_t>(row) * elemSize,
+          elemSize);
+    }
+  }
+}
+
+// Column-major fill for one fixed-width column with any mapping in a chunk.
+inline void fillChunkColumnAnyMapping(
+    const XXHashColumnInfo& col,
+    const vector_size_t* selected,
+    int32_t chunkStart,
+    int32_t chunkSize,
+    char* chunkBuf,
+    int32_t totalRowSize,
+    int32_t colOffset) {
+  int32_t elemSize = col.elementSize;
+  const char* data = col.rawData;
+
+  if (col.isConstant) {
+    char cell[17];
+    if (col.constantIsNull) {
+      cell[0] = 0;
+      memset(cell + 1, 0, elemSize);
+    } else {
+      cell[0] = 1;
+      memcpy(
+          cell + 1,
+          data + static_cast<int64_t>(col.constantIndex) * elemSize,
+          elemSize);
+    }
+    int32_t cellSize = 1 + elemSize;
+    for (int32_t i = 0; i < chunkSize; ++i) {
+      memcpy(chunkBuf + i * totalRowSize + colOffset, cell, cellSize);
+    }
+    return;
+  }
+
+  const vector_size_t* indices = col.indices;
+
+  if (col.nullMode == 0) {
+    for (int32_t i = 0; i < chunkSize; ++i) {
+      auto row = selected[chunkStart + i];
+      auto idx = indices ? indices[row] : row;
+      char* dst = chunkBuf + i * totalRowSize + colOffset;
+      dst[0] = 1;
+      memcpy(
+          dst + 1,
+          data + static_cast<int64_t>(idx) * elemSize,
+          elemSize);
+    }
+  } else if (col.nullMode == 1) {
+    const uint64_t* nullBits = col.nulls;
+    for (int32_t i = 0; i < chunkSize; ++i) {
+      auto row = selected[chunkStart + i];
+      auto idx = indices ? indices[row] : row;
+      char* dst = chunkBuf + i * totalRowSize + colOffset;
+      if (UNLIKELY(bits::isBitNull(nullBits, row))) {
+        dst[0] = 0;
+        memset(dst + 1, 0, elemSize);
+      } else {
+        dst[0] = 1;
+        memcpy(
+            dst + 1,
+            data + static_cast<int64_t>(idx) * elemSize,
+            elemSize);
+      }
+    }
+  } else {
+    const uint64_t* nullBits = col.nulls;
+    for (int32_t i = 0; i < chunkSize; ++i) {
+      auto row = selected[chunkStart + i];
+      auto idx = indices[row];
+      char* dst = chunkBuf + i * totalRowSize + colOffset;
+      if (UNLIKELY(bits::isBitNull(nullBits, idx))) {
+        dst[0] = 0;
+        memset(dst + 1, 0, elemSize);
+      } else {
+        dst[0] = 1;
+        memcpy(
+            dst + 1,
+            data + static_cast<int64_t>(idx) * elemSize,
+            elemSize);
+      }
+    }
+  }
+}
+
+// Hash each row in [chunkStart, chunkStart+chunkSize) from chunkBuf.
+inline void hashChunkRows(
+    const vector_size_t* selected,
+    int32_t chunkStart,
+    int32_t chunkSize,
+    const char* chunkBuf,
+    int32_t totalRowSize,
+    uint64_t* hashes) {
+  for (int32_t i = 0; i < chunkSize; ++i) {
+    hashes[selected[chunkStart + i]] =
+        XXH3_64bits(chunkBuf + i * totalRowSize, totalRowSize);
+  }
+}
+
+// All fixed-width columns, identity-mapped. Column-major chunked fill.
+void xxhashAllFixedIdentity(
+    const std::vector<XXHashColumnInfo>& cols,
+    const SelectivityVector& rows,
+    int32_t totalFixedBytes,
+    raw_vector<uint64_t>& hashes) {
+  const int32_t numCols = cols.size();
+  auto colOffsets = std::make_unique<int32_t[]>(numCols);
+  int32_t totalRowSize = 0;
+  for (int32_t c = 0; c < numCols; ++c) {
+    colOffsets[c] = totalRowSize;
+    totalRowSize += 1 + cols[c].elementSize;
+  }
+
+  vector_size_t numSelected = rows.countSelected();
+  raw_vector<vector_size_t> selected(numSelected);
+  vector_size_t idx = 0;
+  rows.applyToSelected([&](auto row) { selected[idx++] = row; });
+
+  int32_t chunkRows = std::max(1, kXXHashTargetChunkBytes / totalRowSize);
+  raw_vector<char> chunkBuf(chunkRows * totalRowSize);
+
+  for (vector_size_t chunkStart = 0; chunkStart < numSelected;
+       chunkStart += chunkRows) {
+    int32_t chunkSize =
+        std::min<int32_t>(chunkRows, numSelected - chunkStart);
+
+    for (int32_t c = 0; c < numCols; ++c) {
+      fillChunkColumnIdentity(
+          cols[c],
+          selected.data(),
+          chunkStart,
+          chunkSize,
+          chunkBuf.data(),
+          totalRowSize,
+          colOffsets[c]);
+    }
+
+    hashChunkRows(
+        selected.data(), chunkStart, chunkSize,
+        chunkBuf.data(), totalRowSize, hashes.data());
+  }
+}
+
+// All fixed-width columns with dictionary/constant mapping. Column-major
+// chunked fill with pre-resolved index/null.
+void xxhashAllFixedAnyMapping(
+    const std::vector<XXHashColumnInfo>& cols,
+    const SelectivityVector& rows,
+    int32_t totalFixedBytes,
+    raw_vector<uint64_t>& hashes) {
+  const int32_t numCols = cols.size();
+  auto colOffsets = std::make_unique<int32_t[]>(numCols);
+  int32_t totalRowSize = 0;
+  for (int32_t c = 0; c < numCols; ++c) {
+    colOffsets[c] = totalRowSize;
+    totalRowSize += 1 + cols[c].elementSize;
+  }
+
+  vector_size_t numSelected = rows.countSelected();
+  raw_vector<vector_size_t> selected(numSelected);
+  vector_size_t si = 0;
+  rows.applyToSelected([&](auto row) { selected[si++] = row; });
+
+  int32_t chunkRows = std::max(1, kXXHashTargetChunkBytes / totalRowSize);
+  raw_vector<char> chunkBuf(chunkRows * totalRowSize);
+
+  for (vector_size_t chunkStart = 0; chunkStart < numSelected;
+       chunkStart += chunkRows) {
+    int32_t chunkSize =
+        std::min<int32_t>(chunkRows, numSelected - chunkStart);
+
+    for (int32_t c = 0; c < numCols; ++c) {
+      fillChunkColumnAnyMapping(
+          cols[c],
+          selected.data(),
+          chunkStart,
+          chunkSize,
+          chunkBuf.data(),
+          totalRowSize,
+          colOffsets[c]);
+    }
+
+    hashChunkRows(
+        selected.data(), chunkStart, chunkSize,
+        chunkBuf.data(), totalRowSize, hashes.data());
+  }
+}
+
+// Compute per-column hash for one column value from a decoded vector.
+inline uint64_t computeColumnHash(
+    const XXHashColumnInfo& col,
+    vector_size_t row) {
+  vector_size_t idx;
+  bool isNull;
+  resolveIndexAndNull(col, row, idx, isNull);
+
+  if (UNLIKELY(isNull)) {
+    return kNullColumnHash;
+  }
+  if (col.colType == 0) {
+    return XXH3_64bits(
+        col.rawData + static_cast<int64_t>(idx) * col.elementSize,
+        col.elementSize);
+  }
+  if (col.colType == 2) {
+    return col.decoded->base()->hashValueAt(idx);
+  }
+  auto sv = reinterpret_cast<const StringView*>(col.rawData)[idx];
+  return XXH3_64bits(sv.data(), sv.size());
+}
+
+// General path for mixed column types.
+// Per-column hash + combine: each column is hashed independently in a
+// column-major pass (one column's data accessed sequentially), then the
+// per-column hashes are combined into a single hash per row.
+// This avoids assembling a contiguous row buffer and eliminates cross-column
+// cache misses — each column iteration touches only that column's data.
+void xxhashMixedColumns(
+    const std::vector<XXHashColumnInfo>& cols,
+    const SelectivityVector& rows,
+    raw_vector<uint64_t>& hashes) {
+  const int32_t numCols = cols.size();
+
+  vector_size_t numSelected = rows.countSelected();
+  raw_vector<vector_size_t> selected(numSelected);
+  vector_size_t si = 0;
+  rows.applyToSelected([&](auto row) { selected[si++] = row; });
+
+  // Chunk size: perColHashes = chunkRows * numCols * 8 bytes, target ~16KB.
+  int32_t chunkRows =
+      std::max(1, (kXXHashTargetChunkBytes / 2) / (numCols * 8));
+  chunkRows = std::min(chunkRows, 1024);
+
+  // perColHashes layout: [row0_col0, row0_col1, ..., row1_col0, ...]
+  raw_vector<uint64_t> perColHashes(chunkRows * numCols);
+
+  for (vector_size_t chunkStart = 0; chunkStart < numSelected;
+       chunkStart += chunkRows) {
+    int32_t chunkSize =
+        std::min<int32_t>(chunkRows, numSelected - chunkStart);
+
+    // Phase 1: column-major — compute per-column hash for all rows.
+    for (int32_t c = 0; c < numCols; ++c) {
+      auto& col = cols[c];
+      for (int32_t i = 0; i < chunkSize; ++i) {
+        auto row = selected[chunkStart + i];
+        perColHashes[i * numCols + c] = computeColumnHash(col, row);
+      }
+    }
+
+    // Phase 2: combine per-column hashes into final hash per row.
+    for (int32_t i = 0; i < chunkSize; ++i) {
+      hashes[selected[chunkStart + i]] = XXH3_64bits(
+          &perColHashes[i * numCols], numCols * sizeof(uint64_t));
+    }
+  }
+}
+
+void computeXXHashFromDecodedVectors(
+    const std::vector<std::unique_ptr<VectorHasher>>& hashers,
+    const SelectivityVector& rows,
+    raw_vector<uint64_t>& hashes) {
+  auto build = buildXXHashColumnInfos(hashers);
+
+  if (build.allFixedIdentity &&
+      build.totalFixedBytes <= kXXHashInlineBufSize) {
+    xxhashAllFixedIdentity(
+        build.cols, rows, build.totalFixedBytes, hashes);
+  } else if (build.allFixed &&
+             build.totalFixedBytes <= kXXHashInlineBufSize) {
+    xxhashAllFixedAnyMapping(
+        build.cols, rows, build.totalFixedBytes, hashes);
+  } else {
+    xxhashMixedColumns(build.cols, rows, hashes);
+  }
+}
+
+// Pre-extracted row-container column metadata for xxhashRowKeysBatch.
+struct XXHashRowColInfo {
+  // 0 = fixed-width, 1 = var-length (VARCHAR/VARBINARY), 2 = complex type
+  uint8_t colType;
+  int32_t elementSize;
+  int32_t offset;
+  int32_t nullByte;
+  uint8_t nullMask;
+  const Type* type;
+};
+
+struct XXHashRowColBuildResult {
+  std::vector<XXHashRowColInfo> infos;
+  bool allFixed;
+  int32_t totalFixedBytes;
+};
+
+inline XXHashRowColBuildResult buildXXHashRowColInfos(
+    const RowContainer* rowContainer,
+    int32_t numKeys) {
+  XXHashRowColBuildResult result;
+  result.infos.resize(numKeys);
+  result.allFixed = true;
+  result.totalFixedBytes = 0;
+  for (int32_t i = 0; i < numKeys; ++i) {
+    auto column = rowContainer->columnAt(i);
+    auto typeKind = rowContainer->columnTypes()[i]->kind();
+    bool isVarLen =
+        (typeKind == TypeKind::VARCHAR || typeKind == TypeKind::VARBINARY);
+    bool isComplex = (typeKind == TypeKind::ROW || typeKind == TypeKind::ARRAY ||
+                      typeKind == TypeKind::MAP);
+    result.infos[i].colType = isComplex ? 2 : (isVarLen ? 1 : 0);
+    result.infos[i].elementSize =
+        (isVarLen || isComplex)
+        ? 0
+        : rowContainer->columnTypes()[i]->cppSizeInBytes();
+    result.infos[i].offset = column.offset();
+    result.infos[i].nullByte = column.nullByte();
+    result.infos[i].nullMask = column.nullMask();
+    result.infos[i].type = rowContainer->columnTypes()[i].get();
+    if (result.infos[i].colType != 0) {
+      result.allFixed = false;
+    } else {
+      result.totalFixedBytes += 1 + result.infos[i].elementSize;
+    }
+  }
+  return result;
+}
+
+// Batch version: processes all rows sharing stack buffer and heap fallback.
+// Buffer layout matches computeXXHashFromDecodedVectors: fixed-width columns
+// first (fixed-length encoding), then var-length/complex columns.
+void xxhashRowKeysBatch(
+    char* const* rows,
+    int64_t numRows,
+    const XXHashRowColBuildResult& build,
+    uint64_t* hashes) {
+  const auto& colInfos = build.infos;
+
+  // Fast path: all columns are fixed-width (no reordering needed).
+  if (build.allFixed && build.totalFixedBytes <= kXXHashInlineBufSize) {
+    int32_t numKeys = colInfos.size();
+    char buf[kXXHashInlineBufSize];
+    for (int64_t i = 0; i < numRows; ++i) {
+      auto* row = rows[i];
+      int32_t pos = 0;
+      for (int32_t c = 0; c < numKeys; ++c) {
+        auto& ci = colInfos[c];
+        if (UNLIKELY((row[ci.nullByte] & ci.nullMask) != 0)) {
+          buf[pos] = 0;
+          memset(buf + pos + 1, 0, ci.elementSize);
+        } else {
+          buf[pos] = 1;
+          memcpy(buf + pos + 1, row + ci.offset, ci.elementSize);
+        }
+        pos += 1 + ci.elementSize;
+      }
+      hashes[i] = XXH3_64bits(buf, pos);
+    }
+    return;
+  }
+
+  // General path: per-column hash + combine (matches probe-side
+  // xxhashMixedColumns). Each column is hashed independently, then the
+  // per-column hashes are combined via XXH3 in original column order.
+  int32_t numKeys = colInfos.size();
+  auto perColHashes = std::make_unique<uint64_t[]>(numKeys);
+  for (int64_t i = 0; i < numRows; ++i) {
+    auto* row = rows[i];
+
+    for (int32_t c = 0; c < numKeys; ++c) {
+      auto& ci = colInfos[c];
+      bool isNull = (row[ci.nullByte] & ci.nullMask) != 0;
+
+      if (UNLIKELY(isNull)) {
+        perColHashes[c] = kNullColumnHash;
+      } else if (ci.colType == 0) {
+        perColHashes[c] = XXH3_64bits(row + ci.offset, ci.elementSize);
+      } else if (ci.colType == 2) {
+        auto* view =
+            reinterpret_cast<const std::string_view*>(row + ci.offset);
+        auto stream = HashStringAllocator::prepareRead(
+            HashStringAllocator::headerOf(view->data()));
+        perColHashes[c] = ContainerRowSerde::hash(*stream, ci.type);
+      } else {
+        std::string storage;
+        auto sv = HashStringAllocator::contiguousString(
+            *reinterpret_cast<const StringView*>(row + ci.offset), storage);
+        perColHashes[c] = XXH3_64bits(sv.data(), sv.size());
+      }
+    }
+    hashes[i] = XXH3_64bits(perColHashes.get(), numKeys * sizeof(uint64_t));
+  }
+}
+
 } // namespace
 
 #define LANE_COUNT 4
@@ -1420,23 +1975,25 @@ bool HashTable<ignoreNullKeys>::hashRows(
     return true;
   }
 
+  if (hashMode_ == HashMode::kHash) {
+    auto numKeys = static_cast<int32_t>(hashers_.size());
+    auto build = buildXXHashRowColInfos(rows_.get(), numKeys);
+    xxhashRowKeysBatch(
+        rows.data(), rows.size(), build, hashes.data());
+    return true;
+  }
+
+  // kArray or kNormalizedKey mode.
   for (int32_t i = 0; i < hashers_.size(); ++i) {
-    auto& hasher = hashers_[i];
-    if (hashMode_ == HashMode::kHash) {
-      rows_->hash(i, rows, i > 0, hashes.data());
-    } else {
-      // Array or normalized key.
-      auto column = rows_->columnAt(i);
-      if (!hasher->computeValueIdsForRows(
-              rows.data(),
-              rows.size(),
-              column.offset(),
-              column.nullByte(),
-              ignoreNullKeys ? 0 : column.nullMask(),
-              hashes)) {
-        // Must reconsider 'hashMode_' and start over.
-        return false;
-      }
+    auto column = rows_->columnAt(i);
+    if (!hashers_[i]->computeValueIdsForRows(
+            rows.data(),
+            rows.size(),
+            column.offset(),
+            column.nullByte(),
+            ignoreNullKeys ? 0 : column.nullMask(),
+            hashes)) {
+      return false;
     }
   }
   if (hashMode_ == HashMode::kNormalizedKey && initNormalizedKeys) {
@@ -1447,7 +2004,6 @@ bool HashTable<ignoreNullKeys>::hashRows(
   }
   return true;
 }
-
 namespace {
 template <typename Source>
 void syncWorkItems(
@@ -2937,7 +3493,22 @@ int32_t HashTable<false>::listNullKeyRows(
     VELOX_CHECK_EQ(hashers_.size(), 1);
     HashLookup lookup(hashers_);
     if (hashMode_ == HashMode::kHash) {
-      lookup.hashes.push_back(VectorHasher::kNullHash);
+      auto typeKind = hashers_[0]->typeKind();
+      bool isVarLen =
+          (typeKind == TypeKind::VARCHAR || typeKind == TypeKind::VARBINARY);
+      bool isComplex = (typeKind == TypeKind::ROW ||
+                        typeKind == TypeKind::ARRAY ||
+                        typeKind == TypeKind::MAP);
+      uint64_t nullHash;
+      if (!isVarLen && !isComplex) {
+        int32_t elemSize = hashers_[0]->type()->cppSizeInBytes();
+        char nullBuf[17] = {0};
+        nullHash = XXH3_64bits(nullBuf, 1 + elemSize);
+      } else {
+        nullHash =
+            XXH3_64bits(&kNullColumnHash, sizeof(kNullColumnHash));
+      }
+      lookup.hashes.push_back(nullHash);
     } else {
       lookup.hashes.push_back(0);
     }
@@ -2984,13 +3555,15 @@ void HashTable<ignoreNullKeys>::erase(folly::Range<char**> rows) {
   raw_vector<uint64_t> hashes;
   hashes.resize(numRows);
 
-  for (int32_t i = 0; i < hashers_.size(); ++i) {
-    auto& hasher = hashers_[i];
-    if (hashMode_ == HashMode::kHash) {
-      rows_->hash(i, rows, i > 0, hashes.data());
-    } else {
+  if (hashMode_ == HashMode::kHash) {
+    auto numKeys = static_cast<int32_t>(hashers_.size());
+    auto build = buildXXHashRowColInfos(rows_.get(), numKeys);
+    xxhashRowKeysBatch(
+        rows.data(), numRows, build, hashes.data());
+  } else {
+    for (int32_t i = 0; i < hashers_.size(); ++i) {
       auto column = rows_->columnAt(i);
-      if (!hasher->computeValueIdsForRows(
+      if (!hashers_[i]->computeValueIdsForRows(
               rows.data(),
               numRows,
               column.offset(),
@@ -3146,22 +3719,19 @@ void HashTable<ignoreNullKeys>::prepareForGroupProbe(
   // }
   // LOG(ERROR) << std::endl;
 
-  for (auto i = 0; i < hashers.size(); ++i) {
-    auto& hasher = hashers[i];
-    if (mode != BaseHashTable::HashMode::kHash) {
-      if (!hasher->computeValueIds(rows, lookup.hashes)) {
+  if (mode == BaseHashTable::HashMode::kHash) {
+    computeXXHashFromDecodedVectors(hashers, rows, lookup.hashes);
+  } else {
+    for (auto i = 0; i < hashers.size(); ++i) {
+      if (!hashers[i]->computeValueIds(rows, lookup.hashes)) {
         rehash = true;
       }
-    } else {
-      hasher->hash(rows, i > 0, lookup.hashes);
     }
   }
 
   if (rehash || capacity() == 0) {
     if (mode != BaseHashTable::HashMode::kHash) {
       decideHashMode(input->size(), spillInputStartPartitionBit);
-      // Do not forward 'ignoreNullKeys' to avoid redundant evaluation of
-      // deselectRowsWithNulls.
       prepareForGroupProbe(lookup, input, rows, spillInputStartPartitionBit);
       return;
     }
@@ -3191,14 +3761,20 @@ void HashTable<ignoreNullKeys>::prepareForJoinProbe(
   lookup.reset(rows.end());
 
   const auto mode = hashMode();
-  for (auto i = 0; i < hashers.size(); ++i) {
-    auto& hasher = hashers[i];
-    if (mode != BaseHashTable::HashMode::kHash) {
-      auto& key = input->childAt(hasher->channel());
+  if (mode == BaseHashTable::HashMode::kHash) {
+    // kHash mode: ensure hashers are decoded, then compute XXH3.
+    if (!decodeAndRemoveNulls) {
+      for (auto& hasher : hashers) {
+        auto key = input->childAt(hasher->channel())->loadedVector();
+        hasher->decode(*key, rows);
+      }
+    }
+    computeXXHashFromDecodedVectors(hashers, rows, lookup.hashes);
+  } else {
+    for (auto i = 0; i < hashers.size(); ++i) {
+      auto& key = input->childAt(hashers[i]->channel());
       hashers_[i]->lookupValueIds(
           *key, rows, lookup.scratchMemory, lookup.hashes);
-    } else {
-      hasher->hash(rows, i > 0, lookup.hashes);
     }
   }
 
