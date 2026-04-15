@@ -521,9 +521,23 @@ class SumAggregateBase
             clearNullSVE(ptr, m20);
             uint8_t flag0[4] = {0, 0, 0, 0};
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag0[0]), "Upl" (mask20) : "memory");
-            for (int i = 0; i < 4; i++) {
-              if (flag0[i] != 0) {
-                *exec::Aggregate::value<int64_t>(*(result + count + i)) += value[count + i];
+            
+            // 根据 mode2 选择正确的取值方式
+            if (mode2 == 3) {
+              // 字典编码模式：通过字典索引获取值
+              for (int i = 0; i < 4; i++) {
+                if (flag0[i] != 0) {
+                  uint32_t dictIndex = dic[count + i];
+                  int64_t dictValue = value[dictIndex];
+                  *exec::Aggregate::value<int64_t>(*(result + count + i)) += dictValue;
+                }
+              }
+            } else {
+              // 简单模式：直接使用 value 数组
+              for (int i = 0; i < 4; i++) {
+                if (flag0[i] != 0) {
+                  *exec::Aggregate::value<int64_t>(*(result + count + i)) += value[count + i];
+                }
               }
             }
           }
@@ -535,9 +549,23 @@ class SumAggregateBase
             clearNullSVE(ptr, m21);
             uint8_t flag1[4] = {0, 0, 0, 0};
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag1[0]), "Upl" (mask21) : "memory");
-            for (int i = 0; i < 4; i++) {
-              if (flag1[i] != 0) {
-                *exec::Aggregate::value<int64_t>(*(result + count + 4 + i)) += value[count + 4 + i];
+            
+            // 根据 mode2 选择正确的取值方式
+            if (mode2 == 3) {
+              // 字典编码模式
+              for (int i = 0; i < 4; i++) {
+                if (flag1[i] != 0) {
+                  uint32_t dictIndex = dic[count + 4 + i];
+                  int64_t dictValue = value[dictIndex];
+                  *exec::Aggregate::value<int64_t>(*(result + count + 4 + i)) += dictValue;
+                }
+              }
+            } else {
+              // 简单模式
+              for (int i = 0; i < 4; i++) {
+                if (flag1[i] != 0) {
+                  *exec::Aggregate::value<int64_t>(*(result + count + 4 + i)) += value[count + 4 + i];
+                }
               }
             }
           }
@@ -553,9 +581,21 @@ class SumAggregateBase
             clearNullSVE(ptr, m22);
             uint8_t flag2[4] = {0, 0, 0, 0};
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag2[0]), "Upl" (mask22) : "memory");
-            for (int i = 0; i < 4; i++) {
-              if (flag2[i] != 0) {
-                *exec::Aggregate::value<int64_t>(*(result + count + 8 + i)) += value[count + 8 + i];
+            
+            // 根据 mode2 选择正确的取值方式
+            if (mode2 == 3) {
+              for (int i = 0; i < 4; i++) {
+                if (flag2[i] != 0) {
+                  uint32_t dictIndex = dic[count + 8 + i];
+                  int64_t dictValue = value[dictIndex];
+                  *exec::Aggregate::value<int64_t>(*(result + count + 8 + i)) += dictValue;
+                }
+              }
+            } else {
+              for (int i = 0; i < 4; i++) {
+                if (flag2[i] != 0) {
+                  *exec::Aggregate::value<int64_t>(*(result + count + 8 + i)) += value[count + 8 + i];
+                }
               }
             }
           }
@@ -567,9 +607,21 @@ class SumAggregateBase
             clearNullSVE(ptr, m23);
             uint8_t flag3[4] = {0, 0, 0, 0};
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag3[0]), "Upl" (mask23) : "memory");
-            for (int i = 0; i < 4; i++) {
-              if (flag3[i] != 0) {
-                *exec::Aggregate::value<int64_t>(*(result + count + 12 + i)) += value[count + 12 + i];
+            
+            // 根据 mode2 选择正确的取值方式
+            if (mode2 == 3) {
+              for (int i = 0; i < 4; i++) {
+                if (flag3[i] != 0) {
+                  uint32_t dictIndex = dic[count + 12 + i];
+                  int64_t dictValue = value[dictIndex];
+                  *exec::Aggregate::value<int64_t>(*(result + count + 12 + i)) += dictValue;
+                }
+              }
+            } else {
+              for (int i = 0; i < 4; i++) {
+                if (flag3[i] != 0) {
+                  *exec::Aggregate::value<int64_t>(*(result + count + 12 + i)) += value[count + 12 + i];
+                }
               }
             }
           }
@@ -589,9 +641,21 @@ class SumAggregateBase
             clearNullSVE(ptr, m24);
             uint8_t flag4[4] = {0, 0, 0, 0};
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag4[0]), "Upl" (mask24) : "memory");
-            for (int i = 0; i < 4; i++) {
-              if (flag4[i] != 0) {
-                *exec::Aggregate::value<int64_t>(*(result + count + 16 + i)) += value[count + 16 + i];
+            
+            // 根据 mode2 选择正确的取值方式
+            if (mode2 == 3) {
+              for (int i = 0; i < 4; i++) {
+                if (flag4[i] != 0) {
+                  uint32_t dictIndex = dic[count + 16 + i];
+                  int64_t dictValue = value[dictIndex];
+                  *exec::Aggregate::value<int64_t>(*(result + count + 16 + i)) += dictValue;
+                }
+              }
+            } else {
+              for (int i = 0; i < 4; i++) {
+                if (flag4[i] != 0) {
+                  *exec::Aggregate::value<int64_t>(*(result + count + 16 + i)) += value[count + 16 + i];
+                }
               }
             }
           }
@@ -603,9 +667,21 @@ class SumAggregateBase
             clearNullSVE(ptr, m25);
             uint8_t flag5[4] = {0, 0, 0, 0};
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag5[0]), "Upl" (mask25) : "memory");
-            for (int i = 0; i < 4; i++) {
-              if (flag5[i] != 0) {
-                *exec::Aggregate::value<int64_t>(*(result + count + 20 + i)) += value[count + 20 + i];
+            
+            // 根据 mode2 选择正确的取值方式
+            if (mode2 == 3) {
+              for (int i = 0; i < 4; i++) {
+                if (flag5[i] != 0) {
+                  uint32_t dictIndex = dic[count + 20 + i];
+                  int64_t dictValue = value[dictIndex];
+                  *exec::Aggregate::value<int64_t>(*(result + count + 20 + i)) += dictValue;
+                }
+              }
+            } else {
+              for (int i = 0; i < 4; i++) {
+                if (flag5[i] != 0) {
+                  *exec::Aggregate::value<int64_t>(*(result + count + 20 + i)) += value[count + 20 + i];
+                }
               }
             }
           }
@@ -622,9 +698,21 @@ class SumAggregateBase
             clearNullSVE(ptr, m26);
             uint8_t flag6[4] = {0, 0, 0, 0};
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag6[0]), "Upl" (mask26) : "memory");
-            for (int i = 0; i < 4; i++) {
-              if (flag6[i] != 0) {
-                *exec::Aggregate::value<int64_t>(*(result + count + 24 + i)) += value[count + 24 + i];
+            
+            // 根据 mode2 选择正确的取值方式
+            if (mode2 == 3) {
+              for (int i = 0; i < 4; i++) {
+                if (flag6[i] != 0) {
+                  uint32_t dictIndex = dic[count + 24 + i];
+                  int64_t dictValue = value[dictIndex];
+                  *exec::Aggregate::value<int64_t>(*(result + count + 24 + i)) += dictValue;
+                }
+              }
+            } else {
+              for (int i = 0; i < 4; i++) {
+                if (flag6[i] != 0) {
+                  *exec::Aggregate::value<int64_t>(*(result + count + 24 + i)) += value[count + 24 + i];
+                }
               }
             }
           }
@@ -636,9 +724,21 @@ class SumAggregateBase
             clearNullSVE(ptr, m27);
             uint8_t flag7[4] = {0, 0, 0, 0};
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag7[0]), "Upl" (mask27) : "memory");
-            for (int i = 0; i < 4; i++) {
-              if (flag7[i] != 0) {
-                *exec::Aggregate::value<int64_t>(*(result + count + 28 + i)) += value[count + 28 + i];
+            
+            // 根据 mode2 选择正确的取值方式
+            if (mode2 == 3) {
+              for (int i = 0; i < 4; i++) {
+                if (flag7[i] != 0) {
+                  uint32_t dictIndex = dic[count + 28 + i];
+                  int64_t dictValue = value[dictIndex];
+                  *exec::Aggregate::value<int64_t>(*(result + count + 28 + i)) += dictValue;
+                }
+              }
+            } else {
+              for (int i = 0; i < 4; i++) {
+                if (flag7[i] != 0) {
+                  *exec::Aggregate::value<int64_t>(*(result + count + 28 + i)) += value[count + 28 + i];
+                }
               }
             }
           }
