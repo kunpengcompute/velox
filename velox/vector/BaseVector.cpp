@@ -29,6 +29,10 @@
 #include "velox/vector/VectorPool.h"
 #include "velox/vector/VectorTypeUtils.h"
 
+#ifdef __ARM_FEATURE_SVE
+#include <arm_sve.h>
+#endif
+
 namespace facebook::velox {
 
 BaseVector::BaseVector(
@@ -1003,7 +1007,41 @@ void BaseVector::transposeIndices(
     vector_size_t wrapSize,
     const vector_size_t* wrapIndices,
     vector_size_t* resultIndices) {
-#if XSIMD_WITH_AVX2
+#if defined(__ARM_FEATURE_SVE)
+  // Use SVE svld1_gather for efficient indexed access
+  static_assert(sizeof(vector_size_t) == sizeof(int32_t), "SVE implementation assumes vector_size_t is 32-bit");
+  int32_t i = 0;
+  
+  // Main loop: process full vectors
+  int32_t svSize = svcntw();
+  for (; i + svSize <= wrapSize; i += svSize) {
+    // No need for svwhilelt here - full vector
+    svbool_t pg = svptrue_b32();
+    
+    // Load wrap indices
+    svint32_t indices = svld1_s32(pg, wrapIndices + i);
+    
+    // Gather from baseIndices using wrapIndices
+    svint32_t gathered = svld1_gather_s32index_s32(pg, baseIndices, indices);
+    
+    // Store results
+    svst1_s32(pg, resultIndices + i, gathered);
+  }
+  
+  // Tail handling: process remaining elements
+  if (i < wrapSize) {
+    svbool_t pg = svwhilelt_b32(i, wrapSize);
+    
+    // Load wrap indices
+    svint32_t indices = svld1_s32(pg, wrapIndices + i);
+    
+    // Gather from baseIndices using wrapIndices
+    svint32_t gathered = svld1_gather_s32index_s32(pg, baseIndices, indices);
+    
+    // Store results
+    svst1_s32(pg, resultIndices + i, gathered);
+  }
+#elif XSIMD_WITH_AVX2
 
   constexpr int32_t kBatch = xsimd::batch<int32_t>::size;
   static_assert(kBatch == 8);
@@ -1021,7 +1059,9 @@ void BaseVector::transposeIndices(
         .store_unaligned(resultIndices + i);
   }
 #else
-  VELOX_NYI();
+  for (auto i = 0; i < wrapSize; ++i) {
+    resultIndices[i] = baseIndices[wrapIndices[i]];
+  }
 #endif
 }
 
@@ -1034,7 +1074,64 @@ void BaseVector::transposeIndicesWithNulls(
     const uint64_t* wrapNulls,
     vector_size_t* resultIndices,
     uint64_t* resultNulls) {
-#if XSIMD_WITH_AVX2
+#if defined(__ARM_FEATURE_SVE)
+  // Use SVE for efficient indexed access with predication
+  static_assert(sizeof(vector_size_t) == sizeof(int32_t), "SVE implementation assumes vector_size_t is 32-bit");
+  int32_t i = 0;
+  
+  // Main loop: process full vectors
+  int32_t svSize = svcntw();
+  for (; i + svSize <= wrapSize; i += svSize) {
+    // No need for svwhilelt here - full vector
+    svbool_t pg = svptrue_b32();
+    
+    // Load wrap indices
+    svint32_t indices = svld1_s32(pg, wrapIndices + i);
+    
+    // Gather from baseIndices
+    svint32_t gathered = svld1_gather_s32index_s32(pg, baseIndices, indices);
+    
+    // Store results
+    svst1_s32(pg, resultIndices + i, gathered);
+  }
+  
+  // Tail handling: process remaining elements
+  if (i < wrapSize) {
+    svbool_t pg = svwhilelt_b32(i, wrapSize);
+    
+    // Load wrap indices
+    svint32_t indices = svld1_s32(pg, wrapIndices + i);
+    
+    // Gather from baseIndices
+    svint32_t gathered = svld1_gather_s32index_s32(pg, baseIndices, indices);
+    
+    // Store results
+    svst1_s32(pg, resultIndices + i, gathered);
+  }
+  
+  // Handle nulls separately (simplified for initial SVE support)
+  if (wrapNulls || baseNulls) {
+    for (auto i = 0; i < wrapSize; ++i) {
+      bool isNull = false;
+      if (wrapNulls && bits::isBitNull(wrapNulls, i)) {
+        isNull = true;
+      }
+      if (!isNull) {
+        vector_size_t index = wrapIndices[i];
+        if (baseNulls && bits::isBitNull(baseNulls, index)) {
+          isNull = true;
+        }
+        // Fix: write baseIndices[index] instead of index
+        resultIndices[i] = baseIndices[index];
+      } else {
+        resultIndices[i] = 0;
+      }
+      if (resultNulls) {
+        bits::setNull(resultNulls, i, isNull);
+      }
+    }
+  }
+#elif XSIMD_WITH_AVX2
 
   constexpr int32_t kBatch = xsimd::batch<int32_t>::size;
   static_assert(kBatch == 8);
@@ -1061,7 +1158,24 @@ void BaseVector::transposeIndicesWithNulls(
         .store_unaligned(resultIndices + i);
   }
 #else
-  VELOX_NYI();
+  for (auto i = 0; i < wrapSize; ++i) {
+    bool isNull = false;
+    if (wrapNulls && bits::isBitNull(wrapNulls, i)) {
+      isNull = true;
+    }
+    if (!isNull) {
+      vector_size_t index = wrapIndices[i];
+      if (baseNulls && bits::isBitNull(baseNulls, index)) {
+        isNull = true;
+      }
+      resultIndices[i] = baseIndices[index];
+    } else {
+      resultIndices[i] = 0;
+    }
+    if (resultNulls) {
+      bits::setNull(resultNulls, i, isNull);
+    }
+  }
 #endif
 }
 
