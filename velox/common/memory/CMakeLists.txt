@@ -14,6 +14,7 @@
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
+add_subdirectory(subOp)
 
 velox_add_library(
   velox_memory
