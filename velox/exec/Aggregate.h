@@ -434,8 +434,8 @@ class Aggregate {
   const TypePtr resultType_;
 
   // Byte position of null flag in group row.
-  int32_t nullByte_;
-  uint8_t nullMask_;
+  // int32_t nullByte_;
+  // uint8_t nullMask_;
   // Byte position of the initialized flag in group row.
   int32_t initializedByte_;
   uint8_t initializedMask_;
@@ -453,7 +453,7 @@ class Aggregate {
   // Number of null accumulators in the current state of the aggregation
   // operator for this aggregate. If 0, clearing the null as part of update
   // is not needed.
-  uint64_t numNulls_ = 0;
+  // uint64_t numNulls_ = 0;
   HashStringAllocator* allocator_{nullptr};
   std::shared_ptr<core::ExpressionEvaluator> expressionEvaluator_{nullptr};
   std::vector<core::LambdaTypedExprPtr> lambdaExpressions_;
@@ -464,6 +464,13 @@ class Aggregate {
   std::vector<vector_size_t> pushdownCustomIndices_;
 
   bool validateIntermediateInputs_ = false;
+public:
+  int32_t nullByte_;
+  uint64_t numNulls_ = 0;
+  uint8_t nullMask_;
+  int32_t getOffsetFromAgg() {
+    return offset_;
+  }
 };
 
 using AggregateFunctionFactory = std::function<std::unique_ptr<Aggregate>(

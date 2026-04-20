@@ -254,7 +254,11 @@ void GroupingSet::addInputForActiveRows(
     // have null keys.
     return;
   }
-
+  // this->num111++;
+  // if (this->num111 == 97) {
+  //   LOG(ERROR) << "Thread ID is " << std::this_thread::get_id();
+  // }
+  // LOG(ERROR) << "num is " << this->num111;
   table_->groupProbe(*lookup_, BaseHashTable::kNoSpillInputStartPartitionBit);
   masks_.addInput(input, activeRows_);
 

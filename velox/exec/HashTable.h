@@ -121,6 +121,8 @@ class BaseHashTable {
   /// Specifies the hash mode of a table.
   enum class HashMode { kHash, kArray, kNormalizedKey };
 
+  enum class NormalizedKeyMode {nativeVelox, scalar, sve}; // TODO scalar2
+
   static constexpr int8_t kNoSpillInputStartPartitionBit = -1;
 
   /// The name of the runtime stats collected and reported by operators that use
@@ -807,6 +809,9 @@ class HashTable : public BaseHashTable {
       int32_t numGroups,
       raw_vector<uint64_t>& hashes,
       bool initNormalizedKeys);
+  uint64_t* getKeyPtr();
+  char** getValuePtr();
+  uint8_t* getTagPtr();
 
   // Inserts 'numGroups' entries into 'this'. 'groups' point to contents in a
   // RowContainer owned by 'this'. 'hashes' are the hash numbers or array
@@ -877,16 +882,41 @@ class HashTable : public BaseHashTable {
       raw_vector<uint64_t>& hashes);
 
   char* insertEntry(HashLookup& lookup, uint64_t index, vector_size_t row);
+  char*
+  insertEntryforSVE(HashLookup& lookup, uint64_t index, vector_size_t row);
 
   bool compareKeys(const char* group, HashLookup& lookup, vector_size_t row);
 
   bool compareKeys(const char* group, const char* inserted);
+
+  // Pre-extracted per-column comparison metadata for optimized compareKeys.
+  using ColEqualsFn = bool (*)(
+      const char* row,
+      int32_t offset,
+      const DecodedVector& decoded,
+      vector_size_t index);
+
+  struct CompareColumnInfo {
+    int32_t offset;
+    int32_t nullByte;
+    uint8_t nullMask;
+    const DecodedVector* decoded;
+    ColEqualsFn equalsFn;
+  };
+
+  void buildCompareInfos(const std::vector<std::unique_ptr<VectorHasher>>& hashers);
+
+  bool fastCompareKeys(const char* group, vector_size_t row);
 
   template <bool isJoin, bool isNormalizedKey = false>
   void fullProbe(HashLookup& lookup, ProbeState& state, bool extraCheck);
 
   // Shortcut path for group by with normalized keys.
   void groupNormalizedKeyProbe(HashLookup& lookup);
+
+  void groupNormalizedKeyProbeScalar(HashLookup& lookup); // TODO scalar2
+
+  void groupNormalizedKeyProbeSVE(HashLookup& lookup); // TODO scalar2
 
   // Array probe with SIMD.
   void arrayJoinProbe(HashLookup& lookup);
@@ -1053,6 +1083,10 @@ class HashTable : public BaseHashTable {
   // Counts the number of rehash() calls.
   int64_t numRehashes_{0};
   HashMode hashMode_ = HashMode::kArray;
+  NormalizedKeyMode normalizedKeyMode_ = NormalizedKeyMode::sve ; // TODO scalar2，NormalizedKeyMode::sve\NormalizedKeyMode::scalar
+  // Pre-built per-column comparison info for kHash mode fastCompareKeys.
+  // Rebuilt per probe batch in prepareForGroupProbe / prepareForJoinProbe.
+  std::vector<CompareColumnInfo> compareInfos_;
   // Owns the memory of multiple build side hash join tables that are
   // combined into a single probe hash table.
   std::vector<std::unique_ptr<HashTable<ignoreNullKeys>>> otherTables_;

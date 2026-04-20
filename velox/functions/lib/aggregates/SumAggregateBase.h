@@ -21,6 +21,7 @@
 #include "velox/functions/lib/CheckedArithmeticImpl.h"
 #include "velox/functions/lib/aggregates/DecimalAggregate.h"
 #include "velox/functions/lib/aggregates/SimpleNumericAggregate.h"
+#include <arm_sve.h>
 
 namespace facebook::velox::functions::aggregate {
 
@@ -111,6 +112,974 @@ class SumAggregateBase
   }
 
  protected:
+  template <typename T>
+  static constexpr bool kMayPushdown = !std::is_same_v<T, int128_t> &&
+      !std::is_same_v<T, Timestamp> && !std::is_same_v<T, UnknownValue>;
+
+#define UNLIKELY(x) (__builtin_expect((x), 0))
+
+  template <typename T>
+  inline bool isBitSet(const T* bits, uint64_t idx) {
+    return bits[idx / (sizeof(bits[0]) * 8)] &
+        (static_cast<T>(1) << (idx & ((sizeof(bits[0]) * 8) - 1)));
+  }
+
+  inline bool isBitNull(const uint64_t* bits, int32_t index) {
+    return isBitSet(bits, index) == false;
+  }
+  template <typename T, typename U>
+  constexpr inline T roundUp(T value, U factor) {
+    return (value + (factor - 1)) / factor * factor;
+  }
+
+  svbool_t getBitMask(
+      uint8_t* nulls_,
+      int32_t index,
+      int mode,
+      uint32_t* dic,
+      int32_t length) {
+    svbool_t pg;
+    if (mode == 0) {
+      pg = svptrue_b8();
+      return pg;
+    } else if (mode == 1) {
+      __asm__ __volatile__("ldr %0, [%1]"
+                           : "=Upl"(pg)
+                           : "r"(&(nulls_[index]))
+                           : "memory");
+      return pg;
+    } else if (mode == 2) {
+      if (!isBitNull(
+              reinterpret_cast<uint64_t*>(nulls_),
+              0))
+      {
+        pg = svptrue_b8();
+      } else {
+        pg = svpfalse();
+      }
+      return pg;
+    } else if (mode == 3) {
+
+      svuint32_t onc = svdup_u32(1);
+      svuint32_t inv = svindex_u32(0, 1);
+      svuint32_t pow = svlsl_m(svptrue_b32(), onc, inv);
+      uint8_t tmpNulls[4] = {0};
+      uint32_t* null32ptr = reinterpret_cast<uint32_t*>(nulls_);
+
+      svuint32_t posv, idxbufv, bufv, offsetv;
+      svbool_t nullvec, pg1;
+
+      // 处理第一个8元素块
+      pg1 = svwhilelt_b32(index*8, length);
+      // 使用安全的方式加载字典值，确保不会越界
+      posv = svld1(pg1, dic + index * 8);
+      idxbufv = svlsr_x(pg1, posv, 5); // div 32 得到uint32 对应下标
+      bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
+      offsetv = svand_m(pg1, posv, 0b11111); // uint32内偏移，mod 32
+      bufv = svlsr_m(pg1, bufv, offsetv); // 右移，取第offsettv位
+      bufv = svand_m(pg1, bufv, 0x1); // 将其他位置0
+      nullvec = svcmpgt(pg1, bufv, 0);
+      if (__builtin_expect((svptest_any(pg1, nullvec)), 0)) {
+        uint8_t nullsres = svaddv(nullvec, pow);
+        tmpNulls[0] = nullsres;
+      } else {
+        tmpNulls[0] = 0;
+      }
+
+      // 处理第二个8元素块
+      pg1 = svwhilelt_b32(index*8 + 8, length);
+      posv = svld1(pg1, dic + index*8 + 8);
+      idxbufv = svlsr_x(pg1, posv, 5); // div 32 得到uint32 对应下标
+      bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
+      offsetv = svand_m(pg1, posv, 0b11111); // uint32内偏移，mod 32
+      bufv = svlsr_m(pg1, bufv, offsetv); // 右移，取第offsettv位
+      bufv = svand_m(pg1, bufv, 0x1); // 将其他位置0
+      nullvec = svcmpgt(pg1, bufv, 0);
+      if (__builtin_expect((svptest_any(pg1, nullvec)), 0)) {
+        uint8_t nullsres = svaddv(nullvec, pow);
+        tmpNulls[1] = nullsres;
+      } else {
+        tmpNulls[1] = 0;
+      }
+
+      // 处理第三个8元素块
+      pg1 = svwhilelt_b32(index*8 + 16, length);
+      posv = svld1(pg1, dic + index*8 + 16);
+      idxbufv = svlsr_x(pg1, posv, 5); // div 32 得到uint32 对应下标
+      bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
+      offsetv = svand_m(pg1, posv, 0b11111); // uint32内偏移，mod 32
+      bufv = svlsr_m(pg1, bufv, offsetv); // 右移，取第offsettv位
+      bufv = svand_m(pg1, bufv, 0x1); // 将其他位置0
+      nullvec = svcmpgt(pg1, bufv, 0);
+      if (__builtin_expect((svptest_any(pg1, nullvec)), 0)) {
+        uint8_t nullsres = svaddv(nullvec, pow);
+        tmpNulls[2] = nullsres;
+      } else {
+        tmpNulls[2] = 0;
+      }
+
+      // 处理第四个8元素块
+      pg1 = svwhilelt_b32(index*8 + 24, length);
+      posv = svld1(pg1, dic + index*8 + 24);
+      idxbufv = svlsr_x(pg1, posv, 5); // div 32 得到uint32 对应下标
+      bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
+      offsetv = svand_m(pg1, posv, 0b11111); // uint32内偏移，mod 32
+      bufv = svlsr_m(pg1, bufv, offsetv); // 右移，取第offsettv位
+      bufv = svand_m(pg1, bufv, 0x1); // 将其他位置0
+      nullvec = svcmpgt(pg1, bufv, 0);
+      if (__builtin_expect((svptest_any(pg1, nullvec)), 0)) {
+        uint8_t nullsres = svaddv(nullvec, pow);
+        tmpNulls[3] = nullsres;
+      } else {
+        tmpNulls[3] = 0;
+      }
+
+      __asm__ __volatile__("ldr %0, [%1]"
+                           : "=Upl"(pg)
+                           : "r"(tmpNulls)
+                           : "memory");
+      return pg;
+    }
+    // 默认返回全false掩码
+    pg = svpfalse();
+    return pg;
+  }
+
+  svint64_t getValueSVE(
+      int64_t* value,
+
+      int32_t mode,
+      svbool_t pg,
+      uint32_t index,
+      uint32_t* dic) {
+        svint64_t result;
+    if (mode == 0 || mode == 1) {
+      result = svld1_s64(pg, value + index);
+      // return;
+    } else if (mode == 2) {
+      result = svdup_n_s64(value[0]);
+      // return;
+    } else if (mode == 3) {
+      // pg进来是对应int64(value)的如果要取对应dic，要调整p寄存器，原来可能是
+      // 0001 0001 0001 0001，调整后0000 0000 0101 0101
+      svbool_t pg64to32 = svuzp1_b8(pg, svpfalse());
+      svuint32_t offset = svld1(pg64to32, dic + index);
+      svuint64_t offsetLow = svunpklo(offset);
+      result = svld1_gather_index(pg, value, offsetLow);
+      // return;
+    }
+    return result;
+  }
+
+  bool clearNullSVE(svuint64_t ptr, svbool_t pg) //
+  {
+    if (this->numNulls_) {
+      svint64_t group = svld1sb_gather_u64base_offset_s64(
+          pg, ptr, this->nullByte_); // 这里要变
+      svuint8_t group8 = svreinterpret_u8(group);
+
+      svuint8_t tmp = svand_n_u8_z(pg, group8, this->nullMask_);
+      svbool_t test = svcmpne_n_u8(svptrue_b8(), tmp, 0);
+      if (svptest_any(svptrue_b8(), test)) {
+        uint8_t negNull = ~this->nullMask_;
+
+        svuint8_t adjust = svand_n_u8_m(test, group8, negNull);
+        svst1b_scatter_u64base_offset_s64(
+            pg, ptr, this->nullByte_, svreinterpret_s64(adjust));
+
+        int num = svcntp_b8(test, test);
+        this->numNulls_ -= num;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  svint64_t loadGatherResult(svuint64_t ptr, svbool_t mask, int64_t idx) {
+    svint64_t value =
+        svld1_gather_u64base_offset_s64(mask, ptr, idx); // 这里要变
+    return value;
+  }
+
+  void storeScatterResult(svuint64_t ptr, svbool_t mask, svint64_t value, int64_t idx) {
+    svst1_scatter_u64base_offset_s64(mask, ptr, idx, value);
+  }
+
+  void hashAggUpdateSVEWithChar(
+      char** result,
+      uint64_t* bitmap1,
+      uint64_t* bitmap2,
+      int64_t* value,
+      int32_t begin,
+      int32_t end,
+      int mode1,
+      int mode2,
+      uint32_t* dic) {
+    uint8_t* bitmap1_8 = reinterpret_cast<uint8_t*>(bitmap1);
+    uint8_t* bitmap2_8 = reinterpret_cast<uint8_t*>(bitmap2);
+
+    int32_t firstWord =
+        roundUp(begin, 32) == begin ? begin : roundUp(begin, 32) - 32;
+    int32_t lastWord = roundUp(end, 32);
+    svbool_t mask, mask1, mask2;
+    svint64_t tmpValue;
+        // 注意这里的count是统计第几个元素，svbool_t去load，bitmap，一次性可以处理32个元素
+            for (int32_t count = firstWord; count + 32 <= lastWord; count += 32) {
+      int32_t arr8Index = count / 8;
+      if (bitmap2_8 != nullptr) {
+        mask2 = getBitMask(bitmap2_8, arr8Index, mode1, dic, end); // 一次取32个
+      }
+      __asm__ __volatile__("ldr %0, [%1]"
+                                 : "=Upl"(mask1)
+                                                            : "r"(&bitmap1_8[arr8Index])
+                           : "memory");
+      mask = svand_b_z(svptrue_b8(), mask1, mask2);
+      mask = svand_b_z(svptrue_b8(), mask, svwhilelt_b8(count, end));
+      if (!svptest_any(svptrue_b8(), mask)) {
+        continue;
+      }
+
+      svbool_t mask00 = svunpklo(mask);
+      svbool_t mask01 = svunpkhi(mask);
+      if (svptest_any(svptrue_b16(), mask00)) {
+        svbool_t mask10 = svunpklo(mask00);
+        if (svptest_any(svptrue_b32(), mask10)) {
+          svbool_t mask20 = svunpklo(mask10);
+          svbool_t mask21 = svunpkhi(mask10);
+          if (svptest_any(svptrue_b64(), mask20)) {
+            svint64_t tmpValue0;
+            tmpValue0 = getValueSVE(value, mode2, mask20, count, dic);
+            svuint64_t ptr =
+                svld1(mask20, reinterpret_cast<uint64_t*>(result + count));
+            clearNullSVE(ptr, mask20);
+            svint64_t tmpResult0 = loadGatherResult(ptr, mask20, this->getOffsetFromAgg());
+            tmpResult0 = svadd_m(mask20, tmpResult0, tmpValue0);
+            storeScatterResult(ptr, mask20, tmpResult0, this->getOffsetFromAgg());
+          }
+
+          if (svptest_any(svptrue_b64(), mask21)) {
+            svint64_t tmpValue1;
+            tmpValue1 = getValueSVE(value, mode2, mask21, 4 + count, dic);
+            svuint64_t ptr =
+                svld1(mask21, reinterpret_cast<uint64_t*>(result + count + 4));
+            clearNullSVE(ptr, mask21);
+            svint64_t tmpResult1 = loadGatherResult(ptr, mask21, this->getOffsetFromAgg());
+            tmpResult1 = svadd_m(mask21, tmpResult1, tmpValue1);
+            storeScatterResult(ptr, mask21, tmpResult1, this->getOffsetFromAgg());
+          }
+        }
+        svbool_t mask11 = svunpkhi(mask00);
+        if (svptest_any(svptrue_b32(), mask11)) {
+          svbool_t mask22 = svunpklo(mask11);
+          svbool_t mask23 = svunpkhi(mask11);
+          if (svptest_any(svptrue_b64(), mask22)) {
+            svint64_t tmpValue2;
+            tmpValue2 = getValueSVE(value, mode2, mask22, 8 + count, dic);
+            svuint64_t ptr =
+                svld1(mask22, reinterpret_cast<uint64_t*>(result + count + 8));
+            clearNullSVE(ptr, mask22);
+            svint64_t tmpResult2 = loadGatherResult(ptr, mask22, this->getOffsetFromAgg());
+            tmpResult2 = svadd_m(mask22, tmpResult2, tmpValue2);
+            storeScatterResult(ptr, mask22, tmpResult2, this->getOffsetFromAgg());
+          }
+
+          if (svptest_any(svptrue_b64(), mask23)) {
+            svint64_t tmpValue3;
+            tmpValue3 = getValueSVE(value, mode2, mask23, 12 + count, dic);
+            svuint64_t ptr =
+                svld1(mask23, reinterpret_cast<uint64_t*>(result + count + 12));
+            clearNullSVE(ptr, mask23);
+            svint64_t tmpResult3 = loadGatherResult(ptr, mask23, this->getOffsetFromAgg());
+            tmpResult3 = svadd_m(mask23, tmpResult3, tmpValue3);
+            storeScatterResult(ptr, mask23, tmpResult3, this->getOffsetFromAgg());
+          }
+        }
+      }
+
+      svbool_t mask12 = svunpklo(mask01);
+
+      if (svptest_any(svptrue_b16(), mask01)) {
+        svbool_t mask24 = svunpklo(mask12);
+        svbool_t mask25 = svunpkhi(mask12);
+        if (svptest_any(svptrue_b32(), mask12)) {
+          if (svptest_any(svptrue_b64(), mask24)) {
+            svint64_t tmpValue4;
+            tmpValue4 = getValueSVE(value, mode2, mask24, 16 + count, dic);
+            svuint64_t ptr =
+                svld1(mask24, reinterpret_cast<uint64_t*>(result + count + 16));
+            clearNullSVE(ptr, mask24);
+            svint64_t tmpResult4 = loadGatherResult(ptr, mask24, this->getOffsetFromAgg());
+            tmpResult4 = svadd_m(mask24, tmpResult4, tmpValue4);
+            storeScatterResult(ptr, mask24, tmpResult4, this->getOffsetFromAgg());
+          }
+
+          if (svptest_any(svptrue_b64(), mask25)) {
+            svint64_t tmpValue5;
+            tmpValue5 = getValueSVE(value, mode2, mask25, 20 + count, dic);
+            svuint64_t ptr =
+                svld1(mask25, reinterpret_cast<uint64_t*>(result + count + 20));
+            clearNullSVE(ptr, mask25);
+            svint64_t tmpResult5 = loadGatherResult(ptr, mask25, this->getOffsetFromAgg());
+            tmpResult5 = svadd_m(mask25, tmpResult5, tmpValue5);
+            storeScatterResult(ptr, mask25, tmpResult5, this->getOffsetFromAgg());
+          }
+        }
+        svbool_t mask13 = svunpkhi(mask01);
+
+        if (svptest_any(svptrue_b32(), mask13)) {
+          svbool_t mask26 = svunpklo(mask13);
+          svbool_t mask27 = svunpkhi(mask13);
+          if (svptest_any(svptrue_b64(), mask26)) {
+            svint64_t tmpValue6;
+            tmpValue6 = getValueSVE(value,  mode2, mask26, 24 + count, dic);
+            svuint64_t ptr =
+                svld1(mask26, reinterpret_cast<uint64_t*>(result + count + 24));
+            clearNullSVE(ptr, mask26);
+            svint64_t tmpResult6 = loadGatherResult(ptr, mask26, this->getOffsetFromAgg());
+            tmpResult6 = svadd_m(mask26, tmpResult6, tmpValue6);
+            storeScatterResult(ptr, mask26, tmpResult6, this->getOffsetFromAgg());
+          }
+
+          if (svptest_any(svptrue_b64(), mask27)) {
+            svint64_t tmpValue7;
+            tmpValue7 = getValueSVE(value, mode2, mask27, 28 + count, dic);
+            svuint64_t ptr =
+                svld1(mask27, reinterpret_cast<uint64_t*>(result + count + 28));
+            clearNullSVE(ptr, mask27);
+            svint64_t tmpResult7 = loadGatherResult(ptr, mask27, this->getOffsetFromAgg());
+            tmpResult7 = svadd_m(mask27, tmpResult7, tmpValue7);
+            storeScatterResult(ptr, mask27, tmpResult7, this->getOffsetFromAgg());
+          }
+        }
+      }
+    }
+  }
+
+  inline __attribute__((always_inline)) svbool_t
+  getUinqMask(svbool_t pg, const svuint64_t val) {
+    svuint64_t s1 = svext_u64(val, val, 1);
+    svbool_t mask2 = svcmpeq(svwhilelt_b64(0, 3), val, s1);
+
+    svuint64_t s2 = svext_u64(val, val, 2);
+    svbool_t mask3 = svcmpeq(svwhilelt_b64(0, 2), val, s2);
+    svbool_t mask12 = svorr_b_z(pg, mask2, mask3);
+
+    svuint64_t s3 = svext_u64(val, val, 3);
+    svbool_t mask4 = svcmpeq(svwhilelt_b64(0, 1), val, s3);
+
+    svbool_t mask = svorr_b_z(pg, mask4, mask12);
+    mask = svnot_b_z(pg, mask);
+
+    return mask;
+  }
+
+    void hashAggUpdateSVEWithCharForNormal(
+      char** result,
+      uint64_t* bitmap1,
+      uint64_t* bitmap2,
+      int64_t* value,
+      int32_t begin,
+      int32_t end,
+      int mode1,
+      int mode2,
+      uint32_t* dic) {
+    uint8_t* bitmap1_8 = reinterpret_cast<uint8_t*>(bitmap1);
+    uint8_t* bitmap2_8 = reinterpret_cast<uint8_t*>(bitmap2);
+
+    int32_t firstWord =
+        roundUp(begin, 32) == begin ? begin : roundUp(begin, 32) - 32;
+    int32_t lastWord = roundUp(end, 32);
+    svbool_t mask, mask1, mask2;
+    svint64_t tmpValue;
+        // 注意这里的count是统计第几个元素，svbool_t去load，bitmap，一次性可以处理32个元素
+            for (int32_t count = firstWord; count + 32 <= lastWord; count += 32) {
+      int32_t arr8Index = count / 8;
+      if (bitmap2_8 != nullptr) {
+        mask2 = getBitMask(bitmap2_8, arr8Index, mode1, dic, end); // 一次取32个
+      }
+      __asm__ __volatile__("ldr %0, [%1]"
+                                 : "=Upl"(mask1)
+                                                            : "r"(&bitmap1_8[arr8Index])
+                           : "memory");
+      mask = svand_b_z(svptrue_b8(), mask1, mask2);
+      mask = svand_b_z(svptrue_b8(), mask, svwhilelt_b8(count, end));
+      if (!svptest_any(svptrue_b8(), mask)) {
+        continue;
+      }
+
+      svbool_t mask00 = svunpklo(mask);
+      svbool_t mask01 = svunpkhi(mask);
+      if (svptest_any(svptrue_b16(), mask00)) {
+        svbool_t mask10 = svunpklo(mask00);
+        if (svptest_any(svptrue_b32(), mask10)) {
+          svbool_t mask20 = svunpklo(mask10);
+          svbool_t mask21 = svunpkhi(mask10);
+          if (svptest_any(svptrue_b64(), mask20)) {
+            svuint64_t ptr =
+                svld1(mask20, reinterpret_cast<uint64_t*>(result + count));
+            svbool_t m20 = getUinqMask(mask20, ptr);
+            clearNullSVE(ptr, m20);
+            uint8_t flag0[4] = {0, 0, 0, 0};
+            __asm__ __volatile__("str %1, [%0]": : "r" (&flag0[0]), "Upl" (mask20) : "memory");
+            
+            // 根据 mode2 选择正确的取值方式
+            if (mode2 == 3) {
+              // 字典编码模式：通过字典索引获取值
+              for (int i = 0; i < 4; i++) {
+                if (flag0[i] != 0) {
+                  uint32_t dictIndex = dic[count + i];
+                  int64_t dictValue = value[dictIndex];
+                  *exec::Aggregate::value<int64_t>(*(result + count + i)) += dictValue;
+                }
+              }
+            } else {
+              // 简单模式：直接使用 value 数组
+              for (int i = 0; i < 4; i++) {
+                if (flag0[i] != 0) {
+                  *exec::Aggregate::value<int64_t>(*(result + count + i)) += value[count + i];
+                }
+              }
+            }
+          }
+
+          if (svptest_any(svptrue_b64(), mask21)) {
+            svuint64_t ptr =
+                svld1(mask21, reinterpret_cast<uint64_t*>(result + count + 4));
+            svbool_t m21 = getUinqMask(mask21, ptr);
+            clearNullSVE(ptr, m21);
+            uint8_t flag1[4] = {0, 0, 0, 0};
+            __asm__ __volatile__("str %1, [%0]": : "r" (&flag1[0]), "Upl" (mask21) : "memory");
+            
+            // 根据 mode2 选择正确的取值方式
+            if (mode2 == 3) {
+              // 字典编码模式
+              for (int i = 0; i < 4; i++) {
+                if (flag1[i] != 0) {
+                  uint32_t dictIndex = dic[count + 4 + i];
+                  int64_t dictValue = value[dictIndex];
+                  *exec::Aggregate::value<int64_t>(*(result + count + 4 + i)) += dictValue;
+                }
+              }
+            } else {
+              // 简单模式
+              for (int i = 0; i < 4; i++) {
+                if (flag1[i] != 0) {
+                  *exec::Aggregate::value<int64_t>(*(result + count + 4 + i)) += value[count + 4 + i];
+                }
+              }
+            }
+          }
+        }
+        svbool_t mask11 = svunpkhi(mask00);
+        if (svptest_any(svptrue_b32(), mask11)) {
+          svbool_t mask22 = svunpklo(mask11);
+          svbool_t mask23 = svunpkhi(mask11);
+          if (svptest_any(svptrue_b64(), mask22)) {
+            svuint64_t ptr =
+                svld1(mask22, reinterpret_cast<uint64_t*>(result + count + 8));
+            svbool_t m22 = getUinqMask(mask22, ptr);
+            clearNullSVE(ptr, m22);
+            uint8_t flag2[4] = {0, 0, 0, 0};
+            __asm__ __volatile__("str %1, [%0]": : "r" (&flag2[0]), "Upl" (mask22) : "memory");
+            
+            // 根据 mode2 选择正确的取值方式
+            if (mode2 == 3) {
+              for (int i = 0; i < 4; i++) {
+                if (flag2[i] != 0) {
+                  uint32_t dictIndex = dic[count + 8 + i];
+                  int64_t dictValue = value[dictIndex];
+                  *exec::Aggregate::value<int64_t>(*(result + count + 8 + i)) += dictValue;
+                }
+              }
+            } else {
+              for (int i = 0; i < 4; i++) {
+                if (flag2[i] != 0) {
+                  *exec::Aggregate::value<int64_t>(*(result + count + 8 + i)) += value[count + 8 + i];
+                }
+              }
+            }
+          }
+
+          if (svptest_any(svptrue_b64(), mask23)) {
+            svuint64_t ptr =
+                svld1(mask23, reinterpret_cast<uint64_t*>(result + count + 12));
+            svbool_t m23 = getUinqMask(mask23, ptr);
+            clearNullSVE(ptr, m23);
+            uint8_t flag3[4] = {0, 0, 0, 0};
+            __asm__ __volatile__("str %1, [%0]": : "r" (&flag3[0]), "Upl" (mask23) : "memory");
+            
+            // 根据 mode2 选择正确的取值方式
+            if (mode2 == 3) {
+              for (int i = 0; i < 4; i++) {
+                if (flag3[i] != 0) {
+                  uint32_t dictIndex = dic[count + 12 + i];
+                  int64_t dictValue = value[dictIndex];
+                  *exec::Aggregate::value<int64_t>(*(result + count + 12 + i)) += dictValue;
+                }
+              }
+            } else {
+              for (int i = 0; i < 4; i++) {
+                if (flag3[i] != 0) {
+                  *exec::Aggregate::value<int64_t>(*(result + count + 12 + i)) += value[count + 12 + i];
+                }
+              }
+            }
+          }
+        }
+      }
+
+      svbool_t mask12 = svunpklo(mask01);
+
+      if (svptest_any(svptrue_b16(), mask01)) {
+        svbool_t mask24 = svunpklo(mask12);
+        svbool_t mask25 = svunpkhi(mask12);
+        if (svptest_any(svptrue_b32(), mask12)) {
+          if (svptest_any(svptrue_b64(), mask24)) {
+            svuint64_t ptr =
+                svld1(mask24, reinterpret_cast<uint64_t*>(result + count + 16));
+            svbool_t m24 = getUinqMask(mask24, ptr);
+            clearNullSVE(ptr, m24);
+            uint8_t flag4[4] = {0, 0, 0, 0};
+            __asm__ __volatile__("str %1, [%0]": : "r" (&flag4[0]), "Upl" (mask24) : "memory");
+            
+            // 根据 mode2 选择正确的取值方式
+            if (mode2 == 3) {
+              for (int i = 0; i < 4; i++) {
+                if (flag4[i] != 0) {
+                  uint32_t dictIndex = dic[count + 16 + i];
+                  int64_t dictValue = value[dictIndex];
+                  *exec::Aggregate::value<int64_t>(*(result + count + 16 + i)) += dictValue;
+                }
+              }
+            } else {
+              for (int i = 0; i < 4; i++) {
+                if (flag4[i] != 0) {
+                  *exec::Aggregate::value<int64_t>(*(result + count + 16 + i)) += value[count + 16 + i];
+                }
+              }
+            }
+          }
+
+          if (svptest_any(svptrue_b64(), mask25)) {
+            svuint64_t ptr =
+                svld1(mask25, reinterpret_cast<uint64_t*>(result + count + 20));
+            svbool_t m25 = getUinqMask(mask25, ptr);
+            clearNullSVE(ptr, m25);
+            uint8_t flag5[4] = {0, 0, 0, 0};
+            __asm__ __volatile__("str %1, [%0]": : "r" (&flag5[0]), "Upl" (mask25) : "memory");
+            
+            // 根据 mode2 选择正确的取值方式
+            if (mode2 == 3) {
+              for (int i = 0; i < 4; i++) {
+                if (flag5[i] != 0) {
+                  uint32_t dictIndex = dic[count + 20 + i];
+                  int64_t dictValue = value[dictIndex];
+                  *exec::Aggregate::value<int64_t>(*(result + count + 20 + i)) += dictValue;
+                }
+              }
+            } else {
+              for (int i = 0; i < 4; i++) {
+                if (flag5[i] != 0) {
+                  *exec::Aggregate::value<int64_t>(*(result + count + 20 + i)) += value[count + 20 + i];
+                }
+              }
+            }
+          }
+        }
+        svbool_t mask13 = svunpkhi(mask01);
+
+        if (svptest_any(svptrue_b32(), mask13)) {
+          svbool_t mask26 = svunpklo(mask13);
+          svbool_t mask27 = svunpkhi(mask13);
+          if (svptest_any(svptrue_b64(), mask26)) {
+            svuint64_t ptr =
+                svld1(mask26, reinterpret_cast<uint64_t*>(result + count + 24));
+            svbool_t m26 = getUinqMask(mask26, ptr);
+            clearNullSVE(ptr, m26);
+            uint8_t flag6[4] = {0, 0, 0, 0};
+            __asm__ __volatile__("str %1, [%0]": : "r" (&flag6[0]), "Upl" (mask26) : "memory");
+            
+            // 根据 mode2 选择正确的取值方式
+            if (mode2 == 3) {
+              for (int i = 0; i < 4; i++) {
+                if (flag6[i] != 0) {
+                  uint32_t dictIndex = dic[count + 24 + i];
+                  int64_t dictValue = value[dictIndex];
+                  *exec::Aggregate::value<int64_t>(*(result + count + 24 + i)) += dictValue;
+                }
+              }
+            } else {
+              for (int i = 0; i < 4; i++) {
+                if (flag6[i] != 0) {
+                  *exec::Aggregate::value<int64_t>(*(result + count + 24 + i)) += value[count + 24 + i];
+                }
+              }
+            }
+          }
+
+          if (svptest_any(svptrue_b64(), mask27)) {
+            svuint64_t ptr =
+                svld1(mask27, reinterpret_cast<uint64_t*>(result + count + 28));
+            svbool_t m27 = getUinqMask(mask27, ptr);
+            clearNullSVE(ptr, m27);
+            uint8_t flag7[4] = {0, 0, 0, 0};
+            __asm__ __volatile__("str %1, [%0]": : "r" (&flag7[0]), "Upl" (mask27) : "memory");
+            
+            // 根据 mode2 选择正确的取值方式
+            if (mode2 == 3) {
+              for (int i = 0; i < 4; i++) {
+                if (flag7[i] != 0) {
+                  uint32_t dictIndex = dic[count + 28 + i];
+                  int64_t dictValue = value[dictIndex];
+                  *exec::Aggregate::value<int64_t>(*(result + count + 28 + i)) += dictValue;
+                }
+              }
+            } else {
+              for (int i = 0; i < 4; i++) {
+                if (flag7[i] != 0) {
+                  *exec::Aggregate::value<int64_t>(*(result + count + 28 + i)) += value[count + 28 + i];
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Density threshold: when popcount(bits) >= this value within a 64-bit
+  // word, use sequential traversal with bit-test instead of ctz bit-scan.
+  // Sequential mode benefits from branch predictor (nearly-all-true pattern)
+  // and sequential memory access for prefetch. Tunable per micro-architecture.
+  static constexpr int kDenseThreshold = 56;
+
+  inline __attribute__((always_inline)) void accumInt32Row(
+      char* group,
+      int32_t* value,
+      int32_t row) {
+    exec::Aggregate::clearNull(group);
+    *exec::Aggregate::value<int64_t>(group) += value[row];
+  }
+
+  // Dense path: sequential 4-bit nibble scan over [0, rEnd) within a word.
+  // When most bits are set, avoids per-bit ctz overhead; the branch predictor
+  // handles the nearly-all-true pattern with near-100% hit rate.
+  inline __attribute__((always_inline)) void accumWordDense(
+      char** result,
+      int32_t* value,
+      uint64_t bits,
+      int32_t rowBase,
+      int32_t rEnd) {
+    int32_t r = 0;
+    for (; r + 3 < rEnd; r += 4) {
+      uint64_t nibble = (bits >> r) & 0xFULL;
+      if (UNLIKELY(nibble == 0))
+        continue;
+      if (nibble == 0xF) {
+        char* g0 = result[rowBase + r];
+        char* g1 = result[rowBase + r + 1];
+        char* g2 = result[rowBase + r + 2];
+        char* g3 = result[rowBase + r + 3];
+        exec::Aggregate::clearNull(g0);
+        exec::Aggregate::clearNull(g1);
+        exec::Aggregate::clearNull(g2);
+        exec::Aggregate::clearNull(g3);
+        *exec::Aggregate::value<int64_t>(g0) += value[rowBase + r];
+        *exec::Aggregate::value<int64_t>(g1) += value[rowBase + r + 1];
+        *exec::Aggregate::value<int64_t>(g2) += value[rowBase + r + 2];
+        *exec::Aggregate::value<int64_t>(g3) += value[rowBase + r + 3];
+      } else {
+        if (nibble & 1) accumInt32Row(result[rowBase + r], value, rowBase + r);
+        if (nibble & 2) accumInt32Row(result[rowBase + r + 1], value, rowBase + r + 1);
+        if (nibble & 4) accumInt32Row(result[rowBase + r + 2], value, rowBase + r + 2);
+        if (nibble & 8) accumInt32Row(result[rowBase + r + 3], value, rowBase + r + 3);
+      }
+    }
+    for (; r < rEnd; ++r) {
+      if (bits & (1ULL << r))
+        accumInt32Row(result[rowBase + r], value, rowBase + r);
+    }
+  }
+
+  // Sparse path: ctz bit-scan extracts only set-bit positions, then 4x
+  // unrolled accumulation. Efficient when most bits are zero.
+  inline __attribute__((always_inline)) void accumWordSparse(
+      char** result,
+      int32_t* value,
+      uint64_t bits,
+      int32_t rowBase) {
+    int32_t rows[64];
+    int cnt = 0;
+    {
+      uint64_t tmp = bits;
+      while (tmp != 0) {
+        rows[cnt++] = rowBase + __builtin_ctzll(tmp);
+        tmp &= tmp - 1;
+      }
+    }
+    int i = 0;
+    for (; i + 3 < cnt; i += 4) {
+      char* g0 = result[rows[i]];
+      char* g1 = result[rows[i + 1]];
+      char* g2 = result[rows[i + 2]];
+      char* g3 = result[rows[i + 3]];
+      exec::Aggregate::clearNull(g0);
+      exec::Aggregate::clearNull(g1);
+      exec::Aggregate::clearNull(g2);
+      exec::Aggregate::clearNull(g3);
+      *exec::Aggregate::value<int64_t>(g0) += value[rows[i]];
+      *exec::Aggregate::value<int64_t>(g1) += value[rows[i + 1]];
+      *exec::Aggregate::value<int64_t>(g2) += value[rows[i + 2]];
+      *exec::Aggregate::value<int64_t>(g3) += value[rows[i + 3]];
+    }
+    for (; i < cnt; ++i) {
+      char* g = result[rows[i]];
+      exec::Aggregate::clearNull(g);
+      *exec::Aggregate::value<int64_t>(g) += value[rows[i]];
+    }
+  }
+
+  // Clips bitmap word to [begin, end) range within the 64-row window
+  // starting at rowBase. Returns 0 if no active bits remain.
+  static inline __attribute__((always_inline)) uint64_t clipBitsToRange(
+      uint64_t bits,
+      int32_t rowBase,
+      int32_t begin,
+      int32_t end) {
+    if (rowBase < begin)
+      bits &= ~((1ULL << (begin - rowBase)) - 1);
+    if (rowBase + 64 > end) {
+      int shift = end - rowBase;
+      if (shift < 64)
+        bits &= (1ULL << shift) - 1;
+    }
+    return bits;
+  }
+
+  // Adaptive dispatch: picks dense or sparse inner loop per word based on
+  // popcount vs kDenseThreshold.
+  inline __attribute__((always_inline)) void accumWordAdaptive(
+      char** result,
+      int32_t* value,
+      uint64_t bits,
+      int32_t rowBase,
+      int32_t end) {
+    int popcount = __builtin_popcountll(bits);
+    if (popcount >= kDenseThreshold) {
+      int32_t rEnd = (rowBase + 64 > end) ? (end - rowBase) : 64;
+      accumWordDense(result, value, bits, rowBase, rEnd);
+    } else {
+      accumWordSparse(result, value, bits, rowBase);
+    }
+  }
+
+  // Optimized path for int32 SUM with density-adaptive dispatch.
+  // For each 64-bit bitmap word, uses popcount to choose between:
+  //   - Dense path (popcount >= 56): sequential nibble scan with bit-test,
+  //     exploiting branch predictor on nearly-all-true patterns.
+  //   - Sparse path (popcount < 56): ctz bit-scan extracting only active
+  //     rows, avoiding work on zero bits.
+  //
+  // mode1 controls how bitmap2 (null mask) is interpreted:
+  //   0 = no nulls (all selected)
+  //   1 = flat bitmap (direct bit access)
+  //   2 = constant (single bit at index 0)
+  //   3 = dictionary-encoded (indirect via dic[])
+  void hashAggUpdateSVEWithCharForNormalInt32(
+      char** result,
+      uint64_t* bitmap1,
+      uint64_t* bitmap2,
+      int32_t* value,
+      int32_t begin,
+      int32_t end,
+      int mode1,
+      int mode2,
+      uint32_t* dic) {
+
+    auto getNullBit = [&](int32_t idx) -> bool {
+      if (bitmap2 == nullptr)
+        return true;
+      switch (mode1) {
+        case 0:
+          return true;
+        case 1:
+          return isBitSet(reinterpret_cast<uint64_t*>(bitmap2), idx);
+        case 2:
+          return !isBitNull(reinterpret_cast<uint64_t*>(bitmap2), 0);
+        case 3: {
+          uint32_t pos = dic[idx];
+          return isBitSet(reinterpret_cast<uint64_t*>(bitmap2), pos);
+        }
+        default:
+          return false;
+      }
+    };
+
+    if (mode1 == 0 || mode1 == 1) {
+      int32_t wordBegin = begin / 64;
+      int32_t wordEnd = (end + 63) / 64;
+
+      for (int32_t w = wordBegin; w < wordEnd; ++w) {
+        int32_t rowBase = w * 64;
+        uint64_t bits = reinterpret_cast<uint64_t*>(bitmap1)[w];
+        if (mode1 == 1 && bitmap2 != nullptr)
+          bits &= reinterpret_cast<uint64_t*>(bitmap2)[w];
+        bits = clipBitsToRange(bits, rowBase, begin, end);
+        if (bits == 0)
+          continue;
+        accumWordAdaptive(result, value, bits, rowBase, end);
+      }
+    } else if (mode1 == 2) {
+      if (!getNullBit(0))
+        return;
+
+      int32_t wordBegin = begin / 64;
+      int32_t wordEnd = (end + 63) / 64;
+
+      for (int32_t w = wordBegin; w < wordEnd; ++w) {
+        int32_t rowBase = w * 64;
+        uint64_t bits = reinterpret_cast<uint64_t*>(bitmap1)[w];
+        bits = clipBitsToRange(bits, rowBase, begin, end);
+        if (bits == 0)
+          continue;
+        accumWordAdaptive(result, value, bits, rowBase, end);
+      }
+    } else {
+      // mode 3 (dictionary) or unknown: per-row null check via dic[].
+      // Cannot do word-level AND on null bitmap, so filter during ctz scan.
+      // Still use dense path when selectivity bitmap alone is dense.
+      int32_t wordBegin = begin / 64;
+      int32_t wordEnd = (end + 63) / 64;
+
+      for (int32_t w = wordBegin; w < wordEnd; ++w) {
+        int32_t rowBase = w * 64;
+        uint64_t bits = reinterpret_cast<uint64_t*>(bitmap1)[w];
+        bits = clipBitsToRange(bits, rowBase, begin, end);
+        if (bits == 0)
+          continue;
+
+        int32_t rows[64];
+        int cnt = 0;
+        {
+          uint64_t tmp = bits;
+          while (tmp != 0) {
+            int32_t row = rowBase + __builtin_ctzll(tmp);
+            if (getNullBit(row))
+              rows[cnt++] = row;
+            tmp &= tmp - 1;
+          }
+        }
+
+        int i = 0;
+        for (; i + 3 < cnt; i += 4) {
+          char* g0 = result[rows[i]];
+          char* g1 = result[rows[i + 1]];
+          char* g2 = result[rows[i + 2]];
+          char* g3 = result[rows[i + 3]];
+          exec::Aggregate::clearNull(g0);
+          exec::Aggregate::clearNull(g1);
+          exec::Aggregate::clearNull(g2);
+          exec::Aggregate::clearNull(g3);
+          *exec::Aggregate::value<int64_t>(g0) += value[rows[i]];
+          *exec::Aggregate::value<int64_t>(g1) += value[rows[i + 1]];
+          *exec::Aggregate::value<int64_t>(g2) += value[rows[i + 2]];
+          *exec::Aggregate::value<int64_t>(g3) += value[rows[i + 3]];
+        }
+        for (; i < cnt; ++i) {
+          char* g = result[rows[i]];
+          exec::Aggregate::clearNull(g);
+          *exec::Aggregate::value<int64_t>(g) += value[rows[i]];
+        }
+      }
+    }
+  }
+
+  template <
+      bool tableHasNulls,
+      typename TData = ResultType,
+      typename TValue = TInput,
+      typename UpdateSingleValue>
+  void updateGroups(
+      char** groups,
+      const SelectivityVector& rows,
+      const VectorPtr& arg,
+      UpdateSingleValue updateSingleValue,
+      bool mayPushdown,
+      DecodedVector& decoded) {
+
+    if constexpr (kMayPushdown<TData>) {
+      auto encoding = decoded.base()->encoding();
+      if (encoding == VectorEncoding::Simple::LAZY &&
+          !arg->type()->isDecimal()) {
+        velox::aggregate::SimpleCallableHook<TData, UpdateSingleValue> hook(
+            exec::Aggregate::offset_,
+            exec::Aggregate::nullByte_,
+            exec::Aggregate::nullMask_,
+            groups,
+            &this->exec::Aggregate::numNulls_,
+            updateSingleValue);
+
+        auto indices = decoded.indices();
+        decoded.base()->as<const LazyVector>()->load(
+            RowSet(indices, arg->size()), &hook);
+        return;
+      }
+    }
+    // groups
+    // rows.bits
+    uint64_t* bitmask1 = rows.getBits();
+    // decode.bits
+    uint64_t* bitmask2 = decoded.getNulls();
+    // decode value
+    int64_t* value = reinterpret_cast<int64_t*>(decoded.getData());
+    // begin, end
+    vector_size_t begin = rows.getBegin();
+    vector_size_t end = rows.getEnd();
+
+    // mode1, mode2
+    int mode1 = decoded.getMode1();
+    int mode2 = decoded.getmode2();
+
+    // decode dic
+    vector_size_t* dic = decoded.getDic();
+
+    if constexpr (std::is_same_v<TValue, int32_t>) {
+      int32_t* value32 = reinterpret_cast<int32_t*>(decoded.getData());
+      hashAggUpdateSVEWithCharForNormalInt32(
+          groups,
+          bitmask1,
+          bitmask2,
+          value32,
+          begin,
+          end,
+          mode1,
+          mode2,
+          reinterpret_cast<uint32_t*>(dic));
+    } else {
+      hashAggUpdateSVEWithCharForNormal(
+          groups,
+          bitmask1,
+          bitmask2,
+          value,
+          begin,
+          end,
+          mode1,
+          mode2,
+          reinterpret_cast<uint32_t*>(dic));
+    }
+  }
+
+  template <
+      bool tableHasNulls,
+      typename TDataType = TAccumulator,
+      typename Update>
+  inline void
+  updateNonNullValue(char* group, TDataType value, Update updateValue) {
+    if constexpr (tableHasNulls) {
+      exec::Aggregate::clearNull(group);
+    }
+    updateValue(*exec::Aggregate::value<TDataType>(group), value);
+  }
   // TData is used to store the updated sum state. It can be either
   // TAccumulator or TResult, which in most cases are the same, but for
   // sum(real) can differ. TValue is used to decode the sum input 'args'.
@@ -132,8 +1101,16 @@ class SumAggregateBase
     }
 
     if (exec::Aggregate::numNulls_) {
-      BaseAggregate::template updateGroups<true, TData, TValue>(
-          groups, rows, arg, &updateSingleValue<TData>, false);
+      DecodedVector decoded(*arg, rows, !mayPushdown);
+      if (std::is_same_v<TData, int64_t> &&
+          (std::is_same_v<TValue, int64_t> || std::is_same_v<TValue, int32_t>) &&
+          decoded.mayHaveNulls() && Overflow) {
+        updateGroups<true, TData, TValue>(
+            groups, rows, arg, &updateSingleValue<TData>, false, decoded);
+      } else {
+        BaseAggregate::template updateGroups<true, TData, TValue>(
+            groups, rows, arg, &updateSingleValue<TData>, false);
+      }
     } else {
       BaseAggregate::template updateGroups<false, TData, TValue>(
           groups, rows, arg, &updateSingleValue<TData>, false);
