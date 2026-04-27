@@ -199,8 +199,12 @@ class OptimizedSparkDecimalSumAggregate
       char** groups,
       const SelectivityVector& rows,
       const std::vector<VectorPtr>& args,
-      bool /*mayPushdown*/) override {
+      bool mayPushdown) override {
     decodedInput_.decode(*args[0], rows);
+    if (decodedInput_.isConstantMapping()) {
+      Base::addRawInput(groups, rows, args, mayPushdown);
+      return;
+    }
     hashAggUpdateDecimal(
         groups,
         rows.getBits(),
@@ -231,7 +235,13 @@ class OptimizedSparkDecimalSumAggregate
       int mode2,
       uint32_t* dic) {
     auto getValue = [&](int32_t idx) -> TInputType {
-      return (mode2 == 3) ? value[dic[idx]] : value[idx];
+      if (mode2 == 3) {
+        return value[dic[idx]];
+      }
+      if (mode2 == 2) {
+        return value[0];
+      }
+      return value[idx];
     };
 
     auto getNullBit = [&](int32_t idx) -> bool {
@@ -267,6 +277,28 @@ class OptimizedSparkDecimalSumAggregate
         char* g1 = groups[rows[i + 1]];
         char* g2 = groups[rows[i + 2]];
         char* g3 = groups[rows[i + 3]];
+
+        const bool hasAlias =
+            (g0 == g1) || (g0 == g2) || (g0 == g3) || (g1 == g2) ||
+            (g1 == g3) || (g2 == g3);
+
+        if (hasAlias) {
+          for (int j = 0; j < 4; ++j) {
+            char* g = groups[rows[i + j]];
+            auto* acc = this->template value<AccumulatorType>(g);
+            if (acc->sum.has_value()) {
+              int128_t result;
+              acc->overflow += DecimalUtil::addWithOverflow(
+                  result,
+                  static_cast<int128_t>(getValue(rows[i + j])),
+                  acc->sum.value());
+              acc->sum = result;
+              acc->isEmpty = false;
+            }
+            this->clearNull(g);
+          }
+          continue;
+        }
 
         auto* acc0 = this->template value<AccumulatorType>(g0);
         auto* acc1 = this->template value<AccumulatorType>(g1);

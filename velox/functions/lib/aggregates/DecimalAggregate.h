@@ -359,7 +359,13 @@ class DecimalAggregate : public exec::Aggregate {
       int mode2,
       uint32_t* dic) {
     auto getValue = [&](int32_t idx) -> TInputType {
-      return (mode2 == 3) ? value[dic[idx]] : value[idx];
+      if (mode2 == 3) {
+        return value[dic[idx]];
+      }
+      if (mode2 == 2) {
+        return value[0];
+      }
+      return value[idx];
     };
 
     auto getNullBit = [&](int32_t idx) -> bool {
