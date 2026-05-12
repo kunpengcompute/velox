@@ -755,21 +755,21 @@ class SumAggregateBase
 
   inline __attribute__((always_inline)) void accumInt32Row(
       char* group,
-      int32_t* value,
-      int32_t row) {
+      int32_t val) {
     exec::Aggregate::clearNull(group);
-    *exec::Aggregate::value<int64_t>(group) += value[row];
+    *exec::Aggregate::value<int64_t>(group) += val;
   }
 
   // Dense path: sequential 4-bit nibble scan over [0, rEnd) within a word.
   // When most bits are set, avoids per-bit ctz overhead; the branch predictor
   // handles the nearly-all-true pattern with near-100% hit rate.
+  template <typename F>
   inline __attribute__((always_inline)) void accumWordDense(
       char** result,
-      int32_t* value,
       uint64_t bits,
       int32_t rowBase,
-      int32_t rEnd) {
+      int32_t rEnd,
+      F getValue) {
     int32_t r = 0;
     for (; r + 3 < rEnd; r += 4) {
       uint64_t nibble = (bits >> r) & 0xFULL;
@@ -784,30 +784,31 @@ class SumAggregateBase
         exec::Aggregate::clearNull(g1);
         exec::Aggregate::clearNull(g2);
         exec::Aggregate::clearNull(g3);
-        *exec::Aggregate::value<int64_t>(g0) += value[rowBase + r];
-        *exec::Aggregate::value<int64_t>(g1) += value[rowBase + r + 1];
-        *exec::Aggregate::value<int64_t>(g2) += value[rowBase + r + 2];
-        *exec::Aggregate::value<int64_t>(g3) += value[rowBase + r + 3];
+        *exec::Aggregate::value<int64_t>(g0) += getValue(rowBase + r);
+        *exec::Aggregate::value<int64_t>(g1) += getValue(rowBase + r + 1);
+        *exec::Aggregate::value<int64_t>(g2) += getValue(rowBase + r + 2);
+        *exec::Aggregate::value<int64_t>(g3) += getValue(rowBase + r + 3);
       } else {
-        if (nibble & 1) accumInt32Row(result[rowBase + r], value, rowBase + r);
-        if (nibble & 2) accumInt32Row(result[rowBase + r + 1], value, rowBase + r + 1);
-        if (nibble & 4) accumInt32Row(result[rowBase + r + 2], value, rowBase + r + 2);
-        if (nibble & 8) accumInt32Row(result[rowBase + r + 3], value, rowBase + r + 3);
+        if (nibble & 1) accumInt32Row(result[rowBase + r], getValue(rowBase + r));
+        if (nibble & 2) accumInt32Row(result[rowBase + r + 1], getValue(rowBase + r + 1));
+        if (nibble & 4) accumInt32Row(result[rowBase + r + 2], getValue(rowBase + r + 2));
+        if (nibble & 8) accumInt32Row(result[rowBase + r + 3], getValue(rowBase + r + 3));
       }
     }
     for (; r < rEnd; ++r) {
       if (bits & (1ULL << r))
-        accumInt32Row(result[rowBase + r], value, rowBase + r);
+        accumInt32Row(result[rowBase + r], getValue(rowBase + r));
     }
   }
 
   // Sparse path: ctz bit-scan extracts only set-bit positions, then 4x
   // unrolled accumulation. Efficient when most bits are zero.
+  template <typename F>
   inline __attribute__((always_inline)) void accumWordSparse(
       char** result,
-      int32_t* value,
       uint64_t bits,
-      int32_t rowBase) {
+      int32_t rowBase,
+      F getValue) {
     int32_t rows[64];
     int cnt = 0;
     {
@@ -827,15 +828,15 @@ class SumAggregateBase
       exec::Aggregate::clearNull(g1);
       exec::Aggregate::clearNull(g2);
       exec::Aggregate::clearNull(g3);
-      *exec::Aggregate::value<int64_t>(g0) += value[rows[i]];
-      *exec::Aggregate::value<int64_t>(g1) += value[rows[i + 1]];
-      *exec::Aggregate::value<int64_t>(g2) += value[rows[i + 2]];
-      *exec::Aggregate::value<int64_t>(g3) += value[rows[i + 3]];
+      *exec::Aggregate::value<int64_t>(g0) += getValue(rows[i]);
+      *exec::Aggregate::value<int64_t>(g1) += getValue(rows[i + 1]);
+      *exec::Aggregate::value<int64_t>(g2) += getValue(rows[i + 2]);
+      *exec::Aggregate::value<int64_t>(g3) += getValue(rows[i + 3]);
     }
     for (; i < cnt; ++i) {
       char* g = result[rows[i]];
       exec::Aggregate::clearNull(g);
-      *exec::Aggregate::value<int64_t>(g) += value[rows[i]];
+      *exec::Aggregate::value<int64_t>(g) += getValue(rows[i]);
     }
   }
 
@@ -858,18 +859,19 @@ class SumAggregateBase
 
   // Adaptive dispatch: picks dense or sparse inner loop per word based on
   // popcount vs kDenseThreshold.
+  template <typename F>
   inline __attribute__((always_inline)) void accumWordAdaptive(
       char** result,
-      int32_t* value,
       uint64_t bits,
       int32_t rowBase,
-      int32_t end) {
+      int32_t end,
+      F getValue) {
     int popcount = __builtin_popcountll(bits);
     if (popcount >= kDenseThreshold) {
       int32_t rEnd = (rowBase + 64 > end) ? (end - rowBase) : 64;
-      accumWordDense(result, value, bits, rowBase, rEnd);
+      accumWordDense(result, bits, rowBase, rEnd, getValue);
     } else {
-      accumWordSparse(result, value, bits, rowBase);
+      accumWordSparse(result, bits, rowBase, getValue);
     }
   }
 
@@ -915,82 +917,90 @@ class SumAggregateBase
       }
     };
 
-    if (mode1 == 0 || mode1 == 1) {
-      int32_t wordBegin = begin / 64;
-      int32_t wordEnd = (end + 63) / 64;
+    auto processWords = [&](auto getValue) {
+      if (mode1 == 0 || mode1 == 1) {
+        int32_t wordBegin = begin / 64;
+        int32_t wordEnd = (end + 63) / 64;
 
-      for (int32_t w = wordBegin; w < wordEnd; ++w) {
-        int32_t rowBase = w * 64;
-        uint64_t bits = reinterpret_cast<uint64_t*>(bitmap1)[w];
-        if (mode1 == 1 && bitmap2 != nullptr)
-          bits &= reinterpret_cast<uint64_t*>(bitmap2)[w];
-        bits = clipBitsToRange(bits, rowBase, begin, end);
-        if (bits == 0)
-          continue;
-        accumWordAdaptive(result, value, bits, rowBase, end);
-      }
-    } else if (mode1 == 2) {
-      if (!getNullBit(0))
-        return;
+        for (int32_t w = wordBegin; w < wordEnd; ++w) {
+          int32_t rowBase = w * 64;
+          uint64_t bits = reinterpret_cast<uint64_t*>(bitmap1)[w];
+          if (mode1 == 1 && bitmap2 != nullptr)
+            bits &= reinterpret_cast<uint64_t*>(bitmap2)[w];
+          bits = clipBitsToRange(bits, rowBase, begin, end);
+          if (bits == 0)
+            continue;
+          accumWordAdaptive(result, bits, rowBase, end, getValue);
+        }
+      } else if (mode1 == 2) {
+        if (!getNullBit(0))
+          return;
 
-      int32_t wordBegin = begin / 64;
-      int32_t wordEnd = (end + 63) / 64;
+        int32_t wordBegin = begin / 64;
+        int32_t wordEnd = (end + 63) / 64;
 
-      for (int32_t w = wordBegin; w < wordEnd; ++w) {
-        int32_t rowBase = w * 64;
-        uint64_t bits = reinterpret_cast<uint64_t*>(bitmap1)[w];
-        bits = clipBitsToRange(bits, rowBase, begin, end);
-        if (bits == 0)
-          continue;
-        accumWordAdaptive(result, value, bits, rowBase, end);
-      }
-    } else {
-      // mode 3 (dictionary) or unknown: per-row null check via dic[].
-      // Cannot do word-level AND on null bitmap, so filter during ctz scan.
-      // Still use dense path when selectivity bitmap alone is dense.
-      int32_t wordBegin = begin / 64;
-      int32_t wordEnd = (end + 63) / 64;
+        for (int32_t w = wordBegin; w < wordEnd; ++w) {
+          int32_t rowBase = w * 64;
+          uint64_t bits = reinterpret_cast<uint64_t*>(bitmap1)[w];
+          bits = clipBitsToRange(bits, rowBase, begin, end);
+          if (bits == 0)
+            continue;
+          accumWordAdaptive(result, bits, rowBase, end, getValue);
+        }
+      } else {
+        int32_t wordBegin = begin / 64;
+        int32_t wordEnd = (end + 63) / 64;
 
-      for (int32_t w = wordBegin; w < wordEnd; ++w) {
-        int32_t rowBase = w * 64;
-        uint64_t bits = reinterpret_cast<uint64_t*>(bitmap1)[w];
-        bits = clipBitsToRange(bits, rowBase, begin, end);
-        if (bits == 0)
-          continue;
+        for (int32_t w = wordBegin; w < wordEnd; ++w) {
+          int32_t rowBase = w * 64;
+          uint64_t bits = reinterpret_cast<uint64_t*>(bitmap1)[w];
+          bits = clipBitsToRange(bits, rowBase, begin, end);
+          if (bits == 0)
+            continue;
 
-        int32_t rows[64];
-        int cnt = 0;
-        {
-          uint64_t tmp = bits;
-          while (tmp != 0) {
-            int32_t row = rowBase + __builtin_ctzll(tmp);
-            if (getNullBit(row))
-              rows[cnt++] = row;
-            tmp &= tmp - 1;
+          int32_t rows[64];
+          int cnt = 0;
+          {
+            uint64_t tmp = bits;
+            while (tmp != 0) {
+              int32_t row = rowBase + __builtin_ctzll(tmp);
+              if (getNullBit(row))
+                rows[cnt++] = row;
+              tmp &= tmp - 1;
+            }
+          }
+
+          int i = 0;
+          for (; i + 3 < cnt; i += 4) {
+            char* g0 = result[rows[i]];
+            char* g1 = result[rows[i + 1]];
+            char* g2 = result[rows[i + 2]];
+            char* g3 = result[rows[i + 3]];
+            exec::Aggregate::clearNull(g0);
+            exec::Aggregate::clearNull(g1);
+            exec::Aggregate::clearNull(g2);
+            exec::Aggregate::clearNull(g3);
+            *exec::Aggregate::value<int64_t>(g0) += getValue(rows[i]);
+            *exec::Aggregate::value<int64_t>(g1) += getValue(rows[i + 1]);
+            *exec::Aggregate::value<int64_t>(g2) += getValue(rows[i + 2]);
+            *exec::Aggregate::value<int64_t>(g3) += getValue(rows[i + 3]);
+          }
+          for (; i < cnt; ++i) {
+            char* g = result[rows[i]];
+            exec::Aggregate::clearNull(g);
+            *exec::Aggregate::value<int64_t>(g) += getValue(rows[i]);
           }
         }
-
-        int i = 0;
-        for (; i + 3 < cnt; i += 4) {
-          char* g0 = result[rows[i]];
-          char* g1 = result[rows[i + 1]];
-          char* g2 = result[rows[i + 2]];
-          char* g3 = result[rows[i + 3]];
-          exec::Aggregate::clearNull(g0);
-          exec::Aggregate::clearNull(g1);
-          exec::Aggregate::clearNull(g2);
-          exec::Aggregate::clearNull(g3);
-          *exec::Aggregate::value<int64_t>(g0) += value[rows[i]];
-          *exec::Aggregate::value<int64_t>(g1) += value[rows[i + 1]];
-          *exec::Aggregate::value<int64_t>(g2) += value[rows[i + 2]];
-          *exec::Aggregate::value<int64_t>(g3) += value[rows[i + 3]];
-        }
-        for (; i < cnt; ++i) {
-          char* g = result[rows[i]];
-          exec::Aggregate::clearNull(g);
-          *exec::Aggregate::value<int64_t>(g) += value[rows[i]];
-        }
       }
+    };
+
+    if (mode2 == 3) {
+      processWords([&](int32_t idx) { return value[dic[idx]]; });
+    } else if (mode2 == 2) {
+      int32_t cv = value[0];
+      processWords([&](int32_t /*idx*/) { return cv; });
+    } else {
+      processWords([&](int32_t idx) { return value[idx]; });
     }
   }
 
