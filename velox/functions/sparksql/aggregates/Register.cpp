@@ -21,6 +21,7 @@
 #include "velox/functions/sparksql/aggregates/BloomFilterAggAggregate.h"
 #include "velox/functions/sparksql/aggregates/CentralMomentsAggregate.h"
 #include "velox/functions/sparksql/aggregates/CollectListAggregate.h"
+#include "velox/functions/sparksql/aggregates/CountAggregate.h"
 #include "velox/functions/sparksql/aggregates/RegrReplacementAggregate.h"
 #include "velox/functions/sparksql/aggregates/SumAggregate.h"
 
@@ -59,6 +60,11 @@ void registerAggregateFunctions(
       prefix + "bloom_filter_agg", withCompanionFunctions, overwrite);
   registerAverage(prefix + "avg", withCompanionFunctions, overwrite);
   registerSum(prefix + "sum", withCompanionFunctions, overwrite);
+  // Register Spark's own count so it overrides whatever the Presto pass
+  // registered earlier. Gluten invokes Spark's registerAggregateFunctions
+  // with overwrite=true after Presto's, so this call wins for the bare
+  // "count" name resolved by SubstraitToVeloxPlan.
+  registerCount(prefix + "count", withCompanionFunctions, overwrite);
   registerCentralMomentsAggregate(prefix, withCompanionFunctions, overwrite);
   registerCollectSetAggAggregate(prefix, withCompanionFunctions, overwrite);
   registerCollectListAggregate(prefix, withCompanionFunctions, overwrite);
