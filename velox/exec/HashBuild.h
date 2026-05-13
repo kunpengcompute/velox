@@ -258,6 +258,11 @@ class HashBuild final : public Operator {
   // Temporary space for hash numbers.
   raw_vector<uint64_t> hashes_;
 
+  // Reusable scratch buffer holding row pointers returned by
+  // 'RowContainer::newRows()' on the spill restore fast path. Sized to the
+  // current input batch and reused across batches.
+  std::vector<char*> spillRestoreRows_;
+
   // Set of active rows during addInput().
   SelectivityVector activeRows_;
 

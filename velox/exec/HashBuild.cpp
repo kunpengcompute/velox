@@ -394,6 +394,41 @@ void HashBuild::addInput(RowVectorPtr input) {
         input->childAt(spillProbedFlagChannel_)->asFlatVector<bool>();
   }
 
+  // Spill restoration fast path: when reading back a spilled build partition,
+  // the input batch is dense (no rows were deselected by null/anti-join
+  // filtering) and 'activeRows_' covers the whole batch. In that situation we
+  // can replace the per-row 'newRow + store' driven by 'applyToSelected' with
+  // a single bulk allocation and per-column batch stores, which lets the
+  // typed 'storeNoNullsBatch / storeWithNullsBatch' template fold its
+  // dispatch out of the inner loop and process all rows in tight memcpy /
+  // assignment loops. This is the O1 optimization from the spill performance
+  // analysis. The slow path below remains the source of truth for the
+  // non-spill case.
+  const bool spillFastPathEligible = isInputFromSpill() &&
+      activeRows_.isAllSelected() &&
+      activeRows_.size() == static_cast<vector_size_t>(input->size());
+  if (spillFastPathEligible) {
+    const int32_t numRows = input->size();
+    spillRestoreRows_.resize(numRows);
+    rows->newRows(numRows, spillRestoreRows_.data());
+    auto rowsRange = folly::Range<char**>(spillRestoreRows_.data(), numRows);
+    for (auto i = 0; i < hashers.size(); ++i) {
+      rows->store(hashers[i]->decodedVector(), rowsRange, i);
+    }
+    for (auto i = 0; i < dependentChannels_.size(); ++i) {
+      rows->store(*decoders_[i], rowsRange, i + hashers.size());
+    }
+    if (spillProbedFlagVector != nullptr) {
+      for (vector_size_t r = 0; r < numRows; ++r) {
+        VELOX_CHECK(!spillProbedFlagVector->isNullAt(r));
+        if (spillProbedFlagVector->valueAt(r)) {
+          rows->setProbedFlag(&spillRestoreRows_[r], 1);
+        }
+      }
+    }
+    return;
+  }
+
   activeRows_.applyToSelected([&](auto rowIndex) {
     char* newRow = rows->newRow();
     // Store the columns for each row in sequence. At probe time

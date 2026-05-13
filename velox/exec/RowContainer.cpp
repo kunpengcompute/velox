@@ -307,6 +307,88 @@ char* RowContainer::newRow() {
   return initializeRow(row, false /* reuse */);
 }
 
+void RowContainer::newRows(int32_t numRows, char** newRows) {
+  VELOX_DCHECK(mutable_, "Can't add row into an immutable row container");
+  if (numRows <= 0) {
+    return;
+  }
+
+  const int64_t stride =
+      static_cast<int64_t>(fixedRowSize_) + normalizedKeySize_;
+  // 'AllocationPool::allocateFixed' may not be able to satisfy the whole
+  // request from the current run; allocate in as few chunks as possible by
+  // querying the available bytes in the current run before each call. The
+  // pool itself takes care of starting a new run when needed, but we want to
+  // minimize the number of '::memset' / '::memcpy' calls and avoid splitting
+  // an individual row across two runs.
+  int32_t produced = 0;
+  while (produced < numRows) {
+    const int64_t remainingRows = numRows - produced;
+
+    // Figure out how many rows fit contiguously in the current run. If the
+    // current run cannot fit a row, fall back to a single-row request and
+    // let 'allocateFixed' start a new run for us. Even if the requested
+    // chunk does not fit, 'allocateFixed' will start a new run and serve the
+    // entire chunk from there, so the bulk 'memset' below still covers a
+    // contiguous range; we just waste the tail of the previous run, exactly
+    // matching the existing single-row 'newRow()' behavior.
+    int64_t chunk = remainingRows;
+    const int64_t freeBytes = rows_.testingFreeAddressableBytes();
+    if (freeBytes >= stride) {
+      const int64_t fitInCurrent = freeBytes / stride;
+      chunk = std::min<int64_t>(remainingRows, fitInCurrent);
+    } else {
+      chunk = 1;
+    }
+
+    char* base = rows_.allocateFixed(chunk * stride, alignment_);
+
+    // Initialize the entire chunk in two contiguous memory operations rather
+    // than per-row 'initializeRow' calls. This is correct because:
+    //   * memset(0) clears the nullByte region, the free flag, the row-size
+    //     field, the next-row pointer, and the per-row payload area.
+    //   * The default 'initialNulls_' content is all-zero (see ctor), so the
+    //     per-row 'memcpy(initialNulls_)' performed by 'initializeRow' is
+    //     already covered by the bulk memset for hash-join use cases.
+    //   * If a future caller configures 'initialNulls_' with non-zero bits
+    //     (e.g. for aggregation rows where some null flags default to 1) we
+    //     still need to overlay them on every row; that is handled by the
+    //     'initialNullsAllZero' branch below.
+    ::memset(base, 0, chunk * stride);
+
+    const bool hasInitialNulls = !nullOffsets_.empty();
+    bool initialNullsAllZero = true;
+    if (hasInitialNulls) {
+      for (auto b : initialNulls_) {
+        if (b != 0) {
+          initialNullsAllZero = false;
+          break;
+        }
+      }
+    }
+
+    for (int64_t i = 0; i < chunk; ++i) {
+      char* row = base + i * stride + normalizedKeySize_;
+      if (hasInitialNulls && !initialNullsAllZero) {
+        ::memcpy(
+            row + nullByte(nullOffsets_[0]),
+            initialNulls_.data(),
+            initialNulls_.size());
+      }
+      // 'memset' has already cleared 'rowSizeOffset_', 'nextOffset_' and the
+      // free flag bit, so we don't need the explicit assignments performed by
+      // 'initializeRow'.
+      newRows[produced + i] = row;
+    }
+
+    if (normalizedKeySize_) {
+      numRowsWithNormalizedKey_ += chunk;
+    }
+    numRows_ += chunk;
+    produced += chunk;
+  }
+}
+
 char* RowContainer::initializeRow(char* row, bool reuse) {
   if (reuse) {
     auto rows = folly::Range<char**>(&row, 1);
