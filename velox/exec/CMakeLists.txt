@@ -80,6 +80,7 @@ velox_add_library(
   SortWindowBuild.cpp
   Spill.cpp
   SpillFile.cpp
+  SpillRadixSort.cpp
   Spiller.cpp
   StreamingAggregation.cpp
   Strings.cpp
