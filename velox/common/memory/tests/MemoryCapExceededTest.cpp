@@ -191,14 +191,14 @@ TEST_P(MemoryCapExceededTest, allocatorCapacityExceededError) {
       {64LL << 20,
        false,
        std::vector<std::string>{
-           "allocateContiguous failed with .* pages",
+           "allocateContiguous failed with .* pages|growContiguous failed with .* pages",
            "max capacity 128.00MB unlimited capacity used .* available .*",
            ".* reservation .used .*MB, reserved .*MB, min 0B. counters",
            "allocs .*, frees .*, reserves .*, releases .*, collisions .*"}},
       {64LL << 20,
        true,
        std::vector<std::string>{
-           "allocateContiguous failed with .* pages",
+           "allocateContiguous failed with .* pages|growContiguous failed with .* pages",
            "max capacity 128.00MB unlimited capacity used .* available .*",
            ".* reservation .used .*MB, reserved .*MB, min .*B. counters",
            ".*, frees .*, reserves .*, releases .*, collisions .*"}}};
