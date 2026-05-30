@@ -3098,6 +3098,27 @@ TEST_F(VectorTest, rowCopyRanges) {
   test::assertEqualVectors(expected, rowVectorDest);
 }
 
+TEST_F(VectorTest, rowCopySingleRange) {
+  auto source = makeRowVector(
+      {makeNullableFlatVector<int32_t>({10, std::nullopt, 12, 13}),
+       makeFlatVector<int64_t>({20, 21, 22, 23})},
+      [](auto row) { return row == 2; });
+  auto target = makeRowVector(
+      {makeNullableFlatVector<int32_t>({1, 2, 3, 4, 5, 6}),
+       makeFlatVector<int64_t>({7, 8, 9, 10, 11, 12})});
+  target->setNull(3, true);
+  target->setNull(4, true);
+
+  target->copy(source.get(), 2, 1, 3);
+
+  auto expected = makeRowVector(
+      {makeNullableFlatVector<int32_t>(
+           {1, 2, std::nullopt, std::nullopt, 13, 6}),
+       makeFlatVector<int64_t>({7, 8, 21, 10, 23, 12})},
+      [](auto row) { return row == 3; });
+  test::assertEqualVectors(expected, target);
+}
+
 TEST_F(VectorTest, containsNullAtIntegers) {
   VectorPtr data = makeFlatVector<int32_t>({1, 2, 3});
   for (auto i = 0; i < data->size(); ++i) {
