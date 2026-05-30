@@ -121,7 +121,7 @@ class BaseHashTable {
   /// Specifies the hash mode of a table.
   enum class HashMode { kHash, kArray, kNormalizedKey };
 
-  enum class NormalizedKeyMode {nativeVelox, scalar, sve}; // TODO scalar2
+  enum class NormalizedKeyMode { nativeVelox, sve };
 
   static constexpr int8_t kNoSpillInputStartPartitionBit = -1;
 
@@ -914,9 +914,7 @@ class HashTable : public BaseHashTable {
   // Shortcut path for group by with normalized keys.
   void groupNormalizedKeyProbe(HashLookup& lookup);
 
-  void groupNormalizedKeyProbeScalar(HashLookup& lookup); // TODO scalar2
-
-  void groupNormalizedKeyProbeSVE(HashLookup& lookup); // TODO scalar2
+  void groupNormalizedKeyProbeSVE(HashLookup& lookup);
 
   // Array probe with SIMD.
   void arrayJoinProbe(HashLookup& lookup);
@@ -1083,7 +1081,9 @@ class HashTable : public BaseHashTable {
   // Counts the number of rehash() calls.
   int64_t numRehashes_{0};
   HashMode hashMode_ = HashMode::kArray;
-  NormalizedKeyMode normalizedKeyMode_ = NormalizedKeyMode::sve ; // TODO scalar2，NormalizedKeyMode::sve\NormalizedKeyMode::scalar
+  // Set once in the constructor from isJoinBuild_, HWCAP_SVE, and optional
+  // VELOX_HASHAGG_NORMALIZED_KEY_MODE; immutable thereafter.
+  NormalizedKeyMode normalizedKeyMode_ = NormalizedKeyMode::nativeVelox;
   // Pre-built per-column comparison info for kHash mode fastCompareKeys.
   // Rebuilt per probe batch in prepareForGroupProbe / prepareForJoinProbe.
   std::vector<CompareColumnInfo> compareInfos_;

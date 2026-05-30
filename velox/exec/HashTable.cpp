@@ -15,7 +15,11 @@
  */
 
 #include "velox/exec/HashTable.h"
-#include "sveht/src/sve_hash.hpp"
+#include <arm_sve.h>
+#if defined(__linux__) && defined(__aarch64__)
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+#endif
 #include "velox/common/base/AsyncSource.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/Portability.h"
@@ -31,7 +35,64 @@
 #define XXH_STATIC_LINKING_ONLY
 #include "velox/external/xxhash/xxhash.h"
 
+#include <cctype>
+#include <cstdlib>
+#include <string>
+
 using facebook::velox::common::testutil::TestValue;
+
+namespace {
+enum class NormalizedKeyModeOverride { kAuto, kNative, kSve };
+
+bool linuxAarch64RuntimeHasSve() {
+  static const bool kHasSve = []() {
+#if defined(__linux__) && defined(__aarch64__)
+    return (getauxval(AT_HWCAP) & HWCAP_SVE) != 0;
+#else
+    return false;
+#endif
+  }();
+  return kHasSve;
+}
+
+NormalizedKeyModeOverride hashAggNormalizedKeyModeOverride() {
+  static const NormalizedKeyModeOverride kOverride = []() {
+    const char* env = std::getenv("VELOX_HASHAGG_NORMALIZED_KEY_MODE");
+    if (env == nullptr || *env == '\0') {
+      return NormalizedKeyModeOverride::kAuto;
+    }
+    std::string value(env);
+    for (auto& c : value) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (value == "native" || value == "0" || value == "false") {
+      return NormalizedKeyModeOverride::kNative;
+    }
+    if (value == "sve" || value == "1" || value == "true") {
+      return NormalizedKeyModeOverride::kSve;
+    }
+    return NormalizedKeyModeOverride::kAuto;
+  }();
+  return kOverride;
+}
+
+facebook::velox::exec::BaseHashTable::NormalizedKeyMode
+resolveNormalizedKeyModeForAgg(bool isJoinBuild) {
+  using Mode = facebook::velox::exec::BaseHashTable::NormalizedKeyMode;
+  if (isJoinBuild) {
+    return Mode::nativeVelox;
+  }
+  switch (hashAggNormalizedKeyModeOverride()) {
+    case NormalizedKeyModeOverride::kNative:
+      return Mode::nativeVelox;
+    case NormalizedKeyModeOverride::kSve:
+      return linuxAarch64RuntimeHasSve() ? Mode::sve : Mode::nativeVelox;
+    case NormalizedKeyModeOverride::kAuto:
+      return linuxAarch64RuntimeHasSve() ? Mode::sve : Mode::nativeVelox;
+  }
+  return Mode::nativeVelox;
+}
+} // namespace
 
 namespace facebook::velox::exec {
 // static
@@ -61,7 +122,8 @@ HashTable<ignoreNullKeys>::HashTable(
     memory::MemoryPool* pool)
     : BaseHashTable(std::move(hashers)),
       minTableSizeForParallelJoinBuild_(minTableSizeForParallelJoinBuild),
-      isJoinBuild_(isJoinBuild) {
+      isJoinBuild_(isJoinBuild),
+      normalizedKeyMode_(resolveNormalizedKeyModeForAgg(isJoinBuild)) {
   std::vector<TypePtr> keys;
   for (auto& hasher : hashers_) {
     keys.push_back(hasher->type());
@@ -324,17 +386,6 @@ void HashTable<ignoreNullKeys>::storeRowPointer(
     reinterpret_cast<char**>(table_)[index] = row;
     return;
   }
-  if (hashMode_ == HashMode::kNormalizedKey &&
-      normalizedKeyMode_ == NormalizedKeyMode::scalar &&
-      !isJoinBuild_) { // TODO NOTE sve不调用这里，而是自行向量化
-    // TODO scalar2
-    auto* table = reinterpret_cast<sveht::KeyValue*>(table_);
-    table[index].key = reinterpret_cast<normalized_key_t*>(
-        row)[-1]; // 保存normalizedKey，TODO
-                  // 所以在storeKey函数中还是要在group行-1位置保存normalizedKey!
-    table[index].value = row;
-    return;
-  }
   const int64_t offset = bucketOffset(index);
   auto* bucket = bucketAt(offset);
   const auto slotIndex = index & (sizeof(TagVector) - 1);
@@ -352,17 +403,12 @@ char* HashTable<ignoreNullKeys>::insertEntry(
   storeKeys(lookup, row);
 
   if (hashMode_ == HashMode::kNormalizedKey) {
-    // TODO scalar2
-    // 这一步提前，因为storeRowPointer函数要改造依赖group行-1位置保存的normalizedKey
-    // TODO scalar2
-    // 都要存normalizedKey，因为下面storeRowPointer函数里要从group行-1位置取出normalizedKey放到table
-    // key We store the unique digest of key values (normalized key) in the word
+    // We store the unique digest of key values (normalized key) in the word
     // below the row. Space was reserved in the allocation unless we have given
     // up on normalized keys.
     RowContainer::normalizedKey(group) = lookup.normalizedKeys[row]; // NOLINT
   }
 
-  // TODO scalar2 storeRowPointer函数要改造依赖group行-1位置保存的normalizedKey
   storeRowPointer(index, lookup.hashes[row], group);
 
   ++numDistinct_;
@@ -380,11 +426,7 @@ char* HashTable<ignoreNullKeys>::insertEntryforSVE(
   storeKeys(lookup, row);
 
   if (hashMode_ == HashMode::kNormalizedKey) {
-    // TODO scalar2
-    // 这一步提前，因为storeRowPointer函数要改造依赖group行-1位置保存的normalizedKey
-    // TODO scalar2
-    // 都要存normalizedKey，因为下面storeRowPointer函数里要从group行-1位置取出normalizedKey放到table
-    // key We store the unique digest of key values (normalized key) in the word
+    // We store the unique digest of key values (normalized key) in the word
     // below the row. Space was reserved in the allocation unless we have given
     // up on normalized keys.
     RowContainer::normalizedKey(group) = lookup.normalizedKeys[row]; // NOLINT
@@ -1180,66 +1222,6 @@ void xxhashRowKeysBatch(
 
 } // namespace
 
-#define LANE_COUNT 4
-
-void step1_load_keys(
-    const uint64_t* new_key,
-    const svbool_t inv_mask,
-    svuint64_t& prev_key) {
-  svbool_t pg = svptrue_b64();
-  svuint64_t newk = svld1(inv_mask, new_key);
-
-  svbool_t active_mask = svnot_b_z(pg, inv_mask);
-  svuint64_t oldk = svld1(active_mask, (const uint64_t*)&prev_key);
-  prev_key = svorr_z(svptrue_b64(), newk, oldk);
-}
-
-void step3_gather_build(
-    const sveht::KeyValue* table,
-    svuint64_t h,
-    svuint64_t& tab_key) {
-  svbool_t pg = svptrue_b64();
-  // Compute byte offsets = h * sizeof(KeyValue) = h * 16
-  svuint64_t offset = svlsl_n_u64_z(pg, h, 4); // 2^4 = 16
-  tab_key = svld1_gather_u64offset_u64(pg, &table[0].key, offset);
-}
-void step3_gather_build_value(
-    sveht::KeyValue* table,
-    svuint64_t h,
-    svuint64_t& tab_key) {
-  svbool_t pg = svptrue_b64();
-  // Compute byte offsets = h * sizeof(KeyValue) = h * 16
-  svuint64_t offset = svlsl_n_u64_z(pg, h, 4); // 2^4 = 16
-  tab_key = svld1_gather_u64offset_u64(
-      pg, reinterpret_cast<uint64_t*>(&table[0].value), offset);
-}
-
-inline __attribute__((always_inline)) svbool_t
-get_uniq_mask(svbool_t pg, svuint64_t val) {
-  svuint64_t count;
-  uint64_t vals[LANE_COUNT];
-  svst1(pg, vals, val);
-  uint64_t counts[LANE_COUNT] = {1, 1, 1, 1};
-  std::unordered_set<int> unique_counts;
-
-  for (int i = 0; i < LANE_COUNT; i++) {
-    if (counts[i] == 0) {
-      continue;
-    }
-    for (int j = i + 1; j < LANE_COUNT; j++) {
-      if (vals[j] == vals[i]) {
-        // counts[i]++;
-        // unique_counts.emplace(j);
-        counts[j] = 0;
-      }
-    }
-  }
-  count = svld1(pg, counts);
-  svbool_t mask = svcmpgt_n_u64(pg, count, 0);
-
-  return mask;
-}
-
 inline __attribute__((always_inline)) svbool_t
 get_uniq_mask2(svbool_t pg, const svuint64_t val) {
   svuint64_t s1 = svext_u64(val, val, 1);
@@ -1253,29 +1235,6 @@ get_uniq_mask2(svbool_t pg, const svuint64_t val) {
   svbool_t mask4 = svcmpeq(svwhilelt_b64(0, 1), val, s3);
 
   svbool_t mask = svorr_b_z(pg, mask4, mask12);
-  mask = svnot_b_z(pg, mask);
-
-  return mask;
-}
-
-inline __attribute__((always_inline)) svbool_t
-get_uniq_mask3(svbool_t pg, svuint64_t val) { // TODO没有完全成立
-
-  svbool_t mask1 = svpfalse();
-  svuint8_t val_8 = svreinterpret_u8_u64(val);
-
-  svuint8_t s1 = svext_u8(val_8, val_8, 8);
-  svbool_t mask2 = svcmpeq(svwhilelt_b64(0, 4), val, svreinterpret_u64_u8(s1));
-
-  svuint8_t s2 = svext_u8(val_8, val_8, 16);
-  svbool_t mask3 = svcmpeq(svwhilelt_b64(0, 2), val, svreinterpret_u64_u8(s2));
-
-  auto s3 = svrev_b64(mask2);
-  svbool_t mask4 = svand_b_z(svwhilelt_b64(0, 1), svwhilelt_b64(0, 1), s3);
-
-  svbool_t mask11 = svorr_b_z(pg, mask1, mask2);
-  svbool_t mask12 = svorr_b_z(pg, mask3, mask4);
-  svbool_t mask = svorr_b_z(pg, mask11, mask12);
   mask = svnot_b_z(pg, mask);
 
   return mask;
@@ -1803,69 +1762,7 @@ void HashTable<ignoreNullKeys>::groupProbe(
 }
 
 template <bool ignoreNullKeys>
-void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeScalar(
-    HashLookup& lookup) {
-  // TODO scalar2
-  // TODO 暂时不管ignoreNullKeys
-
-  VELOX_DCHECK(!lookup.hashes.empty());
-  VELOX_DCHECK(!lookup.hits.empty());
-
-  int32_t numProbes = lookup.rows.size();
-  const vector_size_t* rows = lookup.rows.data();
-  auto hashes = lookup.hashes.data();
-  auto groups = lookup.hits.data();
-  int32_t i = 0;
-
-  auto* table = reinterpret_cast<sveht::KeyValue*>(table_);
-
-  for (; i < numProbes; ++i) {
-    // sveht::build_scalar(build_keys.data(),build_values.data(),build_keys.size(),p,table.data());
-    // int ret = build_single_key(build_keys[i], build_values[i], p, table);
-
-    auto row = rows[i];
-    uint64_t index = hashes[row] & (capacity_ - 1);
-    // VELOX_DCHECK_LT(index, capacity_);
-
-    // 标量线性探测：
-    uint64_t start = index;
-    while (true) {
-      char* group = table[index].value;
-      if (UNLIKELY(!table[index].value)) { // 空桶标记 用char*空指针来判断 TODO
-                                           // scalar2 unlikely?
-        group = insertEntry(
-            lookup, index, row); // key来自lookup&hasher->decodedVector()&row
-        break;
-      }
-      // if (RowContainer::normalizedKey(group) == lookup.normalizedKeys[row]) {
-      // // 直接比较normalizedKey
-      if (table[index].key ==
-          lookup.normalizedKeys
-              [row]) { // 直接比较normalizedKey，而且直接从table里取出来，而不是从group里
-        groups[row] = group; // NOLINT
-        break;
-      }
-      index = (index + 1) & (capacity_ - 1); // 线性探测
-      if (index == start) {
-        VELOX_FAIL(
-            "Have looped through all the buckets in table: {}",
-            (*this).toString());
-        LOG(ERROR) << "Have looped through all the buckets in table: {}",
-            (*this).toString();
-      }
-    }
-  }
-}
-
-template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::groupNormalizedKeyProbe(HashLookup& lookup) {
-  if (normalizedKeyMode_ == NormalizedKeyMode::scalar) {
-    // TODO scalar2
-
-    groupNormalizedKeyProbeScalar(lookup);
-    return;
-  }
-
   if (normalizedKeyMode_ == NormalizedKeyMode::sve) {
     groupNormalizedKeyProbeSVE(lookup);
     return;
@@ -2077,18 +1974,13 @@ void HashTable<ignoreNullKeys>::joinNormalizedKeyProbe(HashLookup& lookup) {
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::allocateTables(
     uint64_t size,
-    int8_t spillInputStartPartitionBit) { // TODO scala2 NOTE this function is
-                                          // used by both HashAgg and HashJoin
+    int8_t spillInputStartPartitionBit) {
   VELOX_CHECK(bits::isPowerOfTwo(size), "Size is not a power of two: {}", size);
   VELOX_CHECK_GT(size, 0);
   capacity_ = size;
-  size_t slotSize; // TODO scalar2
+  size_t slotSize;
   if (hashMode_ == HashMode::kNormalizedKey &&
-      normalizedKeyMode_ == NormalizedKeyMode::scalar && !isJoinBuild_) {
-    slotSize = 16; // 8-byte normalizedKey + 8-byte group ptr
-  } else if (
-      hashMode_ == HashMode::kNormalizedKey &&
-      normalizedKeyMode_ == NormalizedKeyMode::sve && !isJoinBuild_) {
+      normalizedKeyMode_ == NormalizedKeyMode::sve) {
     slotSize = 17;
   } else {
     slotSize =
@@ -2121,11 +2013,7 @@ void HashTable<ignoreNullKeys>::clear(bool freeTable) {
     if (!freeTable) {
       // All modes have 8 bytes per slot.
       if (hashMode_ == HashMode::kNormalizedKey &&
-          normalizedKeyMode_ == NormalizedKeyMode::scalar && !isJoinBuild_) {
-        ::memset(table_, 0, capacity_ * 16);
-      } else if (
-          hashMode_ == HashMode::kNormalizedKey &&
-          normalizedKeyMode_ == NormalizedKeyMode::sve && !isJoinBuild_) {
+          normalizedKeyMode_ == NormalizedKeyMode::sve) {
         ::memset(table_, 0, capacity_ * 17);
       } else {
         ::memset(table_, 0, capacity_ * sizeof(char*));
@@ -2530,33 +2418,6 @@ void HashTable<ignoreNullKeys>::insertForGroupBy(
       VELOX_CHECK_LT(index, capacity_);
       VELOX_CHECK_NULL(table_[index]);
       table_[index] = groups[i];
-    }
-  } else if (
-      hashMode_ == HashMode::kNormalizedKey &&
-      normalizedKeyMode_ == NormalizedKeyMode::scalar) {
-    // 假设不会二次切换哈希模式，即哈希表里没有旧数据要迁移(numDistinct_=0)，假设不需要扩容的假设，于是此处暂时scalar实现，未来再向量化
-    auto* table = reinterpret_cast<sveht::KeyValue*>(table_);
-    for (auto i = 0; i < numGroups; ++i) {
-      uint64_t index = hashes[i] & (capacity_ - 1);
-      uint64_t start = index;
-      while (true) {
-        char* group = table[index].value;
-        if (UNLIKELY(!table[index].value)) { // 空桶插入
-          // NOTE 现在空指针就可以判断空桶，不需要initialize empty table
-          // NOTE
-          // 此处不必线性探测对非空桶判断是否键相等，因为此处是把旧表数据迁移到新表，而旧的哈希表里的分组都是unique的，因此这里只需要为每个分组数据找到空桶插入即可。
-          table[index].key = reinterpret_cast<normalized_key_t*>(
-              groups[i])[-1]; // 从group -1位置取出normalizedKey放到hash table里
-          table[index].value = groups[i];
-          break;
-        }
-        index = (index + 1) & (capacity_ - 1); // linear probing
-        if (index == start) {
-          VELOX_FAIL(
-              "Have looped through all the buckets in table: {}",
-              (*this).toString());
-        }
-      }
     }
   } else if (
       hashMode_ == HashMode::kNormalizedKey &&
