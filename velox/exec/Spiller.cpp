@@ -22,6 +22,7 @@
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/HashJoinBridge.h"
 #include "velox/exec/PrefixSort.h"
+#include "velox/exec/SpillRadixSort.h"
 #include "velox/external/timsort/TimSort.hpp"
 
 using facebook::velox::common::testutil::TestValue;
@@ -249,7 +250,15 @@ void SpillerBase::ensureSorted(SpillRun& run) {
   {
     NanosecondTimer timer(&sortTimeNs);
 
-    if (!state_.prefixSortConfig().has_value()) {
+    if (SpillRadixSort::canSort(
+            container_, state_.sortCompareFlags(), run.rows.size())) {
+      SpillRadixSort::sort(
+          container_,
+          state_.sortCompareFlags(),
+          SpillRadixSortConfig{},
+          memory::spillMemoryPool(),
+          run.rows);
+    } else if (!state_.prefixSortConfig().has_value()) {
       gfx::timsort(
           run.rows.begin(),
           run.rows.end(),
