@@ -23,6 +23,8 @@
 #include "velox/functions/lib/aggregates/SimpleNumericAggregate.h"
 #include "velox/functions/lib/aggregates/SingleValueAccumulator.h"
 #include "velox/type/FloatingPointUtil.h"
+#include "velox/vector/DecodedVector.h"
+#include "velox/vector/VectorEncoding.h"
 
 namespace facebook::velox::functions::aggregate {
 
@@ -186,10 +188,161 @@ class SimpleNumericMaxAggregate : public SimpleNumericMinMaxAggregate<T> {
   static const T kInitialValue_;
 };
 
+// max(bigint): micro-tuning for int64_t only (see standalone max_int64 benchmark).
+// - Ternary-style max on the hot compare.
+// - When input is flat int64, decoded has no nulls, identity mapping, and all
+// batch rows are selected, use a 4x unrolled update loop.
+template <bool IsMin>
+class SimpleNumericInt64Aggregate : public SimpleNumericMinMaxAggregate<int64_t> {
+    using BaseAggregate = SimpleNumericAggregate<int64_t, int64_t, int64_t>;
+
+public:
+    explicit SimpleNumericInt64Aggregate(TypePtr resultType,
+                                         TimestampPrecision precision = TimestampPrecision::kMilliseconds)
+        : SimpleNumericMinMaxAggregate<int64_t>(resultType, precision)
+    {
+    }
+
+    void addRawInput(char **groups, const SelectivityVector &rows, const std::vector<VectorPtr> &args,
+                     bool mayPushdown) override
+    {
+        if constexpr (BaseAggregate::template kMayPushdown<int64_t>) {
+            if (!args[0]->type()->isDecimal()) {
+                if (mayPushdown && args[0]->isLazy()) {
+                    BaseAggregate::template pushdown<velox::aggregate::MinMaxHook<int64_t, IsMin>>(groups, rows,
+                                                                                                   args[0]);
+                    return;
+                }
+            } else {
+                mayPushdown = false;
+            }
+        } else {
+            mayPushdown = false;
+        }
+
+        DecodedVector decoded(*args[0], rows, !mayPushdown);
+        const auto encoding = decoded.base()->encoding();
+        if constexpr (BaseAggregate::template kMayPushdown<int64_t>) {
+            if (encoding == VectorEncoding::Simple::LAZY && !args[0]->type()->isDecimal()) {
+                BaseAggregate::template pushdown<velox::aggregate::MinMaxHook<int64_t, IsMin>>(groups, rows, args[0]);
+                return;
+            }
+        }
+
+        if (decoded.isConstantMapping()) {
+            if (!decoded.isNullAt(0)) {
+                const auto value = decoded.valueAt<int64_t>(0);
+                rows.applyToSelected([&](vector_size_t row) { updateNonNullGroup(groups[row], value); });
+            }
+            return;
+        }
+
+        if (decoded.mayHaveNulls()) {
+            rows.applyToSelected([&](vector_size_t row) {
+                if (decoded.isNullAt(row)) {
+                    return;
+                }
+                updateNonNullGroup(groups[row], decoded.valueAt<int64_t>(row));
+            });
+            return;
+        }
+
+        if (decoded.isIdentityMapping()) {
+            const int64_t *data = decoded.data<int64_t>();
+            if (rows.isAllSelected()) {
+                const vector_size_t begin = rows.begin();
+                const vector_size_t end = rows.end();
+                vector_size_t row = begin;
+                const vector_size_t n = end - begin;
+                const vector_size_t unrollEnd = begin + (n & ~static_cast<vector_size_t>(3));
+                for (; row < unrollEnd; row += 4) {
+                    updateNonNullGroup(groups[row], data[row]);
+                    updateNonNullGroup(groups[row + 1], data[row + 1]);
+                    updateNonNullGroup(groups[row + 2], data[row + 2]);
+                    updateNonNullGroup(groups[row + 3], data[row + 3]);
+                }
+                for (; row < end; ++row) {
+                    updateNonNullGroup(groups[row], data[row]);
+                }
+                return;
+            }
+            rows.applyToSelected([&](vector_size_t row) { updateNonNullGroup(groups[row], data[row]); });
+            return;
+        }
+
+        rows.applyToSelected(
+            [&](vector_size_t row) { updateNonNullGroup(groups[row], decoded.valueAt<int64_t>(row)); });
+    }
+
+    void addIntermediateResults(char **groups, const SelectivityVector &rows, const std::vector<VectorPtr> &args,
+                                bool mayPushdown) override
+    {
+        addRawInput(groups, rows, args, mayPushdown);
+    }
+
+    void addSingleGroupRawInput(char *group, const SelectivityVector &rows, const std::vector<VectorPtr> &args,
+                                bool mayPushdown) override
+    {
+        BaseAggregate::updateOneGroup(
+            group, rows, args[0], updateGroup, [](int64_t &result, int64_t value, int /* unused */) { result = value; },
+            mayPushdown, kInitialValue_);
+    }
+
+    void addSingleGroupIntermediateResults(char *group, const SelectivityVector &rows,
+                                           const std::vector<VectorPtr> &args, bool mayPushdown) override
+    {
+        addSingleGroupRawInput(group, rows, args, mayPushdown);
+    }
+
+protected:
+    void initializeNewGroupsInternal(char **groups, folly::Range<const vector_size_t *> indices) override
+    {
+        this->setAllNulls(groups, indices);
+        for (auto i : indices) {
+            *this->template value<int64_t>(groups[i]) = kInitialValue_;
+        }
+    }
+
+    static inline void updateGroup(int64_t &result, int64_t value)
+    {
+        if constexpr (IsMin) {
+            result = result <= value ? result : value;
+        } else {
+            result = result >= value ? result : value;
+        }
+    }
+
+private:
+    static const int64_t kInitialValue_;
+
+    inline void updateNonNullGroup(char *group, int64_t value)
+    {
+        this->clearNull(group);
+        int64_t *acc = this->template value<int64_t>(group);
+        const int64_t x = *acc;
+        if constexpr (IsMin) {
+            *acc = x <= value ? x : value;
+        } else {
+            *acc = x >= value ? x : value;
+        }
+    }
+};
+
+template <>
+const int64_t SimpleNumericInt64Aggregate<false>::kInitialValue_ = MinMaxTrait<int64_t>::lowest();
+
+template <>
+const int64_t SimpleNumericInt64Aggregate<true>::kInitialValue_ = MinMaxTrait<int64_t>::max();
+
+template <>
+class SimpleNumericMaxAggregate<int64_t> : public SimpleNumericInt64Aggregate<false> {
+public:
+    using SimpleNumericInt64Aggregate<false>::SimpleNumericInt64Aggregate;
+};
+
 template <typename T>
 const T SimpleNumericMaxAggregate<T>::kInitialValue_ = MinMaxTrait<T>::lowest();
 
-// Negative INF is the smallest value of floating point type.
 template <>
 const float SimpleNumericMaxAggregate<float>::kInitialValue_ =
     -1 * MinMaxTrait<float>::infinity();
@@ -285,6 +438,12 @@ class SimpleNumericMinAggregate : public SimpleNumericMinMaxAggregate<T> {
 
  private:
   static const T kInitialValue_;
+};
+
+template <>
+class SimpleNumericMinAggregate<int64_t> : public SimpleNumericInt64Aggregate<true> {
+public:
+    using SimpleNumericInt64Aggregate<true>::SimpleNumericInt64Aggregate;
 };
 
 template <typename T>
