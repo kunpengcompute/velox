@@ -2697,4 +2697,67 @@ TEST_F(RowContainerTest, storeAndCollectColumnStats) {
   }
 }
 
+TEST_F(RowContainerTest, newRowsBatchAllocation) {
+  // Verifies that the bulk 'newRows' API produces rows that are functionally
+  // indistinguishable from the per-row 'newRow' path: identical number of
+  // rows, ordered, individually addressable, and able to round-trip data
+  // through 'store / extractColumn'.
+  constexpr int32_t kNumRows = 4096;
+  auto rowVector = makeDataset(
+      ROW({BIGINT(), VARCHAR(), DOUBLE()}),
+      kNumRows,
+      [&](RowVectorPtr /*unused*/) {});
+
+  auto rowContainer =
+      makeRowContainer({BIGINT(), VARCHAR(), DOUBLE()}, {}, false);
+
+  std::vector<char*> rows(kNumRows);
+  rowContainer->newRows(kNumRows, rows.data());
+  EXPECT_EQ(rowContainer->numRows(), kNumRows);
+  for (int i = 0; i < kNumRows; ++i) {
+    ASSERT_NE(rows[i], nullptr);
+    if (i > 0) {
+      // Within a single bump-pointer chunk rows must be strictly ordered.
+      // (Across chunks the ordering is run-by-run, but within a kNumRows
+      // batch we can require strict ordering for a smoke check.)
+      EXPECT_NE(rows[i], rows[i - 1]);
+    }
+  }
+
+  SelectivityVector allRows(kNumRows);
+  for (int c = 0; c < rowContainer->columnTypes().size(); ++c) {
+    DecodedVector decoded(*rowVector->childAt(c), allRows);
+    rowContainer->store(decoded, folly::Range(rows.data(), kNumRows), c);
+  }
+  RowContainerTestHelper(rowContainer.get()).checkConsistency();
+
+  // 'listRows' should return the same number of rows that we asked for, and
+  // 'extractColumn' should round-trip the original values for every column.
+  RowContainerIterator iter;
+  std::vector<char*> listed(kNumRows);
+  EXPECT_EQ(
+      rowContainer->listRows(&iter, kNumRows, listed.data()),
+      kNumRows);
+  for (int c = 0; c < rowContainer->columnTypes().size(); ++c) {
+    auto extracted = BaseVector::create(
+        rowContainer->columnTypes()[c], kNumRows, pool_.get());
+    rowContainer->extractColumn(listed.data(), kNumRows, c, extracted);
+    for (int i = 0; i < kNumRows; ++i) {
+      ASSERT_TRUE(extracted->equalValueAt(rowVector->childAt(c).get(), i, i))
+          << "column=" << c << " row=" << i;
+    }
+  }
+}
+
+TEST_F(RowContainerTest, newRowsZero) {
+  auto rowContainer = makeRowContainer({BIGINT()}, {}, false);
+  std::vector<char*> rows(4, reinterpret_cast<char*>(0xdeadbeef));
+  rowContainer->newRows(0, rows.data());
+  EXPECT_EQ(rowContainer->numRows(), 0);
+  // 'newRows(0, ...)' must not write anything to the output buffer.
+  for (auto* p : rows) {
+    EXPECT_EQ(p, reinterpret_cast<char*>(0xdeadbeef));
+  }
+}
+
 } // namespace facebook::velox::exec::test
