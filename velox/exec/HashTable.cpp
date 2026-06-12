@@ -39,6 +39,10 @@
 #include <cstdlib>
 #include <string>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 using facebook::velox::common::testutil::TestValue;
 
 namespace {
@@ -696,27 +700,6 @@ constexpr int32_t kXXHashInlineBufSize = 256;
 constexpr int32_t kXXHashTargetChunkBytes = 32 * 1024;
 constexpr uint64_t kNullColumnHash = 0;
 
-// Resolve base-vector index and null flag from pre-resolved column metadata.
-inline void resolveIndexAndNull(
-    const XXHashColumnInfo& col,
-    vector_size_t row,
-    vector_size_t& idx,
-    bool& isNull) {
-  if (col.isConstant) {
-    idx = col.constantIndex;
-    isNull = col.constantIsNull;
-  } else {
-    idx = col.indices ? col.indices[row] : row;
-    if (col.nullMode == 0) {
-      isNull = false;
-    } else if (col.nullMode == 1) {
-      isNull = bits::isBitNull(col.nulls, row);
-    } else {
-      isNull = bits::isBitNull(col.nulls, idx);
-    }
-  }
-}
-
 struct XXHashColumnBuildResult {
   std::vector<XXHashColumnInfo> cols;
   bool allFixedIdentity;
@@ -820,6 +803,52 @@ inline void fillChunkColumnIdentity(
       }
     }
   } else {
+#if defined(__ARM_NEON)
+    // NEON (AArch32): batch 4 rows for elemSize=4 (INT32) / elemSize=8 (BIGINT)
+    if ((elemSize == 4 || elemSize == 8) && chunkSize >= 8) {
+      int32_t i = 0;
+      const auto* sel = &selected[chunkStart];
+      if (elemSize == 4) {
+        for (; i + 3 < chunkSize; i += 4) {
+          int32x4_t rows = vld1q_s32(sel + i);
+          int32x4_t offsets = vshlq_n_s32(rows, 2);
+          int32_t src[4];
+          src[0] = *reinterpret_cast<const int32_t*>(data + vgetq_lane_s32(offsets, 0));
+          src[1] = *reinterpret_cast<const int32_t*>(data + vgetq_lane_s32(offsets, 1));
+          src[2] = *reinterpret_cast<const int32_t*>(data + vgetq_lane_s32(offsets, 2));
+          src[3] = *reinterpret_cast<const int32_t*>(data + vgetq_lane_s32(offsets, 3));
+          for (int32_t j = 0; j < 4; ++j) {
+            char* dst = chunkBuf + (i + j) * totalRowSize + colOffset;
+            dst[0] = 1;
+            *reinterpret_cast<int32_t*>(dst + 1) = src[j];
+          }
+        }
+      } else {
+        // elemSize == 8
+        for (; i + 3 < chunkSize; i += 4) {
+          int32x4_t rows = vld1q_s32(sel + i);
+          int32x4_t offsets = vshlq_n_s32(rows, 3);
+          int64_t src[4];
+          src[0] = *reinterpret_cast<const int64_t*>(data + vgetq_lane_s32(offsets, 0));
+          src[1] = *reinterpret_cast<const int64_t*>(data + vgetq_lane_s32(offsets, 1));
+          src[2] = *reinterpret_cast<const int64_t*>(data + vgetq_lane_s32(offsets, 2));
+          src[3] = *reinterpret_cast<const int64_t*>(data + vgetq_lane_s32(offsets, 3));
+          for (int32_t j = 0; j < 4; ++j) {
+            char* dst = chunkBuf + (i + j) * totalRowSize + colOffset;
+            dst[0] = 1;
+            *reinterpret_cast<int64_t*>(dst + 1) = src[j];
+          }
+        }
+      }
+      for (; i < chunkSize; ++i) {
+        auto row = sel[i];
+        char* dst = chunkBuf + i * totalRowSize + colOffset;
+        dst[0] = 1;
+        memcpy(dst + 1, data + static_cast<int64_t>(row) * elemSize, elemSize);
+      }
+      return;
+    }
+#endif
     for (int32_t i = 0; i < chunkSize; ++i) {
       auto row = selected[chunkStart + i];
       char* dst = chunkBuf + i * totalRowSize + colOffset;
@@ -866,15 +895,74 @@ inline void fillChunkColumnAnyMapping(
   const vector_size_t* indices = col.indices;
 
   if (col.nullMode == 0) {
-    for (int32_t i = 0; i < chunkSize; ++i) {
-      auto row = selected[chunkStart + i];
-      auto idx = indices ? indices[row] : row;
-      char* dst = chunkBuf + i * totalRowSize + colOffset;
-      dst[0] = 1;
-      memcpy(
-          dst + 1,
-          data + static_cast<int64_t>(idx) * elemSize,
-          elemSize);
+    if (indices == nullptr) {
+      // Identity mapping, no nulls.
+#if defined(__ARM_NEON)
+      if ((elemSize == 4 || elemSize == 8) && chunkSize >= 8) {
+        int32_t i = 0;
+        const auto* sel = &selected[chunkStart];
+        if (elemSize == 4) {
+          for (; i + 3 < chunkSize; i += 4) {
+            int32x4_t rows = vld1q_s32(sel + i);
+            int32x4_t offsets = vshlq_n_s32(rows, 2);
+            int32_t src[4];
+            src[0] = *reinterpret_cast<const int32_t*>(data + vgetq_lane_s32(offsets, 0));
+            src[1] = *reinterpret_cast<const int32_t*>(data + vgetq_lane_s32(offsets, 1));
+            src[2] = *reinterpret_cast<const int32_t*>(data + vgetq_lane_s32(offsets, 2));
+            src[3] = *reinterpret_cast<const int32_t*>(data + vgetq_lane_s32(offsets, 3));
+            for (int32_t j = 0; j < 4; ++j) {
+              char* dst = chunkBuf + (i + j) * totalRowSize + colOffset;
+              dst[0] = 1;
+              *reinterpret_cast<int32_t*>(dst + 1) = src[j];
+            }
+          }
+        } else {
+          // elemSize == 8
+          for (; i + 3 < chunkSize; i += 4) {
+            int32x4_t rows = vld1q_s32(sel + i);
+            int32x4_t offsets = vshlq_n_s32(rows, 3);
+            int64_t src[4];
+            src[0] = *reinterpret_cast<const int64_t*>(data + vgetq_lane_s32(offsets, 0));
+            src[1] = *reinterpret_cast<const int64_t*>(data + vgetq_lane_s32(offsets, 1));
+            src[2] = *reinterpret_cast<const int64_t*>(data + vgetq_lane_s32(offsets, 2));
+            src[3] = *reinterpret_cast<const int64_t*>(data + vgetq_lane_s32(offsets, 3));
+            for (int32_t j = 0; j < 4; ++j) {
+              char* dst = chunkBuf + (i + j) * totalRowSize + colOffset;
+              dst[0] = 1;
+              *reinterpret_cast<int64_t*>(dst + 1) = src[j];
+            }
+          }
+        }
+        for (; i < chunkSize; ++i) {
+          auto row = sel[i];
+          char* dst = chunkBuf + i * totalRowSize + colOffset;
+          dst[0] = 1;
+          memcpy(dst + 1, data + static_cast<int64_t>(row) * elemSize, elemSize);
+        }
+        return;
+      }
+#endif
+      for (int32_t i = 0; i < chunkSize; ++i) {
+        auto row = selected[chunkStart + i];
+        char* dst = chunkBuf + i * totalRowSize + colOffset;
+        dst[0] = 1;
+        memcpy(
+            dst + 1,
+            data + static_cast<int64_t>(row) * elemSize,
+            elemSize);
+      }
+    } else {
+      // Dictionary mapping, no nulls.
+      for (int32_t i = 0; i < chunkSize; ++i) {
+        auto row = selected[chunkStart + i];
+        auto idx = indices[row];
+        char* dst = chunkBuf + i * totalRowSize + colOffset;
+        dst[0] = 1;
+        memcpy(
+            dst + 1,
+            data + static_cast<int64_t>(idx) * elemSize,
+            elemSize);
+      }
     }
   } else if (col.nullMode == 1) {
     const uint64_t* nullBits = col.nulls;
@@ -1016,29 +1104,6 @@ void xxhashAllFixedAnyMapping(
   }
 }
 
-// Compute per-column hash for one column value from a decoded vector.
-inline uint64_t computeColumnHash(
-    const XXHashColumnInfo& col,
-    vector_size_t row) {
-  vector_size_t idx;
-  bool isNull;
-  resolveIndexAndNull(col, row, idx, isNull);
-
-  if (UNLIKELY(isNull)) {
-    return kNullColumnHash;
-  }
-  if (col.colType == 0) {
-    return XXH3_64bits(
-        col.rawData + static_cast<int64_t>(idx) * col.elementSize,
-        col.elementSize);
-  }
-  if (col.colType == 2) {
-    return col.decoded->base()->hashValueAt(idx);
-  }
-  auto sv = reinterpret_cast<const StringView*>(col.rawData)[idx];
-  return XXH3_64bits(sv.data(), sv.size());
-}
-
 // General path for mixed column types.
 // Per-column hash + combine: each column is hashed independently in a
 // column-major pass (one column's data accessed sequentially), then the
@@ -1061,20 +1126,175 @@ void xxhashMixedColumns(
       std::max(1, (kXXHashTargetChunkBytes / 2) / (numCols * 8));
   chunkRows = std::min(chunkRows, 1024);
 
-  // perColHashes layout: [row0_col0, row0_col1, ..., row1_col0, ...]
   raw_vector<uint64_t> perColHashes(chunkRows * numCols);
+
+  // Per-chunk scratch: pre-resolved indices + null flags for one column.
+  // Max chunkRows = 1024, fits in stack comfortably.
+  raw_vector<vector_size_t> preIdx(chunkRows);
+  raw_vector<uint8_t> preNull(chunkRows);
 
   for (vector_size_t chunkStart = 0; chunkStart < numSelected;
        chunkStart += chunkRows) {
     int32_t chunkSize =
         std::min<int32_t>(chunkRows, numSelected - chunkStart);
+    const vector_size_t* const chunkRowsPtr = selected.data() + chunkStart;
 
-    // Phase 1: column-major — compute per-column hash for all rows.
+    // Phase 1: column-major — per-column type-specialized batch hash.
     for (int32_t c = 0; c < numCols; ++c) {
       auto& col = cols[c];
-      for (int32_t i = 0; i < chunkSize; ++i) {
-        auto row = selected[chunkStart + i];
-        perColHashes[i * numCols + c] = computeColumnHash(col, row);
+      auto* out = &perColHashes[c]; // stride = numCols between elements
+
+      if (col.isConstant) {
+        // Constant column: all rows get the same hash.
+        uint64_t constHash = col.constantIsNull ? kNullColumnHash
+            : (col.colType == 0
+                   ? XXH3_64bits(
+                         col.rawData +
+                             static_cast<int64_t>(col.constantIndex) *
+                                 col.elementSize,
+                         col.elementSize)
+                   : (col.colType == 2
+                          ? col.decoded->base()->hashValueAt(col.constantIndex)
+                          : XXH3_64bits(
+                                reinterpret_cast<const StringView*>(
+                                    col.rawData)[col.constantIndex]
+                                    .data(),
+                                reinterpret_cast<const StringView*>(
+                                    col.rawData)[col.constantIndex]
+                                    .size())));
+        for (int32_t i = 0; i < chunkSize; ++i) {
+          out[i * numCols] = constHash;
+        }
+        continue;
+      }
+
+      // Pre-resolve indices and null flags for this column.
+      if (col.indices == nullptr) {
+        // Identity mapping: idx = row, no index lookup needed.
+        if (col.nullMode == 0) {
+          // No nulls: dense loop, zero branches.
+          if (col.colType == 0) {
+            for (int32_t i = 0; i < chunkSize; ++i) {
+              out[i * numCols] = XXH3_64bits(
+                  col.rawData +
+                      static_cast<int64_t>(chunkRowsPtr[i]) * col.elementSize,
+                  col.elementSize);
+            }
+          } else if (col.colType == 2) {
+            auto* base = col.decoded->base();
+            for (int32_t i = 0; i < chunkSize; ++i) {
+              out[i * numCols] = base->hashValueAt(chunkRowsPtr[i]);
+            }
+          } else {
+            // Var-length, identity, no nulls.
+            auto* strViews = reinterpret_cast<const StringView*>(col.rawData);
+            for (int32_t i = 0; i < chunkSize; ++i) {
+              auto& sv = strViews[chunkRowsPtr[i]];
+              out[i * numCols] = XXH3_64bits(sv.data(), sv.size());
+            }
+          }
+        } else {
+          // Identity with nulls: fixed-width can branch, others pre-extract.
+          if (col.colType == 0) {
+            for (int32_t i = 0; i < chunkSize; ++i) {
+              auto r = chunkRowsPtr[i];
+              if (bits::isBitNull(col.nulls, r)) {
+                out[i * numCols] = kNullColumnHash;
+              } else {
+                out[i * numCols] = XXH3_64bits(
+                    col.rawData + static_cast<int64_t>(r) * col.elementSize,
+                    col.elementSize);
+              }
+            }
+          } else {
+            // Pre-extract nulls + rows for dense var-length/complex loop.
+            for (int32_t i = 0; i < chunkSize; ++i) {
+              auto r = chunkRowsPtr[i];
+              preIdx[i] = r;
+              preNull[i] = bits::isBitNull(col.nulls, r);
+            }
+            if (col.colType == 2) {
+              auto* base = col.decoded->base();
+              for (int32_t i = 0; i < chunkSize; ++i) {
+                out[i * numCols] = preNull[i]
+                    ? kNullColumnHash
+                    : base->hashValueAt(preIdx[i]);
+              }
+            } else {
+              auto* strViews = reinterpret_cast<const StringView*>(col.rawData);
+              for (int32_t i = 0; i < chunkSize; ++i) {
+                if (preNull[i]) {
+                  out[i * numCols] = kNullColumnHash;
+                } else {
+                  auto& sv = strViews[preIdx[i]];
+                  out[i * numCols] = XXH3_64bits(sv.data(), sv.size());
+                }
+              }
+            }
+          }
+        }
+      } else {
+        // Non-identity (dictionary) mapping: need indices array.
+        if (col.nullMode == 0) {
+          // No nulls.
+          for (int32_t i = 0; i < chunkSize; ++i) {
+            preIdx[i] = col.indices[chunkRowsPtr[i]];
+          }
+          if (col.colType == 0) {
+            for (int32_t i = 0; i < chunkSize; ++i) {
+              out[i * numCols] = XXH3_64bits(
+                  col.rawData + static_cast<int64_t>(preIdx[i]) * col.elementSize,
+                  col.elementSize);
+            }
+          } else if (col.colType == 2) {
+            auto* base = col.decoded->base();
+            for (int32_t i = 0; i < chunkSize; ++i) {
+              out[i * numCols] = base->hashValueAt(preIdx[i]);
+            }
+          } else {
+            auto* strViews = reinterpret_cast<const StringView*>(col.rawData);
+            for (int32_t i = 0; i < chunkSize; ++i) {
+              auto& sv = strViews[preIdx[i]];
+              out[i * numCols] = XXH3_64bits(sv.data(), sv.size());
+            }
+          }
+        } else {
+          // Non-identity with nulls: pre-resolve both index and null flag.
+          int32_t mode = col.nullMode;
+          for (int32_t i = 0; i < chunkSize; ++i) {
+            auto r = chunkRowsPtr[i];
+            preIdx[i] = col.indices[r];
+            preNull[i] = (mode == 1) ? bits::isBitNull(col.nulls, r)
+                                     : bits::isBitNull(col.nulls, preIdx[i]);
+          }
+          if (col.colType == 0) {
+            for (int32_t i = 0; i < chunkSize; ++i) {
+              out[i * numCols] = preNull[i]
+                  ? kNullColumnHash
+                  : XXH3_64bits(
+                        col.rawData +
+                            static_cast<int64_t>(preIdx[i]) * col.elementSize,
+                        col.elementSize);
+            }
+          } else if (col.colType == 2) {
+            auto* base = col.decoded->base();
+            for (int32_t i = 0; i < chunkSize; ++i) {
+              out[i * numCols] = preNull[i]
+                  ? kNullColumnHash
+                  : base->hashValueAt(preIdx[i]);
+            }
+          } else {
+            auto* strViews = reinterpret_cast<const StringView*>(col.rawData);
+            for (int32_t i = 0; i < chunkSize; ++i) {
+              if (preNull[i]) {
+                out[i * numCols] = kNullColumnHash;
+              } else {
+                auto& sv = strViews[preIdx[i]];
+                out[i * numCols] = XXH3_64bits(sv.data(), sv.size());
+              }
+            }
+          }
+        }
       }
     }
 
