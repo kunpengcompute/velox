@@ -21,14 +21,31 @@ namespace facebook::velox {
 CpuWallTimer::CpuWallTimer(CpuWallTiming& timing) : timing_(timing) {
   ++timing_.count;
   cpuTimeStart_ = process::threadCpuNanos();
+#if defined(__aarch64__)
+  uint64_t currentClock;
+  uint64_t currentFrq;
+  asm volatile("mrs %0, cntvct_el0" : "=r" (currentClock));
+  asm volatile("mrs %0, cntfrq_el0" : "=r" (currentFrq));
+  wallTimeStart_ = ((currentClock * 1000000000ULL ) / currentFrq);
+#else
   wallTimeStart_ = std::chrono::steady_clock::now();
+#endif
 }
 
 CpuWallTimer::~CpuWallTimer() {
   timing_.cpuNanos += process::threadCpuNanos() - cpuTimeStart_;
+#if defined(__aarch64__)
+  uint64_t currentClock;
+  uint64_t currentFrq;
+  asm volatile("mrs %0, cntvct_el0" : "=r" (currentClock));
+  asm volatile("mrs %0, cntfrq_el0" : "=r" (currentFrq));
+  uint64_t duration = ((currentClock * 1000000000ULL ) / currentFrq) - wallTimeStart_;
+  timing_.wallNanos += duration;
+#else
   auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now() - wallTimeStart_);
   timing_.wallNanos += duration.count();
+#endif
 }
 
 } // namespace facebook::velox
