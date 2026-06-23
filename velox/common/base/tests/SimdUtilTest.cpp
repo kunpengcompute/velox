@@ -191,6 +191,31 @@ TEST_F(SimdUtilTest, gather64) {
   auto bits = simd::toBitMask(result == resultMask);
   // Low kBatchSize - 1 lanes are the same.
   EXPECT_EQ((1 << (kBatchSize - 1)) - 1, bits);
+
+  double doubleData[4] = {1.25, 2.5, 3.75, 5.0};
+  auto indexBatch = simd::loadGatherIndices<double>(indices);
+  auto doubleMaskResult = simd::maskGather(
+      xsimd::batch<double>::broadcast(-1),
+      simd::leadingMask<double>(kBatchSize - 1),
+      doubleData,
+      indexBatch);
+  for (auto i = 0; i < kBatchSize - 1; ++i) {
+    EXPECT_EQ(doubleMaskResult.get(i), doubleData[indices[i]]);
+  }
+  EXPECT_EQ(doubleMaskResult.get(kBatchSize - 1), -1);
+
+  int32_t unitStrideWithMaskedTail[4] = {1, 2, 3, 4};
+  auto unitStrideIndexBatch =
+      simd::loadGatherIndices<double>(unitStrideWithMaskedTail);
+  auto maskedTailResult = simd::maskGather(
+      xsimd::batch<double>::broadcast(-1),
+      simd::leadingMask<double>(kBatchSize - 1),
+      doubleData,
+      unitStrideIndexBatch);
+  for (auto i = 0; i < kBatchSize - 1; ++i) {
+    EXPECT_EQ(maskedTailResult.get(i), doubleData[unitStrideWithMaskedTail[i]]);
+  }
+  EXPECT_EQ(maskedTailResult.get(kBatchSize - 1), -1);
 }
 
 TEST_F(SimdUtilTest, gather16) {
@@ -236,6 +261,19 @@ TEST_F(SimdUtilTest, gatherBits) {
   for (auto i = 0; i < bitIndices.size(); ++i) {
     EXPECT_EQ(
         bits::isBitSet(&source, bitIndices[i]), bits::isBitSet(&result, i));
+  }
+
+  uint64_t unorderedSource[2] = {
+      0x0123456789abcdefULL, 0xfedcba9876543210ULL};
+  int32_t unorderedIndices[] = {16, 72, 8, 65, 1, 63, 95, 24};
+  auto unorderedIndexBatch = xsimd::load_unaligned(unorderedIndices);
+  uint64_t unorderedBits =
+      simd::gather8Bits(unorderedSource, unorderedIndexBatch, N);
+  for (auto i = 0; i < N; ++i) {
+    EXPECT_EQ(
+        bits::isBitSet(&unorderedBits, i),
+        bits::isBitSet(unorderedSource, unorderedIndices[i]))
+        << i;
   }
 }
 
