@@ -270,7 +270,11 @@ class PageReader {
   void
   callDecoder(const uint64_t* nulls, bool& nullsFromFastPath, Visitor visitor) {
     if (nulls) {
+#if defined(__aarch64__)
+    nullsFromFastPath = dwio::common::useArmFastPath<Visitor, true>(visitor) &&
+#else
       nullsFromFastPath = dwio::common::useFastPath<Visitor, true>(visitor) &&
+#endif
           (!this->type_->type()->isLongDecimal()) &&
           (this->type_->type()->isShortDecimal() ? isDictionary() : true);
 
@@ -306,7 +310,11 @@ class PageReader {
   callDecoder(const uint64_t* nulls, bool& nullsFromFastPath, Visitor visitor) {
     if (nulls) {
       if (isDictionary()) {
+#if defined(__aarch64__)
+        nullsFromFastPath = dwio::common::useArmFastPath<Visitor, true>(visitor);
+#else
         nullsFromFastPath = dwio::common::useFastPath<Visitor, true>(visitor);
+#endif
         auto dictVisitor = visitor.toStringDictionaryColumnVisitor();
         dictionaryIdDecoder_->readWithVisitor<true>(nulls, dictVisitor);
       } else if (encoding_ == thrift::Encoding::DELTA_BYTE_ARRAY) {
