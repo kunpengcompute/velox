@@ -1319,23 +1319,40 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeSVE(HashLookup& lookup) {
           predicateMask, hashes, svreinterpret_u64(rowOffset));
     }
 
-    // calc tag
+    // C1: Memory-compute dual-issue instruction reorder.
+    // Original order: svlsr → svorr → svand → svlsl → svld1_gather
+    // Optimized: compute table index first to emit gather early;
+    //            svlsr runs in parallel; svorr fills gather stall.
+    // Compute table index (uses currIndex, saved to separate var to avoid
+    //                      overwriting the hash needed by svlsr below).
+    svuint64_t tableIndex =
+        svand_n_u64_z(predicateMask, currIndex, capacity_ - 1);
+    svuint64_t htOffset = svlsl_n_u64_z(predicateMask, tableIndex, 3);
+
+    // Tag shift: independent of tableIndex/htOffset, can dual-issue with above.
     svuint64_t currTagTmp =
         svlsr_n_u64_x(predicateMask, currIndex, kTagShiftBits);
-    svuint64_t currTag = svorr_n_u64_z(
-        predicateMask,
-        currTagTmp,
-        kTagMask); // 4个tag的位置0 8 16
-                   // 24，svreinterpret_u8_u64(svorr_n_u64_z(predicateMask,
-                   // currTagTmp, kTagMask));
 
-    // 计算在hashtable中的index
-    currIndex = svand_n_u64_z(predicateMask, currIndex, capacity_ - 1);
-    svuint64_t htOffset = svlsl_n_u64_z(predicateMask, currIndex, 3);
+    // Emit value gather as early as possible — htOffset is ready.
     valVec = svld1_gather_u64offset_u64(
         predicateMask,
         reinterpret_cast<uint64_t*>(getValuePtr()),
-        htOffset); // hash表的value
+        htOffset);
+
+    // Compiler barrier: prevent the instruction scheduler from hoisting
+    // the tag OR (svorr) above the gather load, which would undo the
+    // manual reorder and lose the dual-issue benefit.
+    asm volatile("" ::: "memory");
+
+    // Tag OR: fills the gather stall window (no dependency on valVec).
+    svuint64_t currTag = svorr_n_u64_z(
+        predicateMask,
+        currTagTmp,
+        kTagMask);
+
+    // currIndex now carries the table index for downstream use
+    // (get_uniq_mask2, svst1 htIndices).
+    currIndex = tableIndex;
 
     emptyMask = svcmpeq_n_u64(predicateMask, valVec, 0);
     if (svptest_any(predicateMask, emptyMask)) {
@@ -1475,23 +1492,29 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeSVE(HashLookup& lookup) {
           predicateMask, hashes, svreinterpret_u64(rowOffset));
     }
 
-    // calc tag
+    // C1: Memory-compute dual-issue instruction reorder (tail).
+    // Same reorder as the main loop: compute table index + emit gather
+    // early, then fill the gather stall with svorr.
+    svuint64_t tableIndex =
+        svand_n_u64_z(predicateMask, currIndex, capacity_ - 1);
+    svuint64_t htOffset = svlsl_n_u64_z(predicateMask, tableIndex, 3);
+
     svuint64_t currTagTmp =
         svlsr_n_u64_x(predicateMask, currIndex, kTagShiftBits);
-    svuint64_t currTag = svorr_n_u64_z(
-        predicateMask,
-        currTagTmp,
-        kTagMask); // 4个tag的位置0 8 16
-                   // 24，svreinterpret_u8_u64(svorr_n_u64_z(predicateMask,
-                   // currTagTmp, kTagMask));
 
-    // 计算在hashtable中的index
-    currIndex = svand_n_u64_z(predicateMask, currIndex, capacity_ - 1);
-    svuint64_t htOffset = svlsl_n_u64_z(predicateMask, currIndex, 3);
     valVec = svld1_gather_u64offset_u64(
         predicateMask,
         reinterpret_cast<uint64_t*>(getValuePtr()),
-        htOffset); // hash表的value
+        htOffset);
+
+    asm volatile("" ::: "memory");
+
+    svuint64_t currTag = svorr_n_u64_z(
+        predicateMask,
+        currTagTmp,
+        kTagMask);
+
+    currIndex = tableIndex;
 
     emptyMask = svcmpeq_n_u64(predicateMask, valVec, 0);
     if (svptest_any(predicateMask, emptyMask)) {
