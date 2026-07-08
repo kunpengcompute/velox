@@ -306,11 +306,17 @@ class SumAggregateBase
     svbool_t mask, mask1, mask2;
     svint64_t tmpValue;
         // 注意这里的count是统计第几个元素，svbool_t去load，bitmap，一次性可以处理32个元素
+    // Helper lambda to get value for a row index, handling all mode2 types
+    auto getValueForRow = [&](int32_t row) -> int64_t {
+      if (mode2 == 3) return value[dic[row]];
+      if (mode2 == 2) return value[0];
+      return value[row];
+    };
+
             for (int32_t count = firstWord; count + 32 <= lastWord; count += 32) {
       int32_t arr8Index = count / 8;
-      if (bitmap2_8 != nullptr) {
-        mask2 = getBitMask(bitmap2_8, arr8Index, mode1, dic, end); // 一次取32个
-      }
+      VELOX_DCHECK(mode1 == 0 || bitmap2_8 != nullptr);
+      mask2 = getBitMask(bitmap2_8, arr8Index, mode1, dic, end);
       __asm__ __volatile__("ldr %0, [%1]"
                                  : "=Upl"(mask1)
                                                             : "r"(&bitmap1_8[arr8Index])
@@ -336,22 +342,9 @@ class SumAggregateBase
             uint8_t flag0[4] = {0, 0, 0, 0};
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag0[0]), "Upl" (mask20) : "memory");
             
-            // 根据 mode2 选择正确的取值方式
-            if (mode2 == 3) {
-              // 字典编码模式：通过字典索引获取值
-              for (int i = 0; i < 4; i++) {
-                if (flag0[i] != 0) {
-                  uint32_t dictIndex = dic[count + i];
-                  int64_t dictValue = value[dictIndex];
-                  *exec::Aggregate::value<int64_t>(*(result + count + i)) += dictValue;
-                }
-              }
-            } else {
-              // 简单模式：直接使用 value 数组
-              for (int i = 0; i < 4; i++) {
-                if (flag0[i] != 0) {
-                  *exec::Aggregate::value<int64_t>(*(result + count + i)) += value[count + i];
-                }
+            for (int i = 0; i < 4; i++) {
+              if (flag0[i] != 0) {
+                *exec::Aggregate::value<int64_t>(*(result + count + i)) += getValueForRow(count + i);
               }
             }
           }
@@ -365,21 +358,9 @@ class SumAggregateBase
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag1[0]), "Upl" (mask21) : "memory");
             
             // 根据 mode2 选择正确的取值方式
-            if (mode2 == 3) {
-              // 字典编码模式
-              for (int i = 0; i < 4; i++) {
-                if (flag1[i] != 0) {
-                  uint32_t dictIndex = dic[count + 4 + i];
-                  int64_t dictValue = value[dictIndex];
-                  *exec::Aggregate::value<int64_t>(*(result + count + 4 + i)) += dictValue;
-                }
-              }
-            } else {
-              // 简单模式
-              for (int i = 0; i < 4; i++) {
-                if (flag1[i] != 0) {
-                  *exec::Aggregate::value<int64_t>(*(result + count + 4 + i)) += value[count + 4 + i];
-                }
+            for (int i = 0; i < 4; i++) {
+              if (flag1[i] != 0) {
+                *exec::Aggregate::value<int64_t>(*(result + count + 4 + i)) += getValueForRow(count + 4 + i);
               }
             }
           }
@@ -397,19 +378,9 @@ class SumAggregateBase
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag2[0]), "Upl" (mask22) : "memory");
             
             // 根据 mode2 选择正确的取值方式
-            if (mode2 == 3) {
-              for (int i = 0; i < 4; i++) {
-                if (flag2[i] != 0) {
-                  uint32_t dictIndex = dic[count + 8 + i];
-                  int64_t dictValue = value[dictIndex];
-                  *exec::Aggregate::value<int64_t>(*(result + count + 8 + i)) += dictValue;
-                }
-              }
-            } else {
-              for (int i = 0; i < 4; i++) {
-                if (flag2[i] != 0) {
-                  *exec::Aggregate::value<int64_t>(*(result + count + 8 + i)) += value[count + 8 + i];
-                }
+            for (int i = 0; i < 4; i++) {
+              if (flag2[i] != 0) {
+                *exec::Aggregate::value<int64_t>(*(result + count + 8 + i)) += getValueForRow(count + 8 + i);
               }
             }
           }
@@ -423,19 +394,9 @@ class SumAggregateBase
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag3[0]), "Upl" (mask23) : "memory");
             
             // 根据 mode2 选择正确的取值方式
-            if (mode2 == 3) {
-              for (int i = 0; i < 4; i++) {
-                if (flag3[i] != 0) {
-                  uint32_t dictIndex = dic[count + 12 + i];
-                  int64_t dictValue = value[dictIndex];
-                  *exec::Aggregate::value<int64_t>(*(result + count + 12 + i)) += dictValue;
-                }
-              }
-            } else {
-              for (int i = 0; i < 4; i++) {
-                if (flag3[i] != 0) {
-                  *exec::Aggregate::value<int64_t>(*(result + count + 12 + i)) += value[count + 12 + i];
-                }
+            for (int i = 0; i < 4; i++) {
+              if (flag3[i] != 0) {
+                *exec::Aggregate::value<int64_t>(*(result + count + 12 + i)) += getValueForRow(count + 12 + i);
               }
             }
           }
@@ -457,19 +418,9 @@ class SumAggregateBase
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag4[0]), "Upl" (mask24) : "memory");
             
             // 根据 mode2 选择正确的取值方式
-            if (mode2 == 3) {
-              for (int i = 0; i < 4; i++) {
-                if (flag4[i] != 0) {
-                  uint32_t dictIndex = dic[count + 16 + i];
-                  int64_t dictValue = value[dictIndex];
-                  *exec::Aggregate::value<int64_t>(*(result + count + 16 + i)) += dictValue;
-                }
-              }
-            } else {
-              for (int i = 0; i < 4; i++) {
-                if (flag4[i] != 0) {
-                  *exec::Aggregate::value<int64_t>(*(result + count + 16 + i)) += value[count + 16 + i];
-                }
+            for (int i = 0; i < 4; i++) {
+              if (flag4[i] != 0) {
+                *exec::Aggregate::value<int64_t>(*(result + count + 16 + i)) += getValueForRow(count + 16 + i);
               }
             }
           }
@@ -483,19 +434,9 @@ class SumAggregateBase
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag5[0]), "Upl" (mask25) : "memory");
             
             // 根据 mode2 选择正确的取值方式
-            if (mode2 == 3) {
-              for (int i = 0; i < 4; i++) {
-                if (flag5[i] != 0) {
-                  uint32_t dictIndex = dic[count + 20 + i];
-                  int64_t dictValue = value[dictIndex];
-                  *exec::Aggregate::value<int64_t>(*(result + count + 20 + i)) += dictValue;
-                }
-              }
-            } else {
-              for (int i = 0; i < 4; i++) {
-                if (flag5[i] != 0) {
-                  *exec::Aggregate::value<int64_t>(*(result + count + 20 + i)) += value[count + 20 + i];
-                }
+            for (int i = 0; i < 4; i++) {
+              if (flag5[i] != 0) {
+                *exec::Aggregate::value<int64_t>(*(result + count + 20 + i)) += getValueForRow(count + 20 + i);
               }
             }
           }
@@ -514,19 +455,9 @@ class SumAggregateBase
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag6[0]), "Upl" (mask26) : "memory");
             
             // 根据 mode2 选择正确的取值方式
-            if (mode2 == 3) {
-              for (int i = 0; i < 4; i++) {
-                if (flag6[i] != 0) {
-                  uint32_t dictIndex = dic[count + 24 + i];
-                  int64_t dictValue = value[dictIndex];
-                  *exec::Aggregate::value<int64_t>(*(result + count + 24 + i)) += dictValue;
-                }
-              }
-            } else {
-              for (int i = 0; i < 4; i++) {
-                if (flag6[i] != 0) {
-                  *exec::Aggregate::value<int64_t>(*(result + count + 24 + i)) += value[count + 24 + i];
-                }
+            for (int i = 0; i < 4; i++) {
+              if (flag6[i] != 0) {
+                *exec::Aggregate::value<int64_t>(*(result + count + 24 + i)) += getValueForRow(count + 24 + i);
               }
             }
           }
@@ -540,19 +471,9 @@ class SumAggregateBase
             __asm__ __volatile__("str %1, [%0]": : "r" (&flag7[0]), "Upl" (mask27) : "memory");
             
             // 根据 mode2 选择正确的取值方式
-            if (mode2 == 3) {
-              for (int i = 0; i < 4; i++) {
-                if (flag7[i] != 0) {
-                  uint32_t dictIndex = dic[count + 28 + i];
-                  int64_t dictValue = value[dictIndex];
-                  *exec::Aggregate::value<int64_t>(*(result + count + 28 + i)) += dictValue;
-                }
-              }
-            } else {
-              for (int i = 0; i < 4; i++) {
-                if (flag7[i] != 0) {
-                  *exec::Aggregate::value<int64_t>(*(result + count + 28 + i)) += value[count + 28 + i];
-                }
+            for (int i = 0; i < 4; i++) {
+              if (flag7[i] != 0) {
+                *exec::Aggregate::value<int64_t>(*(result + count + 28 + i)) += getValueForRow(count + 28 + i);
               }
             }
           }
@@ -924,17 +845,24 @@ class SumAggregateBase
       return;
     }
 
-    if (exec::Aggregate::numNulls_) {
+    // For int64 sum with overflow checking, use SVE-accelerated path.
+    // It handles both with/without accumulator nulls and with/without input
+    // nulls via the tableHasNulls template parameter and mode flags.
+    if constexpr (
+        std::is_same_v<TData, int64_t> &&
+        (std::is_same_v<TValue, int64_t> || std::is_same_v<TValue, int32_t>) &&
+        Overflow) {
       DecodedVector decoded(*arg, rows, !mayPushdown);
-      if (std::is_same_v<TData, int64_t> &&
-          (std::is_same_v<TValue, int64_t> || std::is_same_v<TValue, int32_t>) &&
-          decoded.mayHaveNulls() && Overflow) {
+      if (exec::Aggregate::numNulls_) {
         updateGroups<true, TData, TValue>(
             groups, rows, arg, &updateSingleValue<TData>, false, decoded);
       } else {
-        BaseAggregate::template updateGroups<true, TData, TValue>(
-            groups, rows, arg, &updateSingleValue<TData>, false);
+        updateGroups<false, TData, TValue>(
+            groups, rows, arg, &updateSingleValue<TData>, false, decoded);
       }
+    } else if (exec::Aggregate::numNulls_) {
+      BaseAggregate::template updateGroups<true, TData, TValue>(
+          groups, rows, arg, &updateSingleValue<TData>, false);
     } else {
       BaseAggregate::template updateGroups<false, TData, TValue>(
           groups, rows, arg, &updateSingleValue<TData>, false);
