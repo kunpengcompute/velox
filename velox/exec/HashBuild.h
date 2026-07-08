@@ -259,9 +259,10 @@ class HashBuild final : public Operator {
   raw_vector<uint64_t> hashes_;
 
   // Reusable scratch buffer holding row pointers returned by
-  // 'RowContainer::newRows()' on the spill restore fast path. Sized to the
-  // current input batch and reused across batches.
-  std::vector<char*> spillRestoreRows_;
+  // 'RowContainer::newRows()' on the bulk-store fast path (dense input, both
+  // for regular build input and spill restore). Sized to the current input
+  // batch and reused across batches.
+  std::vector<char*> bulkStoreRows_;
 
   // Set of active rows during addInput().
   SelectivityVector activeRows_;

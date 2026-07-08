@@ -3452,6 +3452,132 @@ TEST_F(HashJoinTest, duplicateJoinKeys) {
   }
 }
 
+TEST_F(HashJoinTest, bulkStoreBuildPath) {
+  // Targets the bulk-store fast path in HashBuild::addInput, which replaces the
+  // per-row 'newRow + store' loop with a single 'newRows' bulk allocation plus
+  // per-column batch stores whenever the build input batch is dense, i.e. no
+  // rows were deselected by null/anti-join key filtering. The fast path must
+  // produce results identical to the per-row slow path across:
+  //   * multiple key column types (INTEGER + VARCHAR) and dependent columns
+  //     (VARCHAR out-of-line payloads + BIGINT),
+  //   * nullable build keys preserved by right/full outer joins (exercising
+  //     'storeWithNullsBatch'),
+  //   * inputs large enough to span multiple RowContainer allocation runs,
+  //   * single- and multi-driver (parallel build + merge) execution.
+  // The complementary sparse case (some build rows deselected -> slow path) is
+  // covered below by the inner/left-join scenarios with null build keys.
+  const RowTypePtr probeType = ROW(
+      {"t_k0", "t_k1", "t_v0"}, {INTEGER(), VARCHAR(), BIGINT()});
+  const RowTypePtr buildType = ROW(
+      {"u_k0", "u_k1", "u_v0", "u_v1"},
+      {INTEGER(), VARCHAR(), VARCHAR(), BIGINT()});
+
+  const vector_size_t numProbeRows = 1'000;
+  auto makeProbeVectors = [&] {
+    return makeBatches(3, [&](int32_t /*unused*/) {
+      return makeRowVector(
+          {"t_k0", "t_k1", "t_v0"},
+          {makeFlatVector<int32_t>(
+               numProbeRows, [](auto r) { return r % 200; }),
+           makeFlatVector<std::string>(
+               numProbeRows, [](auto r) { return fmt::format("k{}", r % 200); }),
+           makeFlatVector<int64_t>(numProbeRows, [](auto r) { return r; })});
+    });
+  };
+
+  // Long, variable-length VARCHAR payloads force multiple HashStringAllocator
+  // runs and make 'newRows' allocate the fixed-width rows in several chunks.
+  const vector_size_t numBuildRows = 2'048;
+  auto valueColumn = [&] {
+    return makeFlatVector<std::string>(
+        numBuildRows, [](auto r) { return std::string(64 + (r % 64), 'a'); });
+  };
+
+  // Dense build keys (no nulls): the build input is fully selected for every
+  // join type, so every batch takes the bulk-store fast path.
+  auto makeDenseBuildVectors = [&] {
+    return makeBatches(2, [&](int32_t /*unused*/) {
+      return makeRowVector(
+          {"u_k0", "u_k1", "u_v0", "u_v1"},
+          {makeFlatVector<int32_t>(
+               numBuildRows, [](auto r) { return r % 200; }),
+           makeFlatVector<std::string>(
+               numBuildRows, [](auto r) { return fmt::format("k{}", r % 200); }),
+           valueColumn(),
+           makeFlatVector<int64_t>(numBuildRows, [](auto r) { return r * 2; })});
+    });
+  };
+
+  // Build keys with nulls: right/full joins keep the null-key rows in the table
+  // so the input stays dense and still takes the bulk-store path (via
+  // 'storeWithNullsBatch'); inner/left joins deselect the null-key rows and
+  // fall back to the per-row slow path.
+  auto makeNullableBuildVectors = [&] {
+    return makeBatches(2, [&](int32_t /*unused*/) {
+      return makeRowVector(
+          {"u_k0", "u_k1", "u_v0", "u_v1"},
+          {makeFlatVector<int32_t>(
+               numBuildRows,
+               [](auto r) { return r % 200; },
+               [](auto r) { return r % 7 == 0; }),
+           makeFlatVector<std::string>(
+               numBuildRows, [](auto r) { return fmt::format("k{}", r % 200); }),
+           valueColumn(),
+           makeFlatVector<int64_t>(numBuildRows, [](auto r) { return r * 2; })});
+    });
+  };
+
+  const std::vector<std::string> outputLayout = {
+      "t_k0", "t_k1", "t_v0", "u_k0", "u_k1", "u_v0", "u_v1"};
+
+  auto run = [&](std::vector<RowVectorPtr>&& buildVectors,
+                 core::JoinType joinType,
+                 const std::string& joinSql,
+                 int32_t numDrivers) {
+    SCOPED_TRACE(fmt::format("joinSql: {}, numDrivers: {}", joinSql, numDrivers));
+    HashJoinBuilder(*pool_, duckDbQueryRunner_, driverExecutor_.get())
+        .numDrivers(numDrivers)
+        .probeType(probeType)
+        .probeKeys({"t_k0", "t_k1"})
+        .probeVectors(makeProbeVectors())
+        .buildType(buildType)
+        .buildKeys({"u_k0", "u_k1"})
+        .buildVectors(std::move(buildVectors))
+        .joinType(joinType)
+        .joinOutputLayout(
+            std::vector<std::string>(outputLayout.begin(), outputLayout.end()))
+        .referenceQuery(
+            "SELECT t_k0, t_k1, t_v0, u_k0, u_k1, u_v0, u_v1 FROM t " + joinSql +
+            " u ON t_k0 = u_k0 AND t_k1 = u_k1")
+        .checkSpillStats(false)
+        .run();
+  };
+
+  for (const int32_t numDrivers : {1, 4}) {
+    // Dense build -> bulk-store fast path.
+    run(makeDenseBuildVectors(), core::JoinType::kInner, "INNER JOIN", numDrivers);
+    // Null build keys preserved by right/full join -> bulk-store fast path
+    // through 'storeWithNullsBatch'.
+    run(makeNullableBuildVectors(),
+        core::JoinType::kRight,
+        "RIGHT JOIN",
+        numDrivers);
+    run(makeNullableBuildVectors(),
+        core::JoinType::kFull,
+        "FULL OUTER JOIN",
+        numDrivers);
+    // Null build keys deselected by inner/left join -> per-row slow path.
+    run(makeNullableBuildVectors(),
+        core::JoinType::kInner,
+        "INNER JOIN",
+        numDrivers);
+    run(makeNullableBuildVectors(),
+        core::JoinType::kLeft,
+        "LEFT JOIN",
+        numDrivers);
+  }
+}
+
 TEST_F(HashJoinTest, semiProject) {
   // Some keys have multiple rows: 2, 3, 5.
   auto probeVectors = makeBatches(3, [&](int32_t /*unused*/) {
