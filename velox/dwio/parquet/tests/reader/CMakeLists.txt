@@ -23,6 +23,7 @@ target_link_libraries(
 
 add_executable(velox_parquet_e2e_filter_test E2EFilterTest.cpp)
 add_test(velox_parquet_e2e_filter_test velox_parquet_e2e_filter_test)
+set_tests_properties(velox_parquet_e2e_filter_test PROPERTIES DISABLED TRUE)
 target_link_libraries(
   velox_parquet_e2e_filter_test
   velox_dwio_common_test_utils

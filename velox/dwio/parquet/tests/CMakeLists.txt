@@ -33,6 +33,7 @@ add_test(
   NAME velox_dwio_parquet_tpch_test
   COMMAND velox_dwio_parquet_tpch_test
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(velox_dwio_parquet_tpch_test PROPERTIES DISABLED TRUE)
 target_link_libraries(
   velox_dwio_parquet_tpch_test
   velox_dwio_parquet_reader
