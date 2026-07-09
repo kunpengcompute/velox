@@ -21,6 +21,15 @@ set(SPARK_SOURCE_URL
     "https://github.com/apache/spark/archive/refs/tags/v${SPARK_VERSION}.tar.gz"
 )
 
+if(DEFINED ENV{VELOX_SPARK_URL})
+  set(SPARK_SOURCE_URL "$ENV{VELOX_SPARK_URL}")
+  if(DEFINED ENV{VELOX_SPARK_SHA256})
+    set(SPARK_SHA256_CHECKSUM "SHA256=$ENV{VELOX_SPARK_SHA256}")
+  else()
+    set(SPARK_SHA256_CHECKSUM "")
+  endif()
+endif()
+
 FetchContent_Declare(
   Spark
   URL ${SPARK_SOURCE_URL}
