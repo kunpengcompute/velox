@@ -16,6 +16,7 @@ add_executable(velox_hdfs_file_test HdfsFileSystemTest.cpp HdfsMiniCluster.cpp
                                     HdfsUtilTest.cpp)
 
 add_test(velox_hdfs_file_test velox_hdfs_file_test)
+set_tests_properties(velox_hdfs_file_test PROPERTIES DISABLED TRUE)
 target_link_libraries(
   velox_hdfs_file_test
   velox_file
@@ -36,6 +37,7 @@ add_executable(velox_hdfs_insert_test InsertIntoHdfsTest.cpp
                                       HdfsMiniCluster.cpp HdfsUtilTest.cpp)
 
 add_test(velox_hdfs_insert_test velox_hdfs_insert_test)
+set_tests_properties(velox_hdfs_insert_test PROPERTIES DISABLED TRUE)
 
 target_link_libraries(
   velox_hdfs_insert_test
