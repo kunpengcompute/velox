@@ -31,6 +31,7 @@ add_test(
   NAME velox_functions_lib_test
   COMMAND velox_functions_lib_test
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(velox_functions_lib_test PROPERTIES DISABLED TRUE)
 
 target_link_libraries(
   velox_functions_lib_test

@@ -1,0 +1,82 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -326,12 +326,42 @@
+ include(cmake/zlib.cmake)
+ include(cmake/download_archive.cmake)
+ 
++if(DEFINED ENV{VELOX_GRPC_DATA_PLANE_API_URL})
++  set(GRPC_DATA_PLANE_API_URL "$ENV{VELOX_GRPC_DATA_PLANE_API_URL}")
++else()
++  set(GRPC_DATA_PLANE_API_URL "https://storage.googleapis.com/grpc-bazel-mirror/github.com/envoyproxy/data-plane-api/archive/9c42588c956220b48eb3099d186487c2f04d32ec.tar.gz")
++endif()
++
++if(DEFINED ENV{VELOX_GRPC_GOOGLEAPIS_URL})
++  set(GRPC_GOOGLEAPIS_URL "$ENV{VELOX_GRPC_GOOGLEAPIS_URL}")
++else()
++  set(GRPC_GOOGLEAPIS_URL "https://storage.googleapis.com/grpc-bazel-mirror/github.com/googleapis/googleapis/archive/2f9af297c84c55c8b871ba4495e01ade42476c92.tar.gz")
++endif()
++
++if(DEFINED ENV{VELOX_GRPC_OPENCENSUS_PROTO_MIRROR_URL})
++  set(GRPC_OPENCENSUS_PROTO_MIRROR_URL "$ENV{VELOX_GRPC_OPENCENSUS_PROTO_MIRROR_URL}")
++else()
++  set(GRPC_OPENCENSUS_PROTO_MIRROR_URL "https://storage.googleapis.com/grpc-bazel-mirror/github.com/census-instrumentation/opencensus-proto/archive/v0.3.0.tar.gz")
++endif()
++
++if(DEFINED ENV{VELOX_GRPC_OPENCENSUS_PROTO_URL})
++  set(GRPC_OPENCENSUS_PROTO_URL "$ENV{VELOX_GRPC_OPENCENSUS_PROTO_URL}")
++else()
++  set(GRPC_OPENCENSUS_PROTO_URL "https://github.com/census-instrumentation/opencensus-proto/archive/v0.3.0.tar.gz")
++endif()
++
++if(DEFINED ENV{VELOX_GRPC_XDS_URL})
++  set(GRPC_XDS_URL "$ENV{VELOX_GRPC_XDS_URL}")
++else()
++  set(GRPC_XDS_URL "https://storage.googleapis.com/grpc-bazel-mirror/github.com/cncf/xds/archive/cb28da3451f158a947dfc45090fe92b07b243bc1.tar.gz")
++endif()
++
+ # Setup external proto library at third_party/envoy-api with 2 download URLs
+ if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/envoy-api)
+   # Download the archive via HTTP, validate the checksum, and extract to third_party/envoy-api.
+   download_archive(
+     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/envoy-api
+-    https://storage.googleapis.com/grpc-bazel-mirror/github.com/envoyproxy/data-plane-api/archive/9c42588c956220b48eb3099d186487c2f04d32ec.tar.gz
++    ${GRPC_DATA_PLANE_API_URL}
+     c5807010b67033330915ca5a20483e30538ae5e689aa14b3631d6284beca4630
+     data-plane-api-9c42588c956220b48eb3099d186487c2f04d32ec
+   )
+@@ -350,7 +380,7 @@
+   # Download the archive via HTTP, validate the checksum, and extract to third_party/googleapis.
+   download_archive(
+     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/googleapis
+-    https://storage.googleapis.com/grpc-bazel-mirror/github.com/googleapis/googleapis/archive/2f9af297c84c55c8b871ba4495e01ade42476c92.tar.gz
++    ${GRPC_GOOGLEAPIS_URL}
+     5bb6b0253ccf64b53d6c7249625a7e3f6c3bc6402abd52d3778bfa48258703a0
+     googleapis-2f9af297c84c55c8b871ba4495e01ade42476c92
+   )
+@@ -369,7 +399,7 @@
+   # Download the archive via HTTP, validate the checksum, and extract to third_party/opencensus-proto/src.
+   download_archive(
+     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/opencensus-proto/src
+-    https://storage.googleapis.com/grpc-bazel-mirror/github.com/census-instrumentation/opencensus-proto/archive/v0.3.0.tar.gz
++    ${GRPC_OPENCENSUS_PROTO_MIRROR_URL}
+     b7e13f0b4259e80c3070b583c2f39e53153085a6918718b1c710caf7037572b0
+     opencensus-proto-0.3.0/src
+   )
+@@ -378,7 +408,7 @@
+   # Download the archive via HTTP, validate the checksum, and extract to third_party/opencensus-proto/src.
+   download_archive(
+     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/opencensus-proto/src
+-    https://github.com/census-instrumentation/opencensus-proto/archive/v0.3.0.tar.gz
++    ${GRPC_OPENCENSUS_PROTO_URL}
+     b7e13f0b4259e80c3070b583c2f39e53153085a6918718b1c710caf7037572b0
+     opencensus-proto-0.3.0/src
+   )
+@@ -388,7 +418,7 @@
+   # Download the archive via HTTP, validate the checksum, and extract to third_party/xds.
+   download_archive(
+     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xds
+-    https://storage.googleapis.com/grpc-bazel-mirror/github.com/cncf/xds/archive/cb28da3451f158a947dfc45090fe92b07b243bc1.tar.gz
++    ${GRPC_XDS_URL}
+     5bc8365613fe2f8ce6cc33959b7667b13b7fe56cb9d16ba740c06e1a7c4242fc
+     xds-cb28da3451f158a947dfc45090fe92b07b243bc1
+   )
