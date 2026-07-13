@@ -219,6 +219,13 @@ class RleDecoderV2 : public dwio::common::IntDecoder<isSigned> {
       const uint64_t numValues,
       const uint64_t* const nulls);
 
+  // Encoding-aware skip of `numValues` non-null values from the current run
+  // position. Advances runRead_ and the underlying bit stream / unpacked
+  // index exactly as doNext would, but without materializing values into an
+  // output buffer. Called by skipPending; numValues is already the non-null
+  // count (callers convert nulls to non-null counts before reaching here).
+  void skipValues(uint64_t numValues);
+
   unsigned char firstByte_;
   uint64_t runLength_;
   uint64_t runRead_;
