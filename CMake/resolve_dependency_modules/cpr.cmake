@@ -33,8 +33,7 @@ FetchContent_Declare(
   URL ${VELOX_CPR_SOURCE_URL}
   URL_HASH ${VELOX_CPR_BUILD_SHA256_CHECKSUM}
   PATCH_COMMAND
-    git apply ${CMAKE_CURRENT_LIST_DIR}/cpr/cpr-libcurl-compatible.patch && git
-    apply ${CMAKE_CURRENT_LIST_DIR}/cpr/cpr-remove-sancheck.patch)
+    git apply ${CMAKE_CURRENT_LIST_DIR}/cpr/cpr-zlib-ng-mirror.patch)
 set(BUILD_SHARED_LIBS ${VELOX_BUILD_SHARED})
 set(CPR_USE_SYSTEM_CURL OFF)
 # ZLIB has already been found by find_package(ZLIB, REQUIRED), set CURL_ZLIB=OFF
