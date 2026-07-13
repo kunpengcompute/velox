@@ -478,6 +478,29 @@ bool varcharColEquals(
     return false;
   }
 
+  // Fast path: the row's string is fully contiguous in memory, which is the
+  // common case (storeStringFast places short strings in a single arena
+  // block). Detect this with the same test contiguousString() uses internally
+  // (view.size() <= header->size()), then compare the remaining bytes
+  // directly. This avoids:
+  //   - the non-inline contiguousString() call (out-of-line, plus a
+  //     per-call std::string construction),
+  //   - the redundant length + prefix re-check inside StringView::operator==,
+  //     since size is already known equal and the prefix was just compared.
+  // The contiguous test's header deref is the same work contiguousString()
+  // would do, so on the fast path the net cost is one inlined header deref +
+  // one memcmp, versus an out-of-line call + header deref + redundant
+  // prefix/length compare + memcmp.
+  const auto* header = HashStringAllocator::headerOf(rowSv.data());
+  if (rowSv.size() <= header->size()) {
+    return memcmp(
+               rowSv.data() + StringView::kPrefixSize,
+               probeSv.data() + StringView::kPrefixSize,
+               rowSv.size() - StringView::kPrefixSize) == 0;
+  }
+
+  // Slow path: the row's string spans multiple non-contiguous arena chunks.
+  // Reassemble via contiguousString() and compare the full string.
   std::string storage;
   auto contiguous =
       HashStringAllocator::contiguousString(rowSv, storage);

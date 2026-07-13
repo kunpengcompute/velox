@@ -2850,6 +2850,51 @@ TEST_P(HashTableTest, fastCompareKeysLongVarchar) {
   }
 }
 
+// Exercises varcharColEquals on strings large enough to span multiple,
+// non-contiguous HashStringAllocator chunks (storeStringFast returns false,
+// copyMultipart writes them as linked pieces). This forces the slow path of
+// varcharColEquals (contiguousString reassembly). Verifies that group identity
+// is preserved across insert + re-probe for such keys.
+TEST_P(HashTableTest, fastCompareKeysMultiChunkVarchar) {
+  auto rowType = ROW({"k1", "k2"}, {BIGINT(), VARCHAR()});
+  auto table_ptr = createHashTableForAggregation(rowType, 2);
+  auto& table = *table_ptr;
+
+  const int numRows = 500;
+  // 8KB strings: well past kMaxAlloc (3/4 page), so the row's StringView
+  // points into a multi-piece allocation that is NOT contiguous in memory.
+  constexpr int32_t kStrLen = 8 * 1024;
+  auto input = makeRowVector({
+      makeFlatVector<int64_t>(numRows, [](auto row) { return row; }),
+      makeFlatVector<std::string>(numRows, [](auto row) {
+        return std::string(kStrLen, static_cast<char>('A' + (row % 26)));
+      }),
+  });
+
+  auto lookup = std::make_unique<HashLookup>(table.hashers());
+  SelectivityVector rows(input->size());
+
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  ASSERT_EQ(table.hashMode(), BaseHashTable::HashMode::kHash);
+  ASSERT_EQ(table.numDistinct(), numRows);
+  auto prevHits = lookup->hits;
+
+  // Re-probe: every row must resolve to its existing group. This drives
+  // varcharColEquals through the multi-chunk slow path for each candidate.
+  table.prepareForGroupProbe(
+      *lookup, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+  table.groupProbe(*lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
+  ASSERT_EQ(table.numDistinct(), numRows);
+  ASSERT_TRUE(lookup->newGroups.empty());
+  for (int i = 0; i < numRows; ++i) {
+    ASSERT_EQ(lookup->hits[i], prevHits[i])
+        << "Multi-chunk varchar mismatch at row " << i;
+  }
+}
+
 TEST_P(HashTableTest, fastCompareKeysNullsMixedTypes) {
   auto rowType = ROW(
       {"k1", "k2", "k3", "k4", "k5", "k6"},
