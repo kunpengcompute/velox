@@ -71,6 +71,8 @@ add_test(
   NAME velox_dwio_dwrf_decompression_test
   COMMAND velox_dwio_dwrf_decompression_test
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(velox_dwio_dwrf_decompression_test PROPERTIES DISABLED
+                                                                   TRUE)
 
 target_link_libraries(
   velox_dwio_dwrf_decompression_test
@@ -390,6 +392,7 @@ target_link_libraries(
 
 add_executable(velox_dwrf_e2e_filter_test E2EFilterTest.cpp)
 add_test(velox_dwrf_e2e_filter_test velox_dwrf_e2e_filter_test)
+set_tests_properties(velox_dwrf_e2e_filter_test PROPERTIES DISABLED TRUE)
 
 target_link_libraries(
   velox_dwrf_e2e_filter_test

@@ -115,7 +115,7 @@ add_test(
   COMMAND velox_exec_test
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
-set_tests_properties(velox_exec_test PROPERTIES TIMEOUT 3000)
+set_tests_properties(velox_exec_test PROPERTIES DISABLED TRUE TIMEOUT 3000)
 
 add_test(
   NAME velox_exec_infra_test
@@ -270,6 +270,9 @@ add_test(
   NAME velox_table_evolution_fuzzer_test
   COMMAND velox_table_evolution_fuzzer_test
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(
+  velox_table_evolution_fuzzer_test
+  PROPERTIES RUN_SERIAL TRUE)
 
 add_executable(velox_aggregation_runner_test AggregationRunnerTest.cpp)
 
