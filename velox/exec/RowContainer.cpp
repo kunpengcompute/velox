@@ -21,6 +21,7 @@
 #endif
 
 #include "velox/common/base/RawVector.h"
+#include "velox/common/base/SimdUtil.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/ContainerRowSerde.h"
 #include "velox/exec/Operator.h"
@@ -954,36 +955,38 @@ void RowContainer::extractStringsBatch(
   struct RowMeta {
     const char* data;
     uint32_t size;
-    bool isMultiPiece;
+    uint8_t isMultiPiece;
   };
 
   static constexpr int32_t kStackLimit = 128;
   RowMeta stackMeta[kStackLimit];
-  RowMeta* heapMeta = nullptr;
-  RowMeta* meta = (numRows <= kStackLimit) ? stackMeta : heapMeta;
-  if (numRows > kStackLimit) {
-    heapMeta = static_cast<RowMeta*>(
-        result->pool()->allocate(sizeof(RowMeta) * numRows));
-    meta = heapMeta;
+  raw_vector<RowMeta> heapMetaVec;
+  RowMeta* meta;
+  if (numRows <= kStackLimit) {
+    meta = stackMeta;
+  } else {
+    heapMetaVec.resize(numRows);
+    meta = heapMetaVec.data();
   }
 
   size_t totalBytes = 0;
   bool useRowNumbers = !rowNumbers.empty();
 
+  // Pre-set all result null bits to not-null (bit set). The null buffer from
+  // mutableNulls(setNotNull=false) is not initialized, so every index would
+  // otherwise need an explicit setNull(false). With this single word-at-a-time
+  // fill, only null rows need a setNull(true) call inside the loop.
+  bits::fillBits(rawNulls, resultOffset, resultOffset + numRows, bits::kNotNull);
+
 #if defined(__ARM_NEON)
   // ---- NEON fast path: batch 4 rows at a time ----
-  // StringView layout: {uint32_t size, char prefix[4], union{char inlined[8], char* ptr}}
-  // sizeof = 16 bytes. We load 4 StringView.size_ as a uint32x4_t for inline classification.
-  // We batch-null-check by loading 16 bytes from row[nullByte] and AND with replicated nullMask.
-
   const uint32_t kInlineThreshold = StringView::kInlineSize;
   const int32_t kNeonStride = 4;
 
-  // Scalar pre-loop for alignment / tail < kNeonStride
   int32_t neonStart = 0;
   int32_t neonEnd = numRows - (numRows % kNeonStride);
 
-  // Phase 1a: NEON-batched pre-scan (4 rows per iteration)
+  // Phase 1a: batched pre-scan (4 rows per iteration)
   for (int32_t i = neonStart; i < neonEnd; i += kNeonStride) {
     const char* row0, *row1, *row2, *row3;
     if (useRowNumbers) {
@@ -998,7 +1001,6 @@ void RowContainer::extractStringsBatch(
       row3 = rows[i + 3];
     }
 
-    // Batch null check: load null byte from each row, AND with nullMask
     uint8_t nullBits = 0;
     if (hasNulls) {
       nullBits = ((row0 ? (row0[nullByte] & nullMask) : nullMask) ? 1 : 0) |
@@ -1006,14 +1008,12 @@ void RowContainer::extractStringsBatch(
                  ((row2 ? (row2[nullByte] & nullMask) : nullMask) ? 4 : 0) |
                  ((row3 ? (row3[nullByte] & nullMask) : nullMask) ? 8 : 0);
     }
-    // row == nullptr treated as null (bit set)
     uint8_t ptrNullBits = ((row0 == nullptr) ? 1 : 0) |
                           ((row1 == nullptr) ? 2 : 0) |
                           ((row2 == nullptr) ? 4 : 0) |
                           ((row3 == nullptr) ? 8 : 0);
     uint8_t combinedNull = ptrNullBits | (hasNulls ? nullBits : 0);
 
-    // Load 4 StringView size fields as uint32x4_t
     uint32_t sizes[4];
     for (int k = 0; k < kNeonStride; ++k) {
       auto ri = resultOffset + i + k;
@@ -1022,7 +1022,6 @@ void RowContainer::extractStringsBatch(
         sizes[k] = 0;
         meta[i + k] = {nullptr, 0, false};
       } else {
-        bits::setNull(rawNulls, ri, false);
         const char* r = (k == 0) ? row0 : (k == 1) ? row1 : (k == 2) ? row2 : row3;
         auto value = valueAt<StringView>(r, offset);
         sizes[k] = static_cast<uint32_t>(value.size());
@@ -1034,20 +1033,19 @@ void RowContainer::extractStringsBatch(
               value.data()) - 1;
           bool isMultiPiece =
               header->isContinued() || header->size() < value.size();
-          meta[i + k] = {value.data(), static_cast<uint32_t>(value.size()),
-                         isMultiPiece};
+          if (FOLLY_UNLIKELY(isMultiPiece)) {
+            meta[i + k] = {value.data(), static_cast<uint32_t>(value.size()),
+                           true};
+          } else {
+            meta[i + k] = {value.data(), static_cast<uint32_t>(value.size()),
+                           false};
+          }
+          __builtin_prefetch(value.data());
         }
       }
     }
 
-    // NEON accumulate sizes of non-inline rows into totalBytes
-    uint32x4_t neonSizes = vld1q_u32(sizes);
-    // Mask out inline/null entries (sizes already 0 for those)
-    uint32_t partialSum[4];
-    vst1q_u32(partialSum, neonSizes);
-    for (int k = 0; k < kNeonStride; ++k) {
-      totalBytes += partialSum[k];
-    }
+    totalBytes += sizes[0] + sizes[1] + sizes[2] + sizes[3];
   }
 
   // Phase 1b: scalar tail
@@ -1065,7 +1063,6 @@ void RowContainer::extractStringsBatch(
       bits::setNull(rawNulls, resultIndex, true);
       meta[i] = {nullptr, 0, false};
     } else {
-      bits::setNull(rawNulls, resultIndex, false);
       auto value = valueAt<StringView>(row, offset);
 
       if (value.isInline()) {
@@ -1076,9 +1073,13 @@ void RowContainer::extractStringsBatch(
             value.data()) - 1;
         bool isMultiPiece =
             header->isContinued() || header->size() < value.size();
-        meta[i] = {value.data(), static_cast<uint32_t>(value.size()),
-                   isMultiPiece};
+        if (FOLLY_UNLIKELY(isMultiPiece)) {
+          meta[i] = {value.data(), static_cast<uint32_t>(value.size()), true};
+        } else {
+          meta[i] = {value.data(), static_cast<uint32_t>(value.size()), false};
+        }
         totalBytes += value.size();
+        __builtin_prefetch(value.data());
       }
     }
   }
@@ -1099,7 +1100,6 @@ void RowContainer::extractStringsBatch(
       bits::setNull(rawNulls, resultIndex, true);
       meta[i] = {nullptr, 0, false};
     } else {
-      bits::setNull(rawNulls, resultIndex, false);
       auto value = valueAt<StringView>(row, offset);
 
       if (value.isInline()) {
@@ -1110,9 +1110,13 @@ void RowContainer::extractStringsBatch(
             value.data()) - 1;
         bool isMultiPiece =
             header->isContinued() || header->size() < value.size();
-        meta[i] = {value.data(), static_cast<uint32_t>(value.size()),
-                   isMultiPiece};
+        if (FOLLY_UNLIKELY(isMultiPiece)) {
+          meta[i] = {value.data(), static_cast<uint32_t>(value.size()), true};
+        } else {
+          meta[i] = {value.data(), static_cast<uint32_t>(value.size()), false};
+        }
         totalBytes += value.size();
+        __builtin_prefetch(value.data());
       }
     }
   }
@@ -1124,8 +1128,9 @@ void RowContainer::extractStringsBatch(
     size_t bufferOffset = 0;
 
 #if defined(__ARM_NEON)
-    // NEON-accelerated contiguous memcpy for short strings (≤32 bytes).
-    // Multi-piece strings still require HashStringAllocator::prepareRead.
+    // NEON-accelerated copy for short strings (≤32 bytes) using fixed-width
+    // load/store pairs with zero branch overhead. Multi-piece strings still
+    // require HashStringAllocator::prepareRead.
     for (int32_t i = 0; i < numRows; ++i) {
       if (meta[i].data == nullptr) {
         continue;
@@ -1134,16 +1139,16 @@ void RowContainer::extractStringsBatch(
       auto size = meta[i].size;
       auto* dst = rawBuffer + bufferOffset;
 
-      if (meta[i].isMultiPiece) {
+      if (FOLLY_UNLIKELY(meta[i].isMultiPiece)) {
         auto stream = HashStringAllocator::prepareRead(
             HashStringAllocator::headerOf(meta[i].data));
         stream->readBytes(dst, size);
       } else if (size <= 16) {
-        // NEON: single 128-bit load/store covers up to 16 bytes.
+        // Single 128-bit load/store covers up to 16 bytes.
         uint8x16_t chunk = vld1q_u8(reinterpret_cast<const uint8_t*>(meta[i].data));
         vst1q_u8(reinterpret_cast<uint8_t*>(dst), chunk);
       } else if (size <= 32) {
-        // NEON: two 128-bit load/stores cover 17-32 bytes.
+        // Two 128-bit load/stores cover 17-32 bytes.
         uint8x16_t lo = vld1q_u8(reinterpret_cast<const uint8_t*>(meta[i].data));
         uint8x16_t hi = vld1q_u8(reinterpret_cast<const uint8_t*>(meta[i].data + 16));
         vst1q_u8(reinterpret_cast<uint8_t*>(dst), lo);
@@ -1164,7 +1169,7 @@ void RowContainer::extractStringsBatch(
       auto size = meta[i].size;
       auto* dst = rawBuffer + bufferOffset;
 
-      if (meta[i].isMultiPiece) {
+      if (FOLLY_UNLIKELY(meta[i].isMultiPiece)) {
         auto stream = HashStringAllocator::prepareRead(
             HashStringAllocator::headerOf(meta[i].data));
         stream->readBytes(dst, size);
@@ -1176,10 +1181,6 @@ void RowContainer::extractStringsBatch(
       bufferOffset += size;
     }
 #endif
-  }
-
-  if (heapMeta) {
-    result->pool()->free(heapMeta, sizeof(RowMeta) * numRows);
   }
 }
 
