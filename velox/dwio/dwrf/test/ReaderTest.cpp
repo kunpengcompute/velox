@@ -2603,6 +2603,77 @@ TEST_F(TestReader, selectiveStringDirect) {
   assertEqualVectors(expected, actual);
 }
 
+TEST_F(TestReader, selectiveStringDirectBulkNulls) {
+  constexpr vector_size_t kSize = 97;
+  auto isNullAt = [](vector_size_t i) { return i % 7 == 0 || i % 13 == 3; };
+  auto stringAt = [](vector_size_t i) -> StringView {
+    static const std::string kLongString(64, 'x');
+    switch (i % 5) {
+      case 0:
+        return StringView("");
+      case 1:
+        return StringView("a");
+      case 2:
+        return StringView("medium");
+      case 3:
+        return StringView(kLongString.data(), kLongString.size());
+      default:
+        return StringView("tail");
+    }
+  };
+
+  auto batch = makeRowVector({
+      makeFlatVector<int64_t>(kSize, [](vector_size_t i) { return i % 4; }),
+      makeFlatVector<StringView>(kSize, stringAt, isNullAt),
+  });
+  auto [writer, reader] = createWriterReader({batch}, pool());
+  auto schema = asRowType(batch->type());
+
+  {
+    SCOPED_TRACE("Dense rows with nulls");
+    auto spec = std::make_shared<common::ScanSpec>("<root>");
+    spec->addAllChildFields(*schema);
+    RowReaderOptions rowReaderOpts;
+    rowReaderOpts.setScanSpec(spec);
+    auto rowReader = reader->createRowReader(rowReaderOpts);
+    auto actual = BaseVector::create(schema, 0, pool());
+
+    ASSERT_EQ(rowReader->next(1024, actual), batch->size());
+    assertEqualVectors(batch, actual);
+  }
+
+  {
+    SCOPED_TRACE("Sparse rows with nulls");
+    auto spec = std::make_shared<common::ScanSpec>("<root>");
+    spec->addAllChildFields(*schema);
+    spec->childByName("c0")->setFilter(
+        common::createBigintValues({1, 2}, false));
+    RowReaderOptions rowReaderOpts;
+    rowReaderOpts.setScanSpec(spec);
+    auto rowReader = reader->createRowReader(rowReaderOpts);
+    auto actual = BaseVector::create(schema, 0, pool());
+
+    ASSERT_EQ(rowReader->next(1024, actual), batch->size());
+
+    std::vector<vector_size_t> selectedRows;
+    for (vector_size_t i = 0; i < kSize; ++i) {
+      if (i % 4 == 1 || i % 4 == 2) {
+        selectedRows.push_back(i);
+      }
+    }
+    auto expected = makeRowVector({
+        makeFlatVector<int64_t>(selectedRows.size(), [&](vector_size_t i) {
+          return selectedRows[i] % 4;
+        }),
+        makeFlatVector<StringView>(
+            selectedRows.size(),
+            [&](vector_size_t i) { return stringAt(selectedRows[i]); },
+            [&](vector_size_t i) { return isNullAt(selectedRows[i]); }),
+    });
+    assertEqualVectors(expected, actual);
+  }
+}
+
 TEST_F(TestReader, selectiveFlatMapFastPathAllInlinedStringKeys) {
   auto maps = makeMapVector<std::string, int64_t>(
       {{{"a", 0}, {"b", 0}}, {{"a", 1}, {"b", 1}}});

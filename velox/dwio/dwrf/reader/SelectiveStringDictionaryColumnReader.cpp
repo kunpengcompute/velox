@@ -210,7 +210,11 @@ void SelectiveStringDictionaryColumnReader::read(
 
   if (inDictionaryReader_) {
     auto end = rows.back() + 1;
+#if defined(__aarch64__)
+    bool isBulk = useArmBulkPath();
+#else
     bool isBulk = useBulkPath();
+#endif
     int32_t numFlags = (isBulk && nullsInReadRange_)
         ? bits::countNonNulls(nullsInReadRange_->as<uint64_t>(), 0, end)
         : end;
