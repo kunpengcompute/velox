@@ -261,7 +261,11 @@ class RleDecoderV1 : public dwio::common::IntDecoder<isSigned> {
   template <bool hasNulls, typename Visitor>
   void readWithVisitor(const uint64_t* nulls, Visitor visitor) {
     skipPending();
+#if defined(__aarch64__)
+    if (dwio::common::useArmFastPath<Visitor, hasNulls>(visitor)) {
+#else
     if (dwio::common::useFastPath<Visitor, hasNulls>(visitor)) {
+#endif
       fastPath<hasNulls>(nulls, visitor);
       return;
     }
