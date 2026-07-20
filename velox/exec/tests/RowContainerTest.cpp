@@ -84,6 +84,16 @@ class RowContainerTestHelper {
       VELOX_CHECK_EQ(
           rowContainer_->types_.size(), rowContainer_->rowColumnsStats_.size());
 
+      // Stats are lazily materialized on first read; trigger materialization
+      // via the accessor so the comparison below sees fresh data instead of a
+      // stale cache left over from the last write.
+      for (uint32_t i = 0; i < rowContainer_->rowColumnsStats_.size(); i++) {
+        if (rowContainer_->types_[i]->isFixedWidth()) {
+          continue;
+        }
+        rowContainer_->columnStats(i);
+      }
+
       for (uint32_t i = 0; i < rowContainer_->rowColumnsStats_.size(); i++) {
         const auto& storedStats = rowContainer_->rowColumnsStats_[i];
         const auto& expectedStats = columnsStats[i];

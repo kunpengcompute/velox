@@ -286,6 +286,7 @@ RowContainer::RowContainer(
     }
   }
   rowColumnsStats_.resize(types_.size());
+  columnHasNulls_.resize(types_.size(), false);
 }
 
 RowContainer::~RowContainer() {
@@ -420,35 +421,21 @@ char* RowContainer::initializeRow(char* row, bool reuse) {
   return row;
 }
 
-void RowContainer::removeOrUpdateRowColumnStats(
-    const char* row,
-    bool setToNull) {
-  // Update row column stats accordingly
-  for (auto i = 0; i < types_.size(); i++) {
-    if (isNullAt(row, columnAt(i))) {
-      rowColumnsStats_[i].removeOrUpdateCellStats(0, true, setToNull);
-    } else if (types_[i]->isFixedWidth()) {
-      rowColumnsStats_[i].removeOrUpdateCellStats(
-          fixedSizeAt(i), false, setToNull);
-    } else {
-      rowColumnsStats_[i].removeOrUpdateCellStats(
-          variableSizeAt(row, i), false, setToNull);
-    }
-  }
-  invalidateMinMaxColumnStats();
-}
-
 void RowContainer::eraseRows(folly::Range<char**> rows) {
   freeRowsExtraMemory(rows, /*freeNextRowVector=*/true);
   for (auto* row : rows) {
     VELOX_CHECK(!bits::isBitSet(row, freeFlagOffset_), "Double free of row");
-    removeOrUpdateRowColumnStats(row, /*setToNull=*/false);
 
     bits::setBit(row, freeFlagOffset_);
     nextFree(row) = firstFreeRow_;
     firstFreeRow_ = row;
   }
   numFreeRows_ += rows.size();
+  // Stats are lazily materialized; an erase is a write, so invalidate the cache
+  // for the next consumer. The per-row incremental update
+  // (removeOrUpdateRowColumnStats) is no longer needed: a fresh full scan on
+  // next read will reflect the erased rows (free rows are skipped).
+  invalidateColumnStatsCache();
 }
 
 int32_t RowContainer::findRows(folly::Range<char**> rows, char** result) const {
@@ -613,42 +600,65 @@ RowColumn::Stats RowColumn::Stats::merge(
 std::optional<RowColumn::Stats> RowContainer::columnStats(
     int32_t columnIndex) const {
   if (rowColumnsStats_.empty()) {
+    // Column stats have been invalidated.
     return std::nullopt;
+  }
+  if (!statsMaterialized_) {
+    recomputeColumnStats();
   }
   return rowColumnsStats_[columnIndex];
 }
 
-void RowContainer::updateColumnStats(
-    const DecodedVector& decoded,
-    vector_size_t rowIndex,
-    char* row,
-    int32_t columnIndex) {
-  if (rowColumnsStats_.empty()) {
-    // Column stats have been invalidated.
-    return;
+void RowContainer::recomputeColumnStats() const {
+  // Reset stats to a clean slate, then do a one-shot scan of all live rows.
+  // Free rows (erased but not yet reused) are skipped via the free flag.
+  for (auto& stats : rowColumnsStats_) {
+    stats = RowColumn::Stats{};
   }
 
-  auto& columnStats = rowColumnsStats_[columnIndex];
-  if (decoded.isNullAt(rowIndex)) {
-    columnStats.addNullCell();
-  } else if (types_[columnIndex]->isFixedWidth()) {
-    columnStats.addCellSize(fixedSizeAt(columnIndex));
-  } else {
-    columnStats.addCellSize(variableSizeAt(row, columnIndex));
+  const auto numAllocations = rows_.numRanges();
+  // Row stride spans allocations: normalized keys are laid out once at the
+  // front of the first numRowsWithNormalizedKey_ rows, so the stride shrinks
+  // by originalNormalizedKeySize_ after those rows are passed. 'curRowSize'
+  // must persist across allocations (mirrors listRows), not reset per range.
+  // Use originalNormalizedKeySize_ (not normalizedKeySize_, which may be 0
+  // after disableNormalizedKeys()): the already-allocated early rows were
+  // sized with the original value.
+  int32_t curRowSize =
+      fixedRowSize_ + (numRowsWithNormalizedKey_ > 0 ? originalNormalizedKeySize_ : 0);
+  int64_t normalizedKeysLeft = numRowsWithNormalizedKey_;
+  for (auto i = 0; i < numAllocations; ++i) {
+    auto range = rows_.rangeAt(i);
+    auto* data = range.data() + memory::alignmentPadding(range.data(), alignment_);
+    auto limit = range.size() -
+        (reinterpret_cast<uintptr_t>(data) -
+         reinterpret_cast<uintptr_t>(range.data()));
+    int64_t row = 0;
+    while (row + curRowSize <= limit) {
+      char* rowPtr = data + row +
+          (normalizedKeysLeft > 0 ? originalNormalizedKeySize_ : 0);
+      row += curRowSize;
+      // Shrink the stride for subsequent rows once normalized keys are used up.
+      if (--normalizedKeysLeft == 0) {
+        curRowSize -= originalNormalizedKeySize_;
+      }
+      // Skip freed rows: their cell values are stale and must not be counted.
+      if (bits::isBitSet(rowPtr, freeFlagOffset_)) {
+        continue;
+      }
+      for (auto c = 0; c < types_.size(); ++c) {
+        const auto& column = rowColumns_[c];
+        if (isNullAt(rowPtr, column)) {
+          rowColumnsStats_[c].addNullCell();
+        } else if (types_[c]->isFixedWidth()) {
+          rowColumnsStats_[c].addCellSize(fixedSizeAt(c));
+        } else {
+          rowColumnsStats_[c].addCellSize(variableSizeAt(rowPtr, c));
+        }
+      }
+    }
   }
-}
-
-void RowContainer::updateColumnStats(char* row, int32_t columnIndex) {
-  const bool nullColumn = isNullAt(row, rowColumns_[columnIndex]);
-
-  auto& columnStats = rowColumnsStats_[columnIndex];
-  if (nullColumn) {
-    columnStats.addNullCell();
-  } else if (types_[columnIndex]->isFixedWidth()) {
-    columnStats.addCellSize(fixedSizeAt(columnIndex));
-  } else {
-    columnStats.addCellSize(variableSizeAt(row, columnIndex));
-  }
+  statsMaterialized_ = true;
 }
 
 void RowContainer::store(
@@ -682,7 +692,9 @@ void RowContainer::store(
         rowColumn.nullMask(),
         columnIndex);
   }
-  updateColumnStats(decoded, rowIndex, row, columnIndex);
+  // Stats are lazily materialized on first read; invalidate the cache so the
+  // next consumer sees fresh data instead of maintaining stats per-row here.
+  invalidateColumnStatsCache();
 }
 
 void RowContainer::store(
@@ -914,7 +926,16 @@ void RowContainer::storeSerializedRow(
       const auto size = storeVariableSizeAt(serialized.data() + offset, row, i);
       offset += size;
     }
-    updateColumnStats(row, i);
+  }
+  // Stats are lazily materialized on first read; a serialized row store is a
+  // write, so invalidate the cache for the next consumer.
+  invalidateColumnStatsCache();
+  // A deserialized row may carry per-column null bits in its flag bytes; record
+  // any null columns so columnHasNulls() stays correct without a full scan.
+  for (auto i = 0; i < types_.size(); ++i) {
+    if (isNullAt(row, rowColumns_[i])) {
+      columnHasNulls_[i] = true;
+    }
   }
 }
 
@@ -1195,6 +1216,7 @@ void RowContainer::storeComplexType(
   if (decoded.isNullAt(index)) {
     VELOX_DCHECK(nullMask);
     row[nullByte] |= nullMask;
+    columnHasNulls_[column] = true;
     return;
   }
   RowSizeTracker tracker(row[rowSizeOffset_], *stringAllocator_);
@@ -1370,6 +1392,10 @@ void RowContainer::clear() {
 
   rowColumnsStats_.clear();
   rowColumnsStats_.resize(types_.size());
+  // After clear, stats are empty and not yet materialized; the next consumer
+  // will recompute (yielding an all-zero result over zero rows).
+  statsMaterialized_ = false;
+  std::fill(columnHasNulls_.begin(), columnHasNulls_.end(), false);
 }
 
 void RowContainer::setProbedFlag(char** rows, int32_t numRows) {

@@ -348,11 +348,15 @@ class RowContainer {
   /// a row with uninitialized keys for aggregates with no-op partial
   /// aggregation.
   void setAllNull(char* row) {
-    removeOrUpdateRowColumnStats(row, /*setToNull=*/true);
     if (!nullOffsets_.empty()) {
       memset(row + nullByte(nullOffsets_[0]), 0xff, initialNulls_.size());
       bits::clearBit(row, freeFlagOffset_);
     }
+    // setAllNull is a write; invalidate the lazily-materialized stats cache so
+    // the next consumer recomputes from the now-nulled row.
+    invalidateColumnStatsCache();
+    // Every nullable column now has a null in this row.
+    std::fill(columnHasNulls_.begin(), columnHasNulls_.end(), true);
   }
 
   /// The row size excluding any out-of-line stored variable length values.
@@ -843,20 +847,29 @@ class RowContainer {
   /// Returns the aggregated column stats of the column with given
   /// 'columnIndex'. nullopt will be returned if the column stats was previous
   /// invalidated. Any row erase operations will invalidate column stats.
+  ///
+  /// Stats are lazily materialized on first call after a write (store/erase/
+  /// clear); the materialization is a one-shot full scan of live rows. This
+  /// keeps the store() hot path free of per-row stats maintenance.
   std::optional<RowColumn::Stats> columnStats(int32_t columnIndex) const;
 
-  uint32_t columnNullCount(int32_t columnIndex) {
-    return rowColumnsStats_[columnIndex].nullCount();
+  uint32_t columnNullCount(int32_t columnIndex) const {
+    auto stats = columnStats(columnIndex);
+    return stats.has_value() ? stats->nullCount() : 0;
   }
 
-  const auto& keyTypes() const {
+  const std::vector<TypePtr>& keyTypes() const {
     return keyTypes_;
   }
 
   /// Returns true if specified column has nulls, false otherwise.
+  /// Backed by the O(1) incrementally-maintained 'columnHasNulls_' flag, NOT
+  /// the lazily-materialized full stats — callers (extractColumn fast/slow
+  /// path, PrefixSort/SpillRadixSort normalized key, prepareJoinTable flag
+  // merge) only need the boolean. This avoids triggering recomputeColumnStats()
+  // on the store/finish/spill hot paths.
   inline bool columnHasNulls(int32_t columnIndex) const {
-    return columnStats(columnIndex)->numCells() > 0 &&
-        columnStats(columnIndex)->nullCount() > 0;
+    return columnHasNulls_[columnIndex];
   }
 
   const std::vector<Accumulator>& accumulators() const {
@@ -1023,13 +1036,6 @@ class RowContainer {
     }
   }
 
-  /// Removes or updates the column stats of a given row by updating each column
-  /// stats.
-  /// @param row - Points to the row to be removed or updated.
-  /// @param setToNull - If true, the row stats is set to a null row,
-  /// otherwise, the stats is erased from the columns stats.
-  void removeOrUpdateRowColumnStats(const char* row, bool setToNull);
-
   char*& nextFree(char* row) const {
     return *reinterpret_cast<char**>(row + kNextFreeOffset);
   }
@@ -1052,6 +1058,10 @@ class RowContainer {
     using T = typename TypeTraits<Kind>::NativeType;
     if (decoded.isNullAt(rowIndex)) {
       row[nullByte] |= nullMask;
+      // Record that this column has at least one null so columnHasNulls()
+      // can answer in O(1) without a full stats recompute scan. Monotone set;
+      // never cleared except by clear().
+      columnHasNulls_[columnIndex] = true;
       // Do not leave an uninitialized value in the case of a
       // null. This is an error with valgrind/asan.
       *reinterpret_cast<T*>(row + offset) = T();
@@ -1095,8 +1105,10 @@ class RowContainer {
     for (int32_t i = 0; i < rows.size(); ++i) {
       storeWithNulls<Kind>(
           decoded, i, isKey, rows[i], offset, nullByte, nullMask, column);
-      updateColumnStats(decoded, i, rows[i], column);
     }
+    // Stats are lazily materialized on first read; invalidate the cache so the
+    // next consumer sees fresh data instead of maintaining stats per-row here.
+    invalidateColumnStatsCache();
   }
 
   template <TypeKind Kind>
@@ -1108,8 +1120,10 @@ class RowContainer {
       int32_t column) {
     for (int32_t i = 0; i < rows.size(); ++i) {
       storeNoNulls<Kind>(decoded, i, isKey, rows[i], offset);
-      updateColumnStats(decoded, i, rows[i], column);
     }
+    // Stats are lazily materialized on first read; invalidate the cache so the
+    // next consumer sees fresh data instead of maintaining stats per-row here.
+    invalidateColumnStatsCache();
   }
 
   template <bool useRowNumbers, typename T>
@@ -1518,21 +1532,19 @@ class RowContainer {
 
   void freeRowsExtraMemory(folly::Range<char**> rows, bool freeNextRowVector);
 
-  inline void updateColumnStats(
-      const DecodedVector& decoded,
-      vector_size_t rowIndex,
-      char* row,
-      int32_t columnIndex);
+  // Lazily (re)compute aggregated column stats by scanning all live rows.
+  // Stats are not maintained on every store(); instead they are materialized
+  // on first read and invalidated by any subsequent write (store/erase/clear).
+  // This moves the O(N*C) per-batch maintenance cost off the store hot path
+  // into a one-shot O(N*V) cold scan at the consumer (only variable-width
+  // columns have consumers: estimatedRowSize / SpillRadixSort / PrefixSort).
+  void recomputeColumnStats() const;
 
-  // Updates column stats for serialized row.
-  inline void updateColumnStats(char* row, int32_t columnIndex);
-
-  // Min/max column stats do not support row erasures. This
-  // method is called whenever a row is erased.
-  void invalidateMinMaxColumnStats() {
-    for (auto columnStats : rowColumnsStats_) {
-      columnStats.invalidateMinMaxColumnStats();
-    }
+  // Marks the lazily-materialized stats cache as stale. Called by every write
+  // path (store, storeSerializedRow, eraseRows, clear) so the next read
+  // triggers a fresh recompute.
+  void invalidateColumnStatsCache() {
+    statsMaterialized_ = false;
   }
 
   const std::vector<TypePtr> keyTypes_;
@@ -1569,7 +1581,27 @@ class RowContainer {
   std::vector<RowColumn> rowColumns_;
   // Aggregated column stats(e.g. min/max size) for non-aggregate
   // fields. Index aligns with 'rowColumns_'.
-  std::vector<RowColumn::Stats> rowColumnsStats_;
+  //
+  // Lazily materialized: not maintained on store(). 'statsMaterialized_'
+  // gates a one-shot full scan on first read. mutable because columnStats()
+  // is const (callers hold const RowContainer*) yet triggers materialization.
+  mutable std::vector<RowColumn::Stats> rowColumnsStats_;
+  mutable bool statsMaterialized_{false};
+  // Lightweight per-column "has null" flag, maintained incrementally on store
+  // (set true when a null cell is written). Monotone: once true it stays true
+  // across erases — erasing a row cannot prove no other live row is null
+  // without a full scan, so we keep the conservative true. This may cause
+  // extractColumn to take the (correct, slightly slower) withNulls path after
+  // the last null of a column is erased, which is an acceptable trade for
+  // removing per-erase removeOrUpdateRowColumnStats maintenance. 'clear()'
+  // resets all flags to false.
+  // This lets columnHasNulls() answer in O(1) without triggering a full
+  // recomputeColumnStats() scan, which is all any columnHasNulls() caller needs
+  // (extractColumn fast/slow path, PrefixSort/SpillRadixSort normalized key,
+  // HashTable::prepareJoinTable flag merge). Only consumers needing min/max/sum
+  // (estimatedRowSize, SpillRadixSort::generateLayout) go through columnStats()
+  // and pay the lazy recompute.
+  std::vector<bool> columnHasNulls_;
   // Bit offset of the probed flag for a full or right outer join  payload. 0 if
   // not applicable.
   int32_t probedFlagOffset_ = 0;
@@ -1697,6 +1729,7 @@ inline void RowContainer::storeWithNulls<TypeKind::HUGEINT>(
   if (decoded.isNullAt(rowIndex)) {
     row[nullByte] |= nullMask;
     memset(row + offset, 0, sizeof(int128_t));
+    columnHasNulls_[columnIndex] = true;
     return;
   }
   HugeInt::serialize(decoded.valueAt<int128_t>(rowIndex), row + offset);
