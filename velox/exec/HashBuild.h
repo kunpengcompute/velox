@@ -290,6 +290,15 @@ class HashBuild final : public Operator {
   // Vector used to read from spilled input with type of 'spillType_'.
   RowVectorPtr spillInput_;
 
+  // The start partition bit offset of the spilled input being restored. It is
+  // set in 'setupSpiller' when the build input comes from a spilled partition,
+  // and advances (right shifts) with each level of recursive spilling. It is
+  // passed to the hash table so that 'checkHashBitsOverlap' can validate the
+  // table's internal hash bits do not overlap with the spill partition bits.
+  // Set to 'kNoSpillInputStartPartitionBit' (-1) if the input is not from spill.
+  int8_t spillInputStartPartitionBit_{
+      BaseHashTable::kNoSpillInputStartPartitionBit};
+
   // Reusable memory for spill partition calculation for input data.
   std::vector<uint32_t> spillPartitions_;
 

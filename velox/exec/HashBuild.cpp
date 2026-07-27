@@ -206,6 +206,11 @@ void HashBuild::setupSpiller(SpillPartition* spillPartition) {
         config->readBufferSize, pool(), &spillStats_);
     startPartitionBit =
         spillPartition->id().partitionBitOffset() + config->numPartitionBits;
+    // Record the advanced start partition bit for the restored spill input so
+    // that the rebuilt hash table can validate hash bits overlap against the
+    // correct (recursive) spill partition bit, not the fixed config value.
+    spillInputStartPartitionBit_ =
+        static_cast<int8_t>(startPartitionBit);
     // Disable spilling if exceeding the max spill level and the query might run
     // out of memory if the restored partition still can't fit in memory.
     if (config->exceedSpillLevelLimit(startPartitionBit)) {
@@ -782,8 +787,7 @@ bool HashBuild::finishHashBuild() {
     CpuWallTimer cpuWallTimer{timing};
     table_->prepareJoinTable(
         std::move(otherTables),
-        isInputFromSpill() ? spillConfig()->startPartitionBit
-                           : BaseHashTable::kNoSpillInputStartPartitionBit,
+        spillInputStartPartitionBit_,
         allowParallelJoinBuild ? operatorCtx_->task()->queryCtx()->executor()
                                : nullptr);
   }
