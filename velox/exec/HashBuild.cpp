@@ -933,6 +933,31 @@ void HashBuild::addRuntimeStats() {
   const auto hashTableStats = table_->stats();
   uint64_t asRange{0};
   uint64_t asDistinct{0};
+
+  // When spill-replay build finishes with table index overlapping configured
+  // spill partition bits, inserts may be slower (see checkHashBitsOverlap).
+  // Visible by default under Gluten (glogSeverityLevel defaults to WARNING).
+  if (spillInputStartPartitionBit_ !=
+          BaseHashTable::kNoSpillInputStartPartitionBit &&
+      spillConfig() != nullptr) {
+    const auto sizeBits = hashTableStats.sizeBits;
+    const auto spillConfigStartBit =
+        static_cast<int64_t>(spillConfig()->startPartitionBit);
+    const auto spillPartitionBits =
+        static_cast<int64_t>(spillConfig()->numPartitionBits);
+    const auto spillCheckRightBit =
+        static_cast<int64_t>(spillInputStartPartitionBit_);
+    if (spillConfigStartBit < sizeBits && sizeBits <= spillCheckRightBit) {
+      // TODO: reduce the log frequency if it is too verbose.
+      LOG(WARNING)
+          << "HashBuild table index overlaps spill partition bits: sizeBits="
+          << sizeBits << ", spillConfigStartBit=" << spillConfigStartBit
+          << ", spillPartitionBits=" << spillPartitionBits
+          << ", spillCheckRightBit=" << spillCheckRightBit
+          << ", pool=" << pool()->name();
+    }
+  }
+
   auto lockedStats = stats_.wlock();
 
   lockedStats->addInputTiming.add(table_->offThreadBuildTiming());
