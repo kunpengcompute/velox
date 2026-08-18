@@ -73,4 +73,19 @@ class SpillRadixSort {
       "spillRadixSortResidualGroups"};
 };
 
+namespace detail {
+
+/// Counting pass of the spill LSD radix sort. Builds a histogram of the byte
+/// at 'byteOffset' of every prefix in 'in', converts it to an exclusive prefix
+/// sum, and scatters 'in' into 'out' so rows with the same byte are
+/// contiguous and stable. Exposed for unit testing; 'out' must be able to
+/// hold 'numRows' pointers.
+void spillRadixSortCountingPass(
+    char** in,
+    char** out,
+    size_t numRows,
+    uint32_t byteOffset);
+
+} // namespace detail
+
 } // namespace facebook::velox::exec

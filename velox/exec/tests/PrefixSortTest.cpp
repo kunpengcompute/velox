@@ -557,6 +557,86 @@ TEST_F(PrefixSortTest, spillRadixSortCanSortNegative) {
   }
 }
 
+// Verifies the radix counting pass
+// (facebook::velox::exec::detail::spillRadixSortCountingPass):
+// it buckets rows by the byte at 'byteOffset' of each prefix and scatters
+// them into 'out' in stable order. We compare against a scalar reference.
+TEST_F(PrefixSortTest, spillRadixSortCountingPass) {
+  constexpr size_t kNumRows = 10'000;
+  constexpr size_t kEntrySize = 64;
+  constexpr uint32_t kByteOffset = 27;
+  constexpr uint32_t kTrialOffset = 13;
+
+  // Reference implementation (scalar).
+  auto referenceCountingPass =
+      [](char** in,
+         char** out,
+         size_t numRows,
+         uint32_t byteOffset) {
+        std::vector<uint32_t> counts(257, 0);
+        for (size_t i = 0; i < numRows; ++i) {
+          ++counts[1 + static_cast<uint8_t>(*(in[i] + byteOffset))];
+        }
+        for (int32_t i = 1; i < 256; ++i) {
+          counts[i] += counts[i - 1];
+        }
+        for (size_t i = 0; i < numRows; ++i) {
+          const auto key = static_cast<uint8_t>(*(in[i] + byteOffset));
+          out[counts[key]++] = in[i];
+        }
+      };
+
+  // Build a contiguous prefix buffer with unique rows so we can verify
+  // stability: row j occupies bytes [j * kEntrySize, (j+1) * kEntrySize).
+  const size_t bufferSize = kNumRows * kEntrySize;
+  std::vector<char> prefix(bufferSize);
+  for (size_t j = 0; j < kNumRows; ++j) {
+    // Fill the whole row with deterministic pseudo-random bytes.
+    for (size_t b = 0; b < kEntrySize; ++b) {
+      prefix[j * kEntrySize + b] =
+          static_cast<char>((j * 131 + b * 17 + (b * b) % 251) & 0xff);
+    }
+  }
+  std::vector<char*> rows(kNumRows);
+  for (size_t j = 0; j < kNumRows; ++j) {
+    rows[j] = prefix.data() + j * kEntrySize;
+  }
+
+  // Compare the two byte offsets in both directions: the counting pass must
+  // produce the same stable scatter as the scalar reference, and the two
+  // offsets must agree with each other (a permutation of all rows).
+  for (uint32_t byteOffset : {kByteOffset, kTrialOffset}) {
+    std::vector<char*> outSve(kNumRows, nullptr);
+    std::vector<char*> outScalar(kNumRows, nullptr);
+    facebook::velox::exec::detail::spillRadixSortCountingPass(
+        rows.data(), outSve.data(), kNumRows, byteOffset);
+    referenceCountingPass(
+        rows.data(), outScalar.data(), kNumRows, byteOffset);
+
+    EXPECT_EQ(outSve, outScalar) << "counting pass mismatch at byte "
+                                 << byteOffset;
+
+    // Every row must appear exactly once (stable permutation).
+    std::vector<bool> seen(kNumRows, false);
+    for (size_t j = 0; j < kNumRows; ++j) {
+      const auto rowIndex = (outSve[j] - prefix.data()) / kEntrySize;
+      ASSERT_LT(rowIndex, kNumRows);
+      EXPECT_FALSE(seen[rowIndex]);
+      seen[rowIndex] = true;
+    }
+  }
+
+  // Edge cases: empty input and single row.
+  {
+    std::vector<char*> out(1, nullptr);
+    facebook::velox::exec::detail::spillRadixSortCountingPass(
+        rows.data(), out.data(), 0, kByteOffset);
+    facebook::velox::exec::detail::spillRadixSortCountingPass(
+        rows.data(), out.data(), 1, kByteOffset);
+    EXPECT_EQ(out[0], rows[0]);
+  }
+}
+
 TEST_F(PrefixSortTest, singleKeyWithNulls) {
   // Vectors with nulls.
   const std::vector<VectorPtr> testData = {
