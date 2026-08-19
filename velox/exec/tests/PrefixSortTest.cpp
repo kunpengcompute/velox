@@ -15,6 +15,7 @@
  */
 
 #include <functional>
+#include <optional>
 #include <gtest/gtest.h>
 
 #include "velox/common/base/Exceptions.h"
@@ -605,10 +606,14 @@ TEST_F(PrefixSortTest, spillRadixSortAllocationFailureFallback) {
     EXPECT_TRUE(SpillRadixSort::canSort(
         &rowContainer, compareFlags, rows.size(), config));
 
+    // The scoped injection must outlive the sort() call below, so it is
+    // declared outside the 'if' (ScopedTestValue unregisters the hook in its
+    // destructor, which would otherwise run at the end of the 'if' block).
+    std::optional<common::testutil::ScopedTestValue> injection;
     if (injectFailure) {
       // Force the chunk allocation to fail so sort() falls back to the
       // comparator path.
-      SCOPED_TESTVALUE_SET(
+      injection.emplace(
           "SpillRadixSort::sort::allocateChunks",
           std::function<void(bool*)>([&](bool*) {
             throw VeloxRuntimeError(

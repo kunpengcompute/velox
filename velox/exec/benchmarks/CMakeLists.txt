@@ -96,6 +96,15 @@ target_link_libraries(
   velox_vector_test_lib
   Folly::follybenchmark)
 
+add_executable(velox_spill_radix_sort_benchmark SpillRadixSortBenchmark.cpp)
+
+target_link_libraries(
+  velox_spill_radix_sort_benchmark
+  velox_exec
+  velox_vector_fuzzer
+  velox_vector_test_lib
+  Folly::follybenchmark)
+
 add_executable(velox_window_prefixsort_benchmark WindowPrefixSortBenchmark.cpp)
 
 target_link_libraries(
