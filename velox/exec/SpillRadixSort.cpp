@@ -188,23 +188,59 @@ int compareNonPrefixKeys(
   return 0;
 }
 
+// The histogram is split into kNumWays independent 257-entry counters
+// (rows routed by index % kNumWays) to break the store->load dependency
+// chain of the scalar counts[..]++ loop, and a software prefetch hides the
+// latency of the scattered row-byte loads. The sub-histograms are merged
+// before the prefix-sum pass. Note: an SVE svld1_gather_u64base_offset_u64
+// variant was tried first but regressed on Kunpeng 920 — the gather
+// instruction stalls on the slowest of 4 scattered cache lines while
+// over-fetching 8 bytes per lane (only the low byte is used), so the scalar
+// load + prefetch path wins.
+constexpr int32_t kNumWays = 4;
+constexpr int32_t kPrefetchDistance = 64;
+
 void countingPass(
     char** in,
     char** out,
     size_t numRows,
     uint32_t byteOffset) {
-  uint32_t counts[257];
+  uint32_t counts[kNumWays][257];
   std::memset(counts, 0, sizeof(counts));
 
-  for (size_t i = 0; i < numRows; ++i) {
-    ++counts[1 + static_cast<uint8_t>(*(in[i] + byteOffset))];
+  // Histogram: 4 independent counter arrays remove the store->load
+  // dependency of counts[..]++; prefetch the scattered row bytes.
+  size_t i = 0;
+  for (; i + kPrefetchDistance < numRows; ++i) {
+    __builtin_prefetch(in[i + kPrefetchDistance] + byteOffset);
+    ++counts[i & (kNumWays - 1)][1 + static_cast<uint8_t>(*(in[i] + byteOffset))];
   }
-  for (int32_t i = 1; i < 256; ++i) {
-    counts[i] += counts[i - 1];
+  for (; i < numRows; ++i) {
+    ++counts[i & (kNumWays - 1)][1 + static_cast<uint8_t>(*(in[i] + byteOffset))];
   }
-  for (size_t i = 0; i < numRows; ++i) {
+
+  // Merge sub-histograms into counts[0].
+  for (int32_t b = 1; b <= 256; ++b) {
+    for (int32_t way = 1; way < kNumWays; ++way) {
+      counts[0][b] += counts[way][b];
+    }
+  }
+
+  // Prefix sums (exclusive).
+  for (int32_t b = 1; b < 256; ++b) {
+    counts[0][b] += counts[0][b - 1];
+  }
+
+  // Scatter pass: prefetch the sort bytes ahead of the dependent stores.
+  i = 0;
+  for (; i + kPrefetchDistance < numRows; ++i) {
+    __builtin_prefetch(in[i + kPrefetchDistance] + byteOffset);
     const auto key = static_cast<uint8_t>(*(in[i] + byteOffset));
-    out[counts[key]++] = in[i];
+    out[counts[0][key]++] = in[i];
+  }
+  for (; i < numRows; ++i) {
+    const auto key = static_cast<uint8_t>(*(in[i] + byteOffset));
+    out[counts[0][key]++] = in[i];
   }
 }
 
@@ -405,5 +441,17 @@ void SpillRadixSort::sort(
     rows[i] = rowFromPrefix(sorted[i], layout);
   }
 }
+
+namespace detail {
+
+void spillRadixSortCountingPass(
+    char** in,
+    char** out,
+    size_t numRows,
+    uint32_t byteOffset) {
+  countingPass(in, out, numRows, byteOffset);
+}
+
+} // namespace detail
 
 } // namespace facebook::velox::exec
