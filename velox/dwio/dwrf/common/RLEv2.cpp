@@ -18,9 +18,33 @@
 #include "velox/dwio/common/SeekableInputStream.h"
 #include "velox/dwio/dwrf/common/Common.h"
 
+#include <arm_sve.h>
+
 namespace facebook::velox::dwrf {
 
 using memory::MemoryPool;
+
+// Build an SVE predicate where lane i is active iff nulls bit `pos+i` is set
+// (i.e. the position is NOT null / valid). The bitmap is bit-packed MSB-first
+// within each uint64_t word. pgTail gates which lanes participate (use
+// svptrue_b64 for a full vector, or svwhilelt for a partial tail vector).
+// Requires nulls to cover at least floor((pos+cnt)/64)+1 words.
+static inline svbool_t nullBitsToPredicate(const uint64_t* nulls,
+                                           uint64_t pos,
+                                           svbool_t pgTail) {
+  const uint64_t cnt = svcntd();
+  const uint64_t wordIdx = pos >> 6;
+  const uint64_t bitOff = pos & 63;
+  uint64_t bits = nulls[wordIdx] >> bitOff;
+  if (bitOff + cnt > 64) {
+    bits |= nulls[wordIdx + 1] << (64 - bitOff);
+  }
+  svuint64_t vbits = svdup_u64(bits);
+  svuint64_t vidx = svindex_u64(0, 1);
+  svuint64_t vbit = svand_n_u64_x(
+      pgTail, svlsr_u64_x(pgTail, vbits, vidx), 1);
+  return svcmpne_n_u64(pgTail, vbit, 0);
+}
 
 struct FixedBitSizes {
   enum FBS {
@@ -143,7 +167,8 @@ RleDecoderV2<isSigned>::RleDecoderV2(
       patchMask_(0),
       actualGap_(0),
       unpacked_(pool, 0),
-      unpackedPatch_(pool, 0) {}
+      unpackedPatch_(pool, 0),
+      bulkScratch_(pool, 0) {}
 
 template RleDecoderV2<true>::RleDecoderV2(
     std::unique_ptr<dwio::common::SeekableInputStream> input,
@@ -508,17 +533,41 @@ uint64_t RleDecoderV2<isSigned>::nextShortRepeats(
   uint64_t nRead = std::min(runLength_ - runRead_, numValues);
 
   if (nulls) {
-    for (uint64_t pos = offset; pos < offset + nRead; ++pos) {
+    // SVE: broadcast firstValue_ and store only to non-null lanes. runRead_
+    // advances by the count of non-null positions (matches the scalar loop,
+    // which only ++runRead_ for valid lanes).
+    const uint64_t end = offset + nRead;
+    uint64_t pos = offset;
+    const uint64_t cnt = svcntd();
+    svint64_t vval = svdup_n_s64(firstValue_);
+    for (; pos + cnt <= end; pos += cnt) {
+      // bit i==1 in the null bitmap means valid; build a predicate from it.
+      svbool_t pgValid = nullBitsToPredicate(nulls, pos, svptrue_b64());
+      // Predicated store: null lanes keep their original value.
+      svst1_s64(pgValid, reinterpret_cast<int64_t*>(data + pos), vval);
+      // runRead_ += number of active (valid) lanes in this vector.
+      runRead_ += svcntp_b64(svptrue_b64(), pgValid);
+    }
+    // Tail: remaining elements that don't fill a full vector.
+    for (; pos < end; ++pos) {
       if (!bits::isBitNull(nulls, pos)) {
         data[pos] = firstValue_;
         ++runRead_;
       }
     }
   } else {
-    for (uint64_t pos = offset; pos < offset + nRead; ++pos) {
-      data[pos] = firstValue_;
-      ++runRead_;
-    }
+    // No nulls: unconditionally fill [offset, offset+nRead) with firstValue_.
+    // runRead_ advances by nRead (every position is valid).
+    uint64_t pos = offset;
+    const uint64_t end = offset + nRead;
+    svint64_t vval = svdup_n_s64(firstValue_);
+    svbool_t pg = svwhilelt_b64_u64(pos, end);
+    do {
+      svst1_s64(pg, reinterpret_cast<int64_t*>(data + pos), vval);
+      pos += svcntd();
+      pg = svwhilelt_b64_u64(pos, end);
+    } while (svptest_first(svptrue_b64(), pg));
+    runRead_ += nRead;
   }
 
   return nRead;
@@ -534,6 +583,106 @@ template uint64_t RleDecoderV2<false>::nextShortRepeats(
     uint64_t offset,
     uint64_t numValues,
     const uint64_t* nulls);
+
+static inline void zigzagDecodeVectorizedWithNull(int64_t* data,
+                                                  const uint64_t* nulls,
+                                                  uint64_t offset,
+                                                  uint64_t nRead) {
+  const uint64_t end = offset + nRead;
+  uint64_t pos = offset;
+  const uint64_t cnt = svcntd();
+
+  for (; pos + cnt <= end; pos += cnt) {
+    const uint64_t wordIdx = pos >> 6;
+    const uint64_t bitOff  = pos & 63;
+    uint64_t bits = nulls[wordIdx] >> bitOff;
+    if (bitOff + cnt > 64) {
+      bits |= nulls[wordIdx + 1] << (64 - bitOff);
+    }
+
+    svuint64_t vbits = svdup_u64(bits);
+    svuint64_t vidx  = svindex_u64(0, 1);
+    svuint64_t vbit  = svand_n_u64_x(svptrue_b64(),
+                          svlsr_u64_x(svptrue_b64(), vbits, vidx),
+                          1);
+    svbool_t pgValid = svcmpne_n_u64(svptrue_b64(), vbit, 0);
+
+    svint64_t  vdata    = svld1_s64(svptrue_b64(),
+                                    reinterpret_cast<const int64_t*>(data + pos));
+    svuint64_t vu       = svreinterpret_u64_s64(vdata);
+    svuint64_t vshifted = svlsr_n_u64_x(svptrue_b64(), vu, 1);
+    svuint64_t vlow     = svand_n_u64_x(svptrue_b64(), vu, 1);
+    svuint64_t vneg     = svsub_u64_x(svptrue_b64(), svdup_n_u64(0), vlow);
+    svuint64_t vres     = sveor_u64_x(svptrue_b64(), vshifted, vneg);
+    svint64_t  vout     = svreinterpret_s64_u64(vres);
+
+    svst1_s64(pgValid, reinterpret_cast<int64_t*>(data + pos), vout);
+  }
+
+  for (; pos < end; ++pos) {
+    if (!bits::isBitNull(nulls, pos)) {
+      data[pos] = ZigZag::decode<uint64_t>(static_cast<uint64_t>(data[pos]));
+    }
+  }
+}
+
+// SVE1 inclusive prefix-sum (scan) of a signed 64-bit vector: result[i] =
+// x[0]+x[1]+...+x[i]. SVE has no native scan instruction, and svext requires
+// a *compile-time constant* index, so we dispatch over the common vector
+// lengths (2/4/8/16) and expand the Hillis-Steele scan with constant strides.
+//
+// svext_s64(zero, v, imm) concatenates zero:v and takes VL lanes starting at
+// element imm of zero, i.e. it shifts v left by (VL - imm) lanes with zero
+// fill. To shift left by s lanes, pass imm = VL - s. Hillis-Steele needs the
+// power-of-two shifts s = 1, 2, ..., VL/2 (order irrelevant: each lane i then
+// accumulates x[i-t] exactly once for every t in [0, i], since every t is a
+// unique subset sum of the shifts).
+//
+// The active predicate pgAll gates which lanes participate; inactive lanes
+// keep x's value (callers mask the result).
+static inline svint64_t inclusiveScanAddS64(svint64_t x, svbool_t pgAll) {
+  svint64_t sum = x;
+  switch (svcntd()) {
+    case 16:
+      // shifts 1, 2, 4, 8 -> imm 15, 14, 12, 8
+      sum = svadd_s64_x(pgAll, sum, svext_s64(svdup_n_s64(0), sum, 15));
+      sum = svadd_s64_x(pgAll, sum, svext_s64(svdup_n_s64(0), sum, 14));
+      sum = svadd_s64_x(pgAll, sum, svext_s64(svdup_n_s64(0), sum, 12));
+      sum = svadd_s64_x(pgAll, sum, svext_s64(svdup_n_s64(0), sum, 8));
+      break;
+    case 8:
+      // shifts 1, 2, 4 -> imm 7, 6, 4
+      sum = svadd_s64_x(pgAll, sum, svext_s64(svdup_n_s64(0), sum, 7));
+      sum = svadd_s64_x(pgAll, sum, svext_s64(svdup_n_s64(0), sum, 6));
+      sum = svadd_s64_x(pgAll, sum, svext_s64(svdup_n_s64(0), sum, 4));
+      break;
+    case 4:
+      // shifts 1, 2 -> imm 3, 2
+      sum = svadd_s64_x(pgAll, sum, svext_s64(svdup_n_s64(0), sum, 3));
+      sum = svadd_s64_x(pgAll, sum, svext_s64(svdup_n_s64(0), sum, 2));
+      break;
+    case 2:
+      // shift 1 -> imm 1
+      sum = svadd_s64_x(pgAll, sum, svext_s64(svdup_n_s64(0), sum, 1));
+      break;
+    default: {
+      // Fallback for unusual lengths: scalar per-lane accumulation. Correct
+      // for any VLA length, just not vectorized. 32 covers the largest SVE
+      // register width in practice (2048-bit = 32 x int64).
+      const uint64_t cnt = svcntd();
+      int64_t carry = 0;
+      int64_t tmp[32];
+      svst1_s64(svptrue_b64(), tmp, x);
+      for (uint64_t i = 0; i < cnt; ++i) {
+        carry += tmp[i];
+        tmp[i] = carry;
+      }
+      sum = svld1_s64(svptrue_b64(), tmp);
+      break;
+    }
+  }
+  return sum;
+}
 
 template <bool isSigned>
 uint64_t RleDecoderV2<isSigned>::nextDirect(
@@ -560,16 +709,21 @@ uint64_t RleDecoderV2<isSigned>::nextDirect(
 
   if (isSigned) {
     if (nulls) {
-      for (uint64_t pos = offset; pos < offset + nRead; ++pos) {
-        if (!bits::isBitNull(nulls, pos)) {
-          data[pos] =
-              ZigZag::decode<uint64_t>(static_cast<uint64_t>(data[pos]));
-        }
-      }
+      zigzagDecodeVectorizedWithNull(data, nulls, offset, nRead);
     } else {
-      for (uint64_t pos = offset; pos < offset + nRead; ++pos) {
-        data[pos] = ZigZag::decode<uint64_t>(static_cast<uint64_t>(data[pos]));
-      }
+      uint64_t pos = offset;
+      const uint64_t end = offset + nRead;
+      svbool_t pg = svwhilelt_b64_u64(pos, end);
+      do {
+        svuint64_t v   = svld1_u64(pg, reinterpret_cast<const uint64_t*>(data + pos));
+        svuint64_t hi  = svlsr_n_u64_x(pg, v, 1);
+        svuint64_t lo  = svand_n_u64_x(pg, v, 1);
+        svuint64_t neg = svsub_u64_x(pg, svdup_n_u64(0), lo);
+        svuint64_t res = sveor_u64_x(pg, hi, neg);
+        svst1_u64(pg, reinterpret_cast<uint64_t*>(data + pos), res);
+        pos += svcntd();
+        pg = svwhilelt_b64_u64(pos, end);
+      } while (svptest_first(svptrue_b64(), pg));
     }
   }
 
@@ -765,13 +919,62 @@ uint64_t RleDecoderV2<isSigned>::nextDelta(
 
   if (bitSize_ == 0) {
     // add fixed deltas to adjacent values
-    for (; pos < offset + nRead; ++pos) {
-      // skip null positions
-      if (nulls && bits::isBitNull(nulls, pos)) {
-        continue;
+    if (nulls == nullptr) {
+      // No nulls: pure arithmetic progression. data[pos+k] =
+      // prevValue_ + (k+1)*deltaBase_. No cross-lane dependency, so each
+      // vector is built from prevValue_ and a (1..cnt)*delta ramp.
+      const uint64_t end = offset + nRead;
+      const uint64_t cnt = svcntd();
+      // vk = {1, 2, 3, ..., cnt} as signed, so vk*deltaBase_ is the per-lane
+      // step relative to prevValue_.
+      svint64_t vk = svreinterpret_s64_u64(svindex_u64(1, 1));
+      svint64_t vdelta = svdup_n_s64(deltaBase_);
+      for (; pos + cnt <= end; pos += cnt) {
+        svint64_t vstep = svmul_s64_x(svptrue_b64(), vk, vdelta);
+        svint64_t vval = svadd_n_s64_x(svptrue_b64(), vstep, prevValue_);
+        svst1_s64(svptrue_b64(), reinterpret_cast<int64_t*>(data + pos), vval);
+        // All cnt lanes written: newest value = prevValue_ + cnt*deltaBase_.
+        prevValue_ += static_cast<int64_t>(cnt) * deltaBase_;
+        runRead_ += cnt;
       }
-      prevValue_ = data[pos] = prevValue_ + deltaBase_;
-      ++runRead_;
+      // Tail: remaining < cnt elements, scalar.
+      for (; pos < end; ++pos) {
+        prevValue_ = data[pos] = prevValue_ + deltaBase_;
+        ++runRead_;
+      }
+    } else {
+      // Nulls present: prevValue_ only advances on non-null positions. The
+      // k-th valid lane gets prevValue_ + k*deltaBase_, where k is its rank
+      // among valid lanes (1-based, inclusive). Compute that rank via an
+      // inclusive scan of the per-lane validity mask.
+      const uint64_t end = offset + nRead;
+      const uint64_t cnt = svcntd();
+      for (; pos + cnt <= end; pos += cnt) {
+        svbool_t pgValid = nullBitsToPredicate(nulls, pos, svptrue_b64());
+        // vone[i] = 1 if lane i is valid, else 0.
+        svint64_t vone =
+            svsel_s64(pgValid, svdup_n_s64(1), svdup_n_s64(0));
+        // vrank[i] = count of valid lanes in [0..i] (inclusive). Null lanes
+        // contribute 0, so they don't advance the rank.
+        svint64_t vrank = inclusiveScanAddS64(vone, svptrue_b64());
+        // value = prevValue_ + vrank * deltaBase_.
+        svint64_t vstep = svmul_n_s64_x(svptrue_b64(), vrank, deltaBase_);
+        svint64_t vval = svadd_n_s64_x(svptrue_b64(), vstep, prevValue_);
+        // Store only valid lanes; null lanes keep their original value.
+        svst1_s64(pgValid, reinterpret_cast<int64_t*>(data + pos), vval);
+        // Advance carry by the number of valid lanes in this vector.
+        const uint64_t nValid = svcntp_b64(svptrue_b64(), pgValid);
+        prevValue_ += static_cast<int64_t>(nValid) * deltaBase_;
+        runRead_ += nValid;
+      }
+      // Tail: remaining elements, scalar.
+      for (; pos < end; ++pos) {
+        if (bits::isBitNull(nulls, pos)) {
+          continue;
+        }
+        prevValue_ = data[pos] = prevValue_ + deltaBase_;
+        ++runRead_;
+      }
     }
   } else {
     for (; pos < offset + nRead; ++pos) {
@@ -793,20 +996,94 @@ uint64_t RleDecoderV2<isSigned>::nextDelta(
     runRead_ += readLongs(data, pos, remaining, bitSize_, nulls);
 
     if (deltaBase_ < 0) {
-      for (; pos < offset + nRead; ++pos) {
-        // skip null positions
-        if (nulls && bits::isBitNull(nulls, pos)) {
-          continue;
+      if (nulls == nullptr) {
+        // No nulls: data[pos+k] = prevValue_ - (d[0]+d[1]+...+d[k]). Compute
+        // the inclusive sum of deltas once, then subtract from prevValue_.
+        const uint64_t end = offset + nRead;
+        const uint64_t cnt = svcntd();
+        for (; pos + cnt <= end; pos += cnt) {
+          svint64_t vd = svld1_s64(
+              svptrue_b64(), reinterpret_cast<const int64_t*>(data + pos));
+          svint64_t vsum = inclusiveScanAddS64(vd, svptrue_b64());
+          svint64_t vval = svsub_s64_x(
+              svptrue_b64(), svdup_n_s64(prevValue_), vsum);
+          svst1_s64(
+              svptrue_b64(), reinterpret_cast<int64_t*>(data + pos), vval);
+          // New prevValue_ = prevValue_ - sum(all deltas). Sum the ORIGINAL
+          // deltas (vd), not vsum (which is an inclusive scan whose horizontal
+          // sum is a weighted sum, not what we want).
+          prevValue_ -= svaddv_s64(svptrue_b64(), vd);
         }
-        prevValue_ = data[pos] = prevValue_ - data[pos];
+        for (; pos < end; ++pos) {
+          prevValue_ = data[pos] = prevValue_ - data[pos];
+        }
+      } else {
+        // Nulls present: scan only over valid lanes. Null deltas are forced
+        // to 0 so they don't perturb the running sum; only valid lanes are
+        // stored back (null lanes keep their original value).
+        const uint64_t end = offset + nRead;
+        const uint64_t cnt = svcntd();
+        for (; pos + cnt <= end; pos += cnt) {
+          svbool_t pgValid = nullBitsToPredicate(nulls, pos, svptrue_b64());
+          svint64_t vd = svld1_s64(
+              svptrue_b64(), reinterpret_cast<const int64_t*>(data + pos));
+          // Zero out null-lane deltas so the inclusive scan skips them.
+          svint64_t vdClean = svsel_s64(pgValid, vd, svdup_n_s64(0));
+          svint64_t vsum = inclusiveScanAddS64(vdClean, svptrue_b64());
+          svint64_t vval = svsub_s64_x(
+              svptrue_b64(), svdup_n_s64(prevValue_), vsum);
+          // Store only valid lanes; null lanes keep their original value.
+          svst1_s64(pgValid, reinterpret_cast<int64_t*>(data + pos), vval);
+          // New prevValue_ = prevValue_ - sum(valid deltas).
+          prevValue_ -= svaddv_s64(pgValid, vd);
+        }
+        for (; pos < end; ++pos) {
+          if (bits::isBitNull(nulls, pos)) {
+            continue;
+          }
+          prevValue_ = data[pos] = prevValue_ - data[pos];
+        }
       }
     } else {
-      for (; pos < offset + nRead; ++pos) {
-        // skip null positions
-        if (nulls && bits::isBitNull(nulls, pos)) {
-          continue;
+      if (nulls == nullptr) {
+        // No nulls: data[pos+k] = prevValue_ + (d[0]+d[1]+...+d[k]).
+        const uint64_t end = offset + nRead;
+        const uint64_t cnt = svcntd();
+        for (; pos + cnt <= end; pos += cnt) {
+          svint64_t vd = svld1_s64(
+              svptrue_b64(), reinterpret_cast<const int64_t*>(data + pos));
+          svint64_t vsum = inclusiveScanAddS64(vd, svptrue_b64());
+          svint64_t vval = svadd_n_s64_x(svptrue_b64(), vsum, prevValue_);
+          svst1_s64(
+              svptrue_b64(), reinterpret_cast<int64_t*>(data + pos), vval);
+          // New prevValue_ = prevValue_ + sum(all deltas). Sum ORIGINAL deltas.
+          prevValue_ += svaddv_s64(svptrue_b64(), vd);
         }
-        prevValue_ = data[pos] = prevValue_ + data[pos];
+        for (; pos < end; ++pos) {
+          prevValue_ = data[pos] = prevValue_ + data[pos];
+        }
+      } else {
+        // Nulls present: same scan-over-valid-lanes scheme as the subtract
+        // branch, but adding.
+        const uint64_t end = offset + nRead;
+        const uint64_t cnt = svcntd();
+        for (; pos + cnt <= end; pos += cnt) {
+          svbool_t pgValid = nullBitsToPredicate(nulls, pos, svptrue_b64());
+          svint64_t vd = svld1_s64(
+              svptrue_b64(), reinterpret_cast<const int64_t*>(data + pos));
+          svint64_t vdClean = svsel_s64(pgValid, vd, svdup_n_s64(0));
+          svint64_t vsum = inclusiveScanAddS64(vdClean, svptrue_b64());
+          svint64_t vval = svadd_n_s64_x(svptrue_b64(), vsum, prevValue_);
+          svst1_s64(pgValid, reinterpret_cast<int64_t*>(data + pos), vval);
+          // New prevValue_ = prevValue_ + sum(valid deltas).
+          prevValue_ += svaddv_s64(pgValid, vd);
+        }
+        for (; pos < end; ++pos) {
+          if (bits::isBitNull(nulls, pos)) {
+            continue;
+          }
+          prevValue_ = data[pos] = prevValue_ + data[pos];
+        }
       }
     }
   }
