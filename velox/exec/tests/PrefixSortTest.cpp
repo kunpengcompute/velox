@@ -14,8 +14,11 @@
  * limitations under the License.
  */
 
+#include <functional>
 #include <gtest/gtest.h>
 
+#include "velox/common/base/Exceptions.h"
+#include "velox/common/testutil/TestValue.h"
 #include "velox/exec/PrefixSort.h"
 #include "velox/exec/SpillRadixSort.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
@@ -511,6 +514,131 @@ TEST_F(PrefixSortTest, spillRadixSortFuzz) {
 
   runFuzzTest(0.0);
   runFuzzTest(0.1);
+}
+
+// Verifies the chunked prefix-buffer allocation: with a tiny per-chunk page
+// budget the sort must still produce the same stable order as the default
+// (single-chunk) path. Exercises many chunks, chunk-boundary crossings, and
+// a non-multiple row count so the last chunk is partial.
+TEST_F(PrefixSortTest, spillRadixSortChunkedAllocation) {
+  constexpr vector_size_t kNumRows = 20'000;
+
+  // Two keys: a BIGINT and a VARCHAR longer than 8 bytes so the normalized
+  // prefix is non-trivial and rows cross chunk boundaries.
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>(
+          kNumRows,
+          [](vector_size_t row) {
+            return static_cast<int64_t>((row * 2654435761U) % 1'000'003);
+          }),
+      makeFlatVector<std::string>(
+          kNumRows,
+          [](vector_size_t row) {
+            return fmt::format("chunk_test_key_{:012}", row % 4093);
+          }),
+  });
+  const std::vector<CompareFlags> compareFlags{kAsc, kAsc};
+
+  auto runSort = [&](uint32_t chunkPages) {
+    const auto rowType = asRowType(data->type());
+    RowContainer rowContainer(
+        {BIGINT(), VARCHAR()}, {}, pool_.get());
+    auto rows = storeRows(kNumRows, data, &rowContainer);
+    const auto sortPool =
+        rootPool_->addLeafChild("spill-radix-sort-chunked");
+    SpillRadixSortConfig config;
+    config.enabled = true;
+    config.minRows = 0;
+    config.maxPrefixBufferChunkPages = chunkPages;
+    EXPECT_TRUE(SpillRadixSort::canSort(
+        &rowContainer, compareFlags, rows.size(), config));
+    SpillRadixSort::sort(
+        &rowContainer, compareFlags, config, sortPool.get(), rows);
+
+    std::vector<std::string> keyNames{"c0", "c1"};
+    const auto keyRowType = ROW(std::move(keyNames), {BIGINT(), VARCHAR()});
+    const RowVectorPtr actual =
+        BaseVector::create<RowVector>(keyRowType, kNumRows, pool_.get());
+    for (int column = 0; column < compareFlags.size(); ++column) {
+      rowContainer.extractColumn(
+          rows.data(), kNumRows, column, actual->childAt(column));
+    }
+    return actual;
+  };
+
+  // Default (single large chunk) vs tiny 1-page chunks (forces ~every row in
+  // its own chunk) vs a small multi-row chunk that straddles boundaries.
+  const auto defaultResult = runSort(256);
+  const auto tinyResult = runSort(1);
+  const auto smallResult = runSort(4);
+
+  velox::test::assertEqualVectors(defaultResult, tinyResult);
+  velox::test::assertEqualVectors(defaultResult, smallResult);
+}
+
+// Verifies the fallback to the comparator sort when the prefix-buffer chunk
+// allocation fails (e.g. the spill memory allocator is exhausted). The
+// fallback must produce the same sorted order as the radix path.
+TEST_F(PrefixSortTest, spillRadixSortAllocationFailureFallback) {
+  constexpr vector_size_t kNumRows = 5'000;
+
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>(
+          kNumRows, [](vector_size_t row) { return row % 97; }),
+      makeFlatVector<std::string>(
+          kNumRows,
+          [](vector_size_t row) {
+            return fmt::format("fallback_key_{:010}", row % 2039);
+          }),
+  });
+  const std::vector<CompareFlags> compareFlags{kAsc, kAsc};
+
+  auto runSort = [&](bool injectFailure) {
+    const auto rowType = asRowType(data->type());
+    RowContainer rowContainer({BIGINT(), VARCHAR()}, {}, pool_.get());
+    auto rows = storeRows(kNumRows, data, &rowContainer);
+    const auto sortPool =
+        rootPool_->addLeafChild("spill-radix-sort-fallback");
+    SpillRadixSortConfig config;
+    config.enabled = true;
+    config.minRows = 0;
+    EXPECT_TRUE(SpillRadixSort::canSort(
+        &rowContainer, compareFlags, rows.size(), config));
+
+    if (injectFailure) {
+      // Force the chunk allocation to fail so sort() falls back to the
+      // comparator path.
+      SCOPED_TESTVALUE_SET(
+          "SpillRadixSort::sort::allocateChunks",
+          std::function<void(bool*)>([&](bool*) {
+            throw VeloxRuntimeError(
+                __FILE__,
+                __LINE__,
+                __FUNCTION__,
+                "SpillRadixSort::sort",
+                "Injected prefix buffer allocation failure",
+                "",
+                error_code::kMemAllocError,
+                /*isRetriable=*/true);
+          }));
+    }
+    SpillRadixSort::sort(
+        &rowContainer, compareFlags, config, sortPool.get(), rows);
+
+    std::vector<std::string> keyNames{"c0", "c1"};
+    const auto keyRowType = ROW(std::move(keyNames), {BIGINT(), VARCHAR()});
+    const RowVectorPtr actual =
+        BaseVector::create<RowVector>(keyRowType, kNumRows, pool_.get());
+    for (int column = 0; column < compareFlags.size(); ++column) {
+      rowContainer.extractColumn(
+          rows.data(), kNumRows, column, actual->childAt(column));
+    }
+    return actual;
+  };
+
+  const auto radixResult = runSort(false);
+  const auto fallbackResult = runSort(true);
+  velox::test::assertEqualVectors(radixResult, fallbackResult);
 }
 
 // Negative tests: configurations and inputs for which canSort must return
