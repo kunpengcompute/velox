@@ -143,8 +143,23 @@ class SpillRadixSortBenchmark {
     SpillRadixSortConfig config;
     config.enabled = true;
     config.minRows = 0;
-    SpillRadixSort::sort(
-        rowContainer, compareFlags, config, pool_, sortedRows);
+    // Mirror the production spill path (SpillerBase::ensureSorted): when
+    // canSort rejects radix (e.g. two or more truncated string keys) fall
+    // back to the comparator sort. Without this the benchmark bypasses the
+    // gate and would show the radix regression that production avoids.
+    if (SpillRadixSort::canSort(
+            rowContainer, compareFlags, sortedRows.size(), config)) {
+      SpillRadixSort::sort(
+          rowContainer, compareFlags, config, pool_, sortedRows);
+    } else {
+      gfx::timsort(
+          sortedRows.begin(),
+          sortedRows.end(),
+          [&](const char* left, const char* right) {
+            return rowContainer->compareRows(
+                       left, right, compareFlags) < 0;
+          });
+    }
   }
 
   void runTimSort(

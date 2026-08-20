@@ -690,6 +690,86 @@ TEST_F(PrefixSortTest, spillRadixSortCanSortNegative) {
   }
 }
 
+// Verifies the truncated-string-key gate: radix is rejected when two or more
+// string keys exceed maxStringPrefixLength (their equal-prefix groups grow
+// too large for residual compare), but accepted with zero or one such key.
+TEST_F(PrefixSortTest, spillRadixSortTruncatedStringGate) {
+  constexpr vector_size_t kNumRows = 1'000;
+
+  // Helper: build a hasher-agnostic RowContainer of string keys and check
+  // canSort. Long keys (> maxStringPrefixLength) populate columnStats with a
+  // maxBytes that exceeds the 16-byte default prefix budget.
+  auto makeContainer = [&](const std::vector<std::string>& col0,
+                           const std::vector<std::string>& col1) {
+    std::vector<TypePtr> keyTypes;
+    if (!col0.empty()) {
+      keyTypes.push_back(VARCHAR());
+    }
+    if (!col1.empty()) {
+      keyTypes.push_back(VARCHAR());
+    }
+    // Use the two-argument constructor (no dependent types); an empty brace
+    // list cannot be deduced through make_unique's forwarding.
+    auto container = std::make_unique<RowContainer>(keyTypes, pool_.get());
+    std::vector<char*> rows(kNumRows);
+    for (auto i = 0; i < kNumRows; ++i) {
+      rows[i] = container->newRow();
+    }
+    if (!col0.empty()) {
+      auto vec = makeFlatVector<StringView>(
+          kNumRows, [&](vector_size_t row) { return StringView(col0[row]); });
+      DecodedVector decoded(*vec);
+      for (auto i = 0; i < kNumRows; ++i) {
+        container->store(decoded, i, rows[i], 0);
+      }
+    }
+    if (!col1.empty()) {
+      auto vec = makeFlatVector<StringView>(
+          kNumRows, [&](vector_size_t row) { return StringView(col1[row]); });
+      DecodedVector decoded(*vec);
+      for (auto i = 0; i < kNumRows; ++i) {
+        container->store(decoded, i, rows[i], 1);
+      }
+    }
+    return container;
+  };
+
+  std::vector<std::string> shortKeys(kNumRows);
+  std::vector<std::string> longKeys(kNumRows);
+  for (auto i = 0; i < kNumRows; ++i) {
+    shortKeys[i] = fmt::format("short{}", i % 7); // <= 16 bytes
+    longKeys[i] = fmt::format("a_very_long_string_key_{:012}", i % 1000);
+  }
+
+  SpillRadixSortConfig config;
+  config.enabled = true;
+  config.minRows = 0;
+
+  // Zero truncated keys: two short string keys fully fit the prefix.
+  {
+    auto container = makeContainer(shortKeys, shortKeys);
+    std::vector<CompareFlags> flags{kAsc, kAsc};
+    EXPECT_TRUE(SpillRadixSort::canSort(
+        container.get(), flags, kNumRows, config));
+  }
+
+  // One truncated key: still acceptable (prefix usually disambiguates).
+  {
+    auto container = makeContainer(shortKeys, longKeys);
+    std::vector<CompareFlags> flags{kAsc, kAsc};
+    EXPECT_TRUE(SpillRadixSort::canSort(
+        container.get(), flags, kNumRows, config));
+  }
+
+  // Two truncated keys: rejected, falls back to comparator sort.
+  {
+    auto container = makeContainer(longKeys, longKeys);
+    std::vector<CompareFlags> flags{kAsc, kAsc};
+    EXPECT_FALSE(SpillRadixSort::canSort(
+        container.get(), flags, kNumRows, config));
+  }
+}
+
 // Verifies the radix counting pass
 // (facebook::velox::exec::detail::spillRadixSortCountingPass):
 // it buckets rows by the byte at 'byteOffset' of each prefix and scatters

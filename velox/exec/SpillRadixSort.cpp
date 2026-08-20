@@ -278,6 +278,43 @@ bool validForRadix(
   return layout.normalizedBufferSize % kAlignment == 0;
 }
 
+// Counts the number of string keys whose values exceed
+// 'maxStringPrefixLength'. Such keys are truncated in the radix prefix, so
+// rows that share the encoded prefix still need a residual RowContainer
+// comparison. A single truncated string key is fine (the prefix usually
+// disambiguates most rows), but with two or more truncated string keys the
+// equal-prefix groups grow large and the residual timsort dominates, making
+// radix sort slower than a plain comparator sort (benchmarked 68%-89% of
+// TimSort with 2-4 VARCHAR keys). Reject radix in that case.
+//
+// NOTE: iterate over ALL keys, not just layout.numNormalizedKeys. When the
+// first string key is truncated, PrefixSortLayout::generate() breaks out of
+// its encoding loop with numNormalizedKeys == 1, so the remaining keys are
+// entirely non-normalized and would be missed by a numNormalizedKeys bound.
+bool radixSortSuitable(
+    const RowContainer* rowContainer,
+    const SpillRadixSortConfig& config) {
+  const auto& keyTypes = rowContainer->keyTypes();
+  int32_t numTruncatedStringKeys = 0;
+  for (auto i = 0; i < keyTypes.size(); ++i) {
+    if (keyTypes[i]->kind() != TypeKind::VARCHAR &&
+        keyTypes[i]->kind() != TypeKind::VARBINARY) {
+      continue;
+    }
+    const auto stats = rowContainer->columnStats(i);
+    // Without stats we conservatively assume the key may be truncated.
+    if (!stats.has_value() ||
+        static_cast<uint64_t>(stats.value().maxBytes()) >
+            config.maxStringPrefixLength) {
+      ++numTruncatedStringKeys;
+    }
+    if (numTruncatedStringKeys >= 2) {
+      return false;
+    }
+  }
+  return true;
+}
+
 } // namespace
 
 // static
@@ -291,7 +328,8 @@ bool SpillRadixSort::canSort(
   }
   const auto normalizedFlags = compareFlagsOrDefault(rowContainer, compareFlags);
   const auto layout = generateLayout(rowContainer, normalizedFlags, config);
-  return validForRadix(layout, numRows, config);
+  return validForRadix(layout, numRows, config) &&
+      radixSortSuitable(rowContainer, config);
 }
 
 // static
@@ -307,6 +345,23 @@ void SpillRadixSort::sort(
   VELOX_CHECK(
       validForRadix(layout, numRows, config),
       "SpillRadixSort::sort called for unsupported input");
+  // Defensive gate: even if the caller skipped canSort, reject radix when
+  // truncated string keys would make it slower than the comparator sort
+  // (see radixSortSuitable). This mirrors SpillerBase::ensureSorted which
+  // consults canSort before calling sort().
+  if (!radixSortSuitable(rowContainer, config)) {
+    VELOX_MEM_LOG(WARNING)
+        << "SpillRadixSort::sort falling back to comparator sort: "
+        << "too many truncated string keys for radix";
+    gfx::timsort(
+        rows.begin(),
+        rows.end(),
+        [&](const char* left, const char* right) {
+          return rowContainer->compareRows(
+                     left, right, normalizedFlags) < 0;
+        });
+    return;
+  }
 
   const auto entrySize = layout.entrySize;
 
