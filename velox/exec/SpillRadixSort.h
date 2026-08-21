@@ -42,6 +42,13 @@ struct SpillRadixSortConfig {
   /// sorted by this prefix first, then resolved by residual RowContainer
   /// comparison within equal-prefix groups.
   uint32_t maxStringPrefixLength{16};
+
+  /// Maximum number of 4KB pages per contiguous prefix-buffer chunk. The
+  /// prefix buffer is allocated as multiple chunks of at most this size
+  /// instead of one huge contiguous allocation, so that a very large spill
+  /// run (millions of rows) does not require a single multi-hundred-MB
+  /// contiguous block from the memory allocator.
+  uint32_t maxPrefixBufferChunkPages{256};
 };
 
 class SpillRadixSort {
