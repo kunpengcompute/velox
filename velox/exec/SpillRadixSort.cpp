@@ -18,10 +18,15 @@
 #include <algorithm>
 #include <cstring>
 
+#include "velox/common/base/Exceptions.h"
 #include "velox/common/base/SimdUtil.h"
+#include "velox/common/testutil/TestValue.h"
 #include "velox/exec/Operator.h"
 #include "velox/exec/PrefixSort.h"
 #include "velox/external/timsort/TimSort.hpp"
+#include "velox/buffer/Buffer.h"
+
+using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
 namespace {
@@ -268,26 +273,92 @@ void SpillRadixSort::sort(
       "SpillRadixSort::sort called for unsupported input");
 
   const auto entrySize = layout.entrySize;
-  memory::ContiguousAllocation prefixBufferAlloc;
-  {
-    const auto numPages =
-        memory::AllocationTraits::numPages(numRows * entrySize);
-    pool->allocateContiguous(numPages, prefixBufferAlloc);
-  }
-  char* prefixBuffer = prefixBufferAlloc.data<char>();
 
-  for (auto i = 0; i < rows.size(); ++i) {
-    extractRowAndEncodePrefixKeys(
-        rowContainer, layout, rows[i], prefixBuffer + i * entrySize);
-  }
+  // Allocate the prefix buffer as a set of bounded chunks instead of a single
+  // numRows * entrySize contiguous block. A spill run can contain millions of
+  // rows (e.g. q67 OrderBy spills ~200-400M rows * ~64B entry = 120MB+), and a
+  // single huge contiguous request can fail in a memory-constrained
+  // allocator (MEM_ALLOC_ERROR on q67). Chunking bounds each allocation to
+  // 'maxPrefixBufferChunkPages' 4KB pages; row i lives in
+  // chunk[i / rowsPerChunk] at offset (i % rowsPerChunk) * entrySize.
+  const auto bytesPerChunk =
+      static_cast<uint64_t>(config.maxPrefixBufferChunkPages) *
+      memory::AllocationTraits::kPageSize;
+  const auto rowsPerChunk =
+      std::max<uint64_t>(1, bytesPerChunk / entrySize);
+  const auto numChunks =
+      (numRows + rowsPerChunk - 1) / rowsPerChunk;
+  std::vector<memory::ContiguousAllocation> chunkAllocs(numChunks);
+  std::vector<char*> chunks(numChunks);
+  BufferPtr srcBuffer;
+  BufferPtr scratchBuffer;
+  try {
+    // Test injection point: allow tests to force the allocation failure and
+    // verify the comparator-sort fallback below.
+    TestValue::adjust("SpillRadixSort::sort::allocateChunks", nullptr);
+    for (auto c = 0; c < numChunks; ++c) {
+      const auto chunkRows =
+          std::min<uint64_t>(rowsPerChunk, numRows - c * rowsPerChunk);
+      const auto numPages =
+          memory::AllocationTraits::numPages(chunkRows * entrySize);
+      pool->allocateContiguous(numPages, chunkAllocs[c]);
+      chunks[c] = chunkAllocs[c].data<char>();
+    }
 
-  auto srcBuffer = AlignedBuffer::allocate<char*>(numRows, pool);
-  auto scratchBuffer = AlignedBuffer::allocate<char*>(numRows, pool);
+    // Encode keys into the chunks. Walk chunk-by-chunk with a running row
+    // index so the hot loop has no per-row division/modulo (chunk lookup)
+    // and writes are sequential within each chunk for prefetch-friendliness.
+    {
+      size_t i = 0;
+      for (auto c = 0; c < numChunks; ++c) {
+        const auto chunkRows =
+            std::min<uint64_t>(rowsPerChunk, numRows - c * rowsPerChunk);
+        char* chunkBase = chunks[c];
+        for (uint64_t r = 0; r < chunkRows; ++r, ++i) {
+          extractRowAndEncodePrefixKeys(
+              rowContainer, layout, rows[i], chunkBase + r * entrySize);
+        }
+      }
+    }
+
+    // The radix pointer arrays also allocate from the spill pool; they must
+    // be covered by the same fallback below.
+    srcBuffer = AlignedBuffer::allocate<char*>(numRows, pool);
+    scratchBuffer = AlignedBuffer::allocate<char*>(numRows, pool);
+    {
+      auto* src = srcBuffer->asMutable<char*>();
+      size_t i = 0;
+      for (auto c = 0; c < numChunks; ++c) {
+        const auto chunkRows =
+            std::min<uint64_t>(rowsPerChunk, numRows - c * rowsPerChunk);
+        char* chunkBase = chunks[c];
+        for (uint64_t r = 0; r < chunkRows; ++r, ++i) {
+          src[i] = chunkBase + r * entrySize;
+        }
+      }
+    }
+  } catch (const VeloxRuntimeError& e) {
+    // The prefix buffer or the pointer arrays could not be allocated (e.g.
+    // the spill memory allocator is exhausted). Fall back to the comparator
+    // sort which requires no additional memory, matching the behavior of the
+    // non-radix spill path.
+    if (e.errorCode() != error_code::kMemAllocError) {
+      throw;
+    }
+    VELOX_MEM_LOG(WARNING)
+        << "SpillRadixSort::sort falling back to comparator sort after "
+        << "allocation failure: " << e.what();
+    gfx::timsort(
+        rows.begin(),
+        rows.end(),
+        [&](const char* left, const char* right) {
+          return rowContainer->compareRows(
+                     left, right, normalizedFlags) < 0;
+        });
+    return;
+  }
   char** src = srcBuffer->asMutable<char*>();
   char** scratch = scratchBuffer->asMutable<char*>();
-  for (size_t i = 0; i < numRows; ++i) {
-    src[i] = prefixBuffer + i * entrySize;
-  }
 
   char** sorted = radixSort(src, scratch, numRows, layout.normalizedBufferSize);
 
