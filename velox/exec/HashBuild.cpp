@@ -206,6 +206,11 @@ void HashBuild::setupSpiller(SpillPartition* spillPartition) {
         config->readBufferSize, pool(), &spillStats_);
     startPartitionBit =
         spillPartition->id().partitionBitOffset() + config->numPartitionBits;
+    // Record the advanced start partition bit for the restored spill input so
+    // that the rebuilt hash table can validate hash bits overlap against the
+    // correct (recursive) spill partition bit, not the fixed config value.
+    spillInputStartPartitionBit_ =
+        static_cast<int8_t>(startPartitionBit);
     // Disable spilling if exceeding the max spill level and the query might run
     // out of memory if the restored partition still can't fit in memory.
     if (config->exceedSpillLevelLimit(startPartitionBit)) {
@@ -782,8 +787,7 @@ bool HashBuild::finishHashBuild() {
     CpuWallTimer cpuWallTimer{timing};
     table_->prepareJoinTable(
         std::move(otherTables),
-        isInputFromSpill() ? spillConfig()->startPartitionBit
-                           : BaseHashTable::kNoSpillInputStartPartitionBit,
+        spillInputStartPartitionBit_,
         allowParallelJoinBuild ? operatorCtx_->task()->queryCtx()->executor()
                                : nullptr);
   }
@@ -929,6 +933,31 @@ void HashBuild::addRuntimeStats() {
   const auto hashTableStats = table_->stats();
   uint64_t asRange{0};
   uint64_t asDistinct{0};
+
+  // When spill-replay build finishes with table index overlapping configured
+  // spill partition bits, inserts may be slower (see checkHashBitsOverlap).
+  // Visible by default under Gluten (glogSeverityLevel defaults to WARNING).
+  if (spillInputStartPartitionBit_ !=
+          BaseHashTable::kNoSpillInputStartPartitionBit &&
+      spillConfig() != nullptr) {
+    const auto sizeBits = hashTableStats.sizeBits;
+    const auto spillConfigStartBit =
+        static_cast<int64_t>(spillConfig()->startPartitionBit);
+    const auto spillPartitionBits =
+        static_cast<int64_t>(spillConfig()->numPartitionBits);
+    const auto spillCheckRightBit =
+        static_cast<int64_t>(spillInputStartPartitionBit_);
+    if (spillConfigStartBit < sizeBits && sizeBits <= spillCheckRightBit) {
+      // TODO: reduce the log frequency if it is too verbose.
+      LOG(WARNING)
+          << "HashBuild table index overlaps spill partition bits: sizeBits="
+          << sizeBits << ", spillConfigStartBit=" << spillConfigStartBit
+          << ", spillPartitionBits=" << spillPartitionBits
+          << ", spillCheckRightBit=" << spillCheckRightBit
+          << ", pool=" << pool()->name();
+    }
+  }
+
   auto lockedStats = stats_.wlock();
 
   lockedStats->addInputTiming.add(table_->offThreadBuildTiming());
