@@ -1932,7 +1932,7 @@ TEST_P(HashTableTest, NormalizedKeyMode_scalarExecution) { // normalized key mod
       rows,
       BaseHashTable::kNoSpillInputStartPartitionBit);
 
-  // group probe table using lookup and record results in lookup.hits
+  // group probe table using lookup and record results in lookup.hotEntries
   table.groupProbe(lookup, BaseHashTable::kNoSpillInputStartPartitionBit);
 
   // for (auto i = 0; i < lookup.rows.size(); ++i) {

@@ -15,7 +15,9 @@
  */
 
 #include "velox/exec/HashTable.h"
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
 #include <arm_sve.h>
+#endif
 #if defined(__linux__) && defined(__aarch64__)
 #include <asm/hwcap.h>
 #include <sys/auxv.h>
@@ -85,16 +87,64 @@ resolveNormalizedKeyModeForAgg(bool isJoinBuild) {
   switch (hashAggNormalizedKeyModeOverride()) {
     case NormalizedKeyModeOverride::kNative:
       return Mode::nativeVelox;
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
     case NormalizedKeyModeOverride::kSve:
       return linuxAarch64RuntimeHasSve() ? Mode::sve : Mode::nativeVelox;
     case NormalizedKeyModeOverride::kAuto:
       return linuxAarch64RuntimeHasSve() ? Mode::sve : Mode::nativeVelox;
+#else
+    case NormalizedKeyModeOverride::kSve:
+    case NormalizedKeyModeOverride::kAuto:
+      return Mode::nativeVelox;
+#endif
   }
   return Mode::nativeVelox;
+}
+
+enum class HashLookupLayoutOverride { kAuto, kAos, kSoa };
+
+HashLookupLayoutOverride hashLookupLayoutOverride() {
+  static const HashLookupLayoutOverride kOverride = []() {
+    const char* env = std::getenv("VELOX_HASH_LOOKUP_LAYOUT");
+    if (env == nullptr || *env == '\0') {
+      return HashLookupLayoutOverride::kAuto;
+    }
+    std::string value(env);
+    for (auto& c : value) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (value == "aos" || value == "1" || value == "true") {
+      return HashLookupLayoutOverride::kAos;
+    }
+    if (value == "soa" || value == "0" || value == "false") {
+      return HashLookupLayoutOverride::kSoa;
+    }
+    return HashLookupLayoutOverride::kAuto;
+  }();
+  return kOverride;
 }
 } // namespace
 
 namespace facebook::velox::exec {
+bool hashLookupAosEnabled() {
+  static const bool kEnabled = []() {
+    switch (hashLookupLayoutOverride()) {
+      case HashLookupLayoutOverride::kAos:
+        return true;
+      case HashLookupLayoutOverride::kSoa:
+        return false;
+      case HashLookupLayoutOverride::kAuto:
+#if defined(__aarch64__)
+        return true;
+#else
+        return false;
+#endif
+    }
+    return false;
+  }();
+  return kEnabled;
+}
+
 // static
 std::string BaseHashTable::modeString(HashMode mode) {
   switch (mode) {
@@ -399,7 +449,10 @@ char* HashTable<ignoreNullKeys>::insertEntry(
     uint64_t index,
     vector_size_t row) {
   char* group = rows_->newRow();
-  lookup.hits[row] = group; // NOLINT
+  lookup.hits[row] = group;
+  if (hashLookupAosEnabled()) {
+    lookup.hotEntries[row].hit = group; // NOLINT
+  }
   storeKeys(lookup, row);
 
   if (hashMode_ == HashMode::kNormalizedKey) {
@@ -422,7 +475,10 @@ char* HashTable<ignoreNullKeys>::insertEntryforSVE(
     uint64_t index,
     vector_size_t row) {
   char* group = rows_->newRow();
-  lookup.hits[row] = group; // NOLINT
+  lookup.hits[row] = group;
+  if (hashLookupAosEnabled()) {
+    lookup.hotEntries[row].hit = group; // NOLINT
+  }
   storeKeys(lookup, row);
 
   if (hashMode_ == HashMode::kNormalizedKey) {
@@ -621,6 +677,9 @@ FOLLY_ALWAYS_INLINE void HashTable<ignoreNullKeys>::fullProbe(
         },
         numTombstones_,
         !isJoin && extraCheck);
+    if (hashLookupAosEnabled()) {
+      lookup.hotEntries[state.row()].hit = lookup.hits[state.row()];
+    }
     return;
   }
   lookup.hits[state.row()] = state.fullProbe<op>(
@@ -637,6 +696,9 @@ FOLLY_ALWAYS_INLINE void HashTable<ignoreNullKeys>::fullProbe(
       },
       numTombstones_,
       !isJoin && extraCheck);
+  if (hashLookupAosEnabled()) {
+    lookup.hotEntries[state.row()].hit = lookup.hits[state.row()];
+  }
 }
 
 namespace {
@@ -1222,6 +1284,7 @@ void xxhashRowKeysBatch(
 
 } // namespace
 
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
 inline __attribute__((always_inline)) svbool_t
 get_uniq_mask2(svbool_t pg, const svuint64_t val) {
   svuint64_t s1 = svext_u64(val, val, 1);
@@ -1274,7 +1337,7 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeSVE(HashLookup& lookup) {
   int32_t numProbes = lookup.rows.size();
   const int32_t* rows = lookup.rows.data();
   auto hashes = lookup.hashes.data();
-  auto groups = lookup.hits.data();
+  const bool aosLayout = hashLookupAosEnabled();
   auto normalizedKeys = lookup.normalizedKeys.data();
 
   bool all = false;
@@ -1372,7 +1435,8 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeSVE(HashLookup& lookup) {
       getKeyPtr()[htIdx] = normalizedKeys[i + idx];
       getValuePtr()[htIdx] =
           insertEntryforSVE(lookup, htIdx, i + idx);
-      groups[i + idx] = getValuePtr()[htIdx];
+      lookup.hits[i + idx] = getValuePtr()[htIdx];
+      if (aosLayout) lookup.hotEntries[i + idx].hit = lookup.hits[i + idx];
       getTagPtr()[htIdx] = tags[idx];
 
       flag1 &= (flag1 - 1);
@@ -1430,7 +1494,8 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeSVE(HashLookup& lookup) {
             getKeyPtr()[htZeroIdx] = currNormalizedKey;
             getValuePtr()[htZeroIdx] =
                 insertEntryforSVE(lookup, htZeroIdx, rowIdx);
-            groups[rowIdx] = getValuePtr()[htZeroIdx];
+            lookup.hits[rowIdx] = getValuePtr()[htZeroIdx];
+            if (aosLayout) lookup.hotEntries[rowIdx].hit = lookup.hits[rowIdx];
             getTagPtr()[htZeroIdx] = tags[idx];
             // 走到下一个conflict
             processSuccess = true;
@@ -1440,7 +1505,8 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeSVE(HashLookup& lookup) {
             int32_t htIdx =
                 htStartIdx + conflictIdx; // 从hash表中拿到key，和当前的key比较
             if (currNormalizedKey == getKeyPtr()[htIdx]) {
-              groups[rowIdx] = getValuePtr()[htIdx];
+              lookup.hits[rowIdx] = getValuePtr()[htIdx];
+              if (aosLayout) lookup.hotEntries[rowIdx].hit = lookup.hits[rowIdx];
               // 走到下一个conflict
               processSuccess = true;
               break;
@@ -1452,7 +1518,8 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeSVE(HashLookup& lookup) {
           getKeyPtr()[htZeroIdx] = currNormalizedKey;
           getValuePtr()[htZeroIdx] =
               insertEntryforSVE(lookup, htZeroIdx, rowIdx);
-          groups[rowIdx] = getValuePtr()[htZeroIdx];
+          lookup.hits[rowIdx] = getValuePtr()[htZeroIdx];
+          if (aosLayout) lookup.hotEntries[rowIdx].hit = lookup.hits[rowIdx];
           getTagPtr()[htZeroIdx] = tags[idx];
           processSuccess = true;
         }
@@ -1528,7 +1595,8 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeSVE(HashLookup& lookup) {
       getKeyPtr()[htIdx] = normalizedKeys[i + idx];
       getValuePtr()[htIdx] =
           insertEntryforSVE(lookup, htIdx, i + idx);
-      groups[i + idx] = getValuePtr()[htIdx];
+      lookup.hits[i + idx] = getValuePtr()[htIdx];
+      if (aosLayout) lookup.hotEntries[i + idx].hit = lookup.hits[i + idx];
       getTagPtr()[htIdx] = tags[idx];
 
       flag1 &= (flag1 - 1);
@@ -1588,7 +1656,8 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeSVE(HashLookup& lookup) {
             getKeyPtr()[htZeroIdx] = currNormalizedKey;
             getValuePtr()[htZeroIdx] =
                 insertEntryforSVE(lookup, htZeroIdx, rowIdx);
-            groups[rowIdx] = getValuePtr()[htZeroIdx];
+            lookup.hits[rowIdx] = getValuePtr()[htZeroIdx];
+            if (aosLayout) lookup.hotEntries[rowIdx].hit = lookup.hits[rowIdx];
             getTagPtr()[htZeroIdx] = tags[idx];
             // 走到下一个conflict
             processSuccess = true;
@@ -1598,7 +1667,8 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeSVE(HashLookup& lookup) {
             int32_t htIdx =
                 htStartIdx + conflictIdx; // 从hash表中拿到key，和当前的key比较
             if (currNormalizedKey == getKeyPtr()[htIdx]) {
-              groups[rowIdx] = getValuePtr()[htIdx];
+              lookup.hits[rowIdx] = getValuePtr()[htIdx];
+              if (aosLayout) lookup.hotEntries[rowIdx].hit = lookup.hits[rowIdx];
               // 走到下一个conflict
               processSuccess = true;
               break;
@@ -1610,7 +1680,8 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeSVE(HashLookup& lookup) {
           getKeyPtr()[htZeroIdx] = currNormalizedKey;
           getValuePtr()[htZeroIdx] =
               insertEntryforSVE(lookup, htZeroIdx, rowIdx);
-          groups[rowIdx] = getValuePtr()[htZeroIdx];
+          lookup.hits[rowIdx] = getValuePtr()[htZeroIdx];
+          if (aosLayout) lookup.hotEntries[rowIdx].hit = lookup.hits[rowIdx];
           getTagPtr()[htZeroIdx] = tags[idx];
           processSuccess = true;
         }
@@ -1621,6 +1692,8 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbeSVE(HashLookup& lookup) {
       conflictFlag &= (conflictFlag - 1);
     }
 }
+
+#endif // __aarch64__ && __ARM_FEATURE_SVE
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::groupProbe(
@@ -1646,7 +1719,10 @@ void HashTable<ignoreNullKeys>::groupProbe(
   int32_t probeIndex = 0;
   const int32_t numProbes = lookup.rows.size();
   const auto* rows = lookup.rows.data();
-  const auto* hashes = lookup.hashes.data();
+  const bool aosLayout = hashLookupAosEnabled();
+  auto hashAt = [&](vector_size_t r) -> const uint64_t& {
+    return aosLayout ? lookup.hotEntries[r].hash : lookup.hashes[r];
+  };
  
   // Contiguous probe rows: {rowStart, rowStart+1, ..., rowStart+numProbes-1}.
   // populateLookupRows enumerates selected rows in ascending order; if first
@@ -1663,13 +1739,13 @@ void HashTable<ignoreNullKeys>::groupProbe(
 
   if (isContiguousRowRange) {
     // ===== Contiguous row range fast path =====
-    // Direct hashes[rowStart + probeSlot] without rows[] indirection per slot.
+    // Direct hotEntries[rowStart + probeSlot] without rows[] indirection.
     // Scheme E: two-stage pipeline — prefetch batch N+1 while processing N.
 
     auto prefetchBatch = [&](ProbeState* st, int32_t probeBase) {
       for (int32_t k = 0; k < kBatchWidth && probeBase + k < numProbes; ++k) {
         const int32_t row = rowStart + probeBase + k;
-        st[k].preProbe(*this, hashes[row], row);
+        st[k].preProbe(*this, hashAt(row), row);
       }
     };
 
@@ -1678,11 +1754,11 @@ void HashTable<ignoreNullKeys>::groupProbe(
 
     for (; probeIndex + kBatchWidth <= numProbes;
         probeIndex += kBatchWidth) {
-      // Scheme D: prefetch hashes for a future batch.
+      // Scheme D: prefetch HotEntries for a future batch (co-located hot data).
       if (probeIndex + kBatchWidth + kHashPrefetchAhead < numProbes) {
         for (int32_t p = 0; p < kBatchWidth; p += 2) {
-          __builtin_prefetch(&hashes[rowStart + probeIndex + kBatchWidth +
-              kHashPrefetchAhead + p]);
+          __builtin_prefetch(&hashAt(rowStart + probeIndex + kBatchWidth +
+              kHashPrefetchAhead + p));
         }
       }
 
@@ -1706,7 +1782,7 @@ void HashTable<ignoreNullKeys>::groupProbe(
     // Tail: remaining rows.
     for (; probeIndex < numProbes; ++probeIndex) {
       const int32_t row = rowStart + probeIndex;
-      bufA[0].preProbe(*this, hashes[row], row);
+      bufA[0].preProbe(*this, hashAt(row), row);
       bufA[0].firstProbe(*this, 0);
       fullProbe<false>(lookup, bufA[0], false);
     }
@@ -1717,7 +1793,7 @@ void HashTable<ignoreNullKeys>::groupProbe(
     auto prefetchBatch = [&](ProbeState* st, int32_t base) {
       for (int32_t k = 0; k < kBatchWidth && base + k < numProbes; ++k) {
         int32_t r = rows[base + k];
-        st[k].preProbe(*this, hashes[r], r);
+        st[k].preProbe(*this, hashAt(r), r);
       }
     };
 
@@ -1726,11 +1802,11 @@ void HashTable<ignoreNullKeys>::groupProbe(
 
     for (; probeIndex + kBatchWidth <= numProbes;
         probeIndex += kBatchWidth) {
-      // Scheme D: prefetch hashes for a future batch via rows indirection.
+      // Scheme D: prefetch HotEntries for a future batch via rows indirection.
       if (probeIndex + kBatchWidth + kHashPrefetchAhead < numProbes) {
         for (int32_t p = 0; p < kBatchWidth; p += 2) {
           __builtin_prefetch(
-              &hashes[rows[probeIndex + kBatchWidth + kHashPrefetchAhead + p]]);
+              &hashAt(rows[probeIndex + kBatchWidth + kHashPrefetchAhead + p]));
         }
       }
 
@@ -1754,7 +1830,7 @@ void HashTable<ignoreNullKeys>::groupProbe(
     // Tail: remaining rows.
     for (; probeIndex < numProbes; ++probeIndex) {
       int32_t r = rows[probeIndex];
-      bufA[0].preProbe(*this, hashes[r], r);
+      bufA[0].preProbe(*this, hashAt(r), r);
       bufA[0].firstProbe(*this, 0);
       fullProbe<false>(lookup, bufA[0], false);
     }
@@ -1763,10 +1839,12 @@ void HashTable<ignoreNullKeys>::groupProbe(
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::groupNormalizedKeyProbe(HashLookup& lookup) {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
   if (normalizedKeyMode_ == NormalizedKeyMode::sve) {
     groupNormalizedKeyProbeSVE(lookup);
     return;
   }
+#endif
 
   ProbeState state1;
   ProbeState state2;
@@ -1806,50 +1884,69 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbe(HashLookup& lookup) {
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::arrayGroupProbe(HashLookup& lookup) {
   VELOX_DCHECK(!lookup.hashes.empty());
-  VELOX_DCHECK(!lookup.hits.empty());
 
-  int32_t numProbes = lookup.rows.size();
-  const vector_size_t* rows = lookup.rows.data();
-  auto hashes = lookup.hashes.data();
-  auto groups = lookup.hits.data();
-  int32_t i = 0;
-  if (process::hasAvx2() && simd::isDense(rows, numProbes)) {
-    auto allZero = xsimd::broadcast<int64_t>(0);
-    constexpr int32_t kWidth = xsimd::batch<int64_t>::size;
-    auto start = rows[0];
-    auto end = start + numProbes - kWidth;
-    for (i = start; i <= end; i += kWidth) {
-      auto loaded = simd::gather(
-          reinterpret_cast<const int64_t*>(table_),
-          reinterpret_cast<const int64_t*>(hashes + i));
-      loaded.store_unaligned(reinterpret_cast<int64_t*>(groups + i));
-      auto misses = simd::toBitMask(loaded == allZero);
-      if (LIKELY(!misses)) {
-        continue;
+  if (hashLookupAosEnabled()) {
+    int32_t numProbes = lookup.rows.size();
+    const vector_size_t* rows = lookup.rows.data();
+    auto hashes = lookup.hashes.data();
+    int32_t i = 0;
+    for (; i < numProbes; ++i) {
+      auto row = rows[i];
+      uint64_t index = hashes[row];
+      VELOX_DCHECK_LT(index, capacity_);
+      char* group = table_[index];
+      if (UNLIKELY(!group)) {
+        group = insertEntry(lookup, index, row);
       }
-      for (auto miss = 0; miss < kWidth; ++miss) {
-        auto row = i + miss;
-        if (!groups[row]) {
-          auto index = hashes[row];
-          auto hit = table_[index];
-          if (!hit) {
-            hit = insertEntry(lookup, index, row);
+      lookup.hits[row] = group;
+      lookup.hotEntries[row].hit = group; // NOLINT
+    }
+  } else {
+    VELOX_DCHECK(!lookup.hits.empty());
+
+    int32_t numProbes = lookup.rows.size();
+    const vector_size_t* rows = lookup.rows.data();
+    auto hashes = lookup.hashes.data();
+    auto groups = lookup.hits.data();
+    int32_t i = 0;
+    if (process::hasAvx2() && simd::isDense(rows, numProbes)) {
+      auto allZero = xsimd::broadcast<int64_t>(0);
+      constexpr int32_t kWidth = xsimd::batch<int64_t>::size;
+      auto start = rows[0];
+      auto end = start + numProbes - kWidth;
+      for (i = start; i <= end; i += kWidth) {
+        auto loaded = simd::gather(
+            reinterpret_cast<const int64_t*>(table_),
+            reinterpret_cast<const int64_t*>(hashes + i));
+        loaded.store_unaligned(reinterpret_cast<int64_t*>(groups + i));
+        auto misses = simd::toBitMask(loaded == allZero);
+        if (LIKELY(!misses)) {
+          continue;
+        }
+        for (auto miss = 0; miss < kWidth; ++miss) {
+          auto row = i + miss;
+          if (!groups[row]) {
+            auto index = hashes[row];
+            auto hit = table_[index];
+            if (!hit) {
+              hit = insertEntry(lookup, index, row);
+            }
+            groups[row] = hit;
           }
-          groups[row] = hit;
         }
       }
+      i -= start;
     }
-    i -= start;
-  }
-  for (; i < numProbes; ++i) {
-    auto row = rows[i];
-    uint64_t index = hashes[row];
-    VELOX_DCHECK_LT(index, capacity_);
-    char* group = table_[index];
-    if (UNLIKELY(!group)) {
-      group = insertEntry(lookup, index, row);
+    for (; i < numProbes; ++i) {
+      auto row = rows[i];
+      uint64_t index = hashes[row];
+      VELOX_DCHECK_LT(index, capacity_);
+      char* group = table_[index];
+      if (UNLIKELY(!group)) {
+        group = insertEntry(lookup, index, row);
+      }
+      groups[row] = group; // NOLINT
     }
-    groups[row] = group; // NOLINT
   }
 }
 
@@ -1868,19 +1965,23 @@ void HashTable<ignoreNullKeys>::joinProbe(HashLookup& lookup) {
   int32_t probeIndex = 0;
   int32_t numProbes = lookup.rows.size();
   const vector_size_t* rows = lookup.rows.data();
+  const bool aosLayout = hashLookupAosEnabled();
+  auto hashAt = [&](vector_size_t r) -> const uint64_t& {
+    return aosLayout ? lookup.hotEntries[r].hash : lookup.hashes[r];
+  };
   ProbeState state1;
   ProbeState state2;
   ProbeState state3;
   ProbeState state4;
   for (; probeIndex + 4 <= numProbes; probeIndex += 4) {
     int32_t row = rows[probeIndex];
-    state1.preProbe(*this, lookup.hashes[row], row);
+    state1.preProbe(*this, hashAt(row), row);
     row = rows[probeIndex + 1];
-    state2.preProbe(*this, lookup.hashes[row], row);
+    state2.preProbe(*this, hashAt(row), row);
     row = rows[probeIndex + 2];
-    state3.preProbe(*this, lookup.hashes[row], row);
+    state3.preProbe(*this, hashAt(row), row);
     row = rows[probeIndex + 3];
-    state4.preProbe(*this, lookup.hashes[row], row);
+    state4.preProbe(*this, hashAt(row), row);
     state1.firstProbe(*this, 0);
     state2.firstProbe(*this, 0);
     state3.firstProbe(*this, 0);
@@ -1892,7 +1993,7 @@ void HashTable<ignoreNullKeys>::joinProbe(HashLookup& lookup) {
   }
   for (; probeIndex < numProbes; ++probeIndex) {
     int32_t row = rows[probeIndex];
-    state1.preProbe(*this, lookup.hashes[row], row);
+    state1.preProbe(*this, hashAt(row), row);
     state1.firstProbe(*this, 0);
     fullProbe<true>(lookup, state1, false);
   }
@@ -1900,43 +2001,79 @@ void HashTable<ignoreNullKeys>::joinProbe(HashLookup& lookup) {
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::arrayJoinProbe(HashLookup& lookup) {
-  // Rows are nearly always consecutive.
-  auto& rows = lookup.rows;
-  auto hashes = lookup.hashes.data();
-  auto hits = lookup.hits.data();
-  auto numRows = rows.size();
-  int32_t i = 0;
-  constexpr int32_t kBatchSize = xsimd::batch<int64_t>::size;
-  constexpr int32_t kStep = kBatchSize * 2;
-  // We loop 2 vectors at a time for fewer switches. The rows are in practice
-  // always contiguous.
-  for (; i + kStep <= numRows; i += kStep) {
-    auto firstRow = rows[i];
-    if (rows[i + kStep - 1] - firstRow == kStep - 1) {
-      // kStep consecutive.
-      simd::gather(
-          reinterpret_cast<const int64_t*>(table_),
-          reinterpret_cast<const int64_t*>(hashes + firstRow))
-          .store_unaligned(reinterpret_cast<int64_t*>(hits) + firstRow);
-      simd::gather(
-          reinterpret_cast<const int64_t*>(table_),
-          reinterpret_cast<const int64_t*>(hashes + firstRow + kBatchSize))
-          .store_unaligned(
-              reinterpret_cast<int64_t*>(hits) + firstRow + kBatchSize);
-    } else {
-      for (auto j = i; j < i + kStep; ++j) {
-        auto row = rows[j];
-        auto index = hashes[row];
-        VELOX_DCHECK_LT(index, capacity_);
-        hits[row] = table_[index]; // NOLINT
+  if (hashLookupAosEnabled()) {
+    // AoS layout: hit pointers live in hotEntries and are mirrored to hits.
+    auto& rows = lookup.rows;
+    auto hashes = lookup.hashes.data();
+    auto numRows = rows.size();
+    int32_t i = 0;
+    constexpr int32_t kBatchSize = xsimd::batch<int64_t>::size;
+    constexpr int32_t kStep = kBatchSize * 2;
+    for (; i + kStep <= numRows; i += kStep) {
+      auto firstRow = rows[i];
+      if (rows[i + kStep - 1] - firstRow == kStep - 1) {
+        // kStep consecutive — write directly to hotEntries.
+        for (auto j = 0; j < kStep; ++j) {
+          auto r = firstRow + j;
+          lookup.hits[r] = table_[hashes[r]]; // NOLINT
+          lookup.hotEntries[r].hit = lookup.hits[r];
+        }
+      } else {
+        for (auto j = i; j < i + kStep; ++j) {
+          auto row = rows[j];
+          auto index = hashes[row];
+          VELOX_DCHECK_LT(index, capacity_);
+          lookup.hits[row] = table_[index]; // NOLINT
+          lookup.hotEntries[row].hit = lookup.hits[row];
+        }
       }
     }
-  }
-  for (; i < numRows; ++i) {
-    auto row = rows[i];
-    auto index = hashes[row];
-    VELOX_DCHECK_LT(index, capacity_);
-    hits[row] = table_[index]; // NOLINT
+    for (; i < numRows; ++i) {
+      auto row = rows[i];
+      auto index = hashes[row];
+      VELOX_DCHECK_LT(index, capacity_);
+      lookup.hits[row] = table_[index]; // NOLINT
+      lookup.hotEntries[row].hit = lookup.hits[row];
+    }
+  } else {
+    // Rows are nearly always consecutive.
+    auto& rows = lookup.rows;
+    auto hashes = lookup.hashes.data();
+    auto hits = lookup.hits.data();
+    auto numRows = rows.size();
+    int32_t i = 0;
+    constexpr int32_t kBatchSize = xsimd::batch<int64_t>::size;
+    constexpr int32_t kStep = kBatchSize * 2;
+    // We loop 2 vectors at a time for fewer switches. The rows are in practice
+    // always contiguous.
+    for (; i + kStep <= numRows; i += kStep) {
+      auto firstRow = rows[i];
+      if (rows[i + kStep - 1] - firstRow == kStep - 1) {
+        // kStep consecutive.
+        simd::gather(
+            reinterpret_cast<const int64_t*>(table_),
+            reinterpret_cast<const int64_t*>(hashes + firstRow))
+            .store_unaligned(reinterpret_cast<int64_t*>(hits) + firstRow);
+        simd::gather(
+            reinterpret_cast<const int64_t*>(table_),
+            reinterpret_cast<const int64_t*>(hashes + firstRow + kBatchSize))
+            .store_unaligned(
+                reinterpret_cast<int64_t*>(hits) + firstRow + kBatchSize);
+      } else {
+        for (auto j = i; j < i + kStep; ++j) {
+          auto row = rows[j];
+          auto index = hashes[row];
+          VELOX_DCHECK_LT(index, capacity_);
+          hits[row] = table_[index]; // NOLINT
+        }
+      }
+    }
+    for (; i < numRows; ++i) {
+      auto row = rows[i];
+      auto index = hashes[row];
+      VELOX_DCHECK_LT(index, capacity_);
+      hits[row] = table_[index]; // NOLINT
+    }
   }
 }
 
@@ -1948,7 +2085,7 @@ void HashTable<ignoreNullKeys>::joinNormalizedKeyProbe(HashLookup& lookup) {
   ProbeState states[kPrefetchSize];
   const uint64_t* keys = lookup.normalizedKeys.data();
   const uint64_t* hashes = lookup.hashes.data();
-  char** hits = lookup.hits.data();
+  const bool aosLayout = hashLookupAosEnabled();
   constexpr int32_t kKeyOffset =
       -static_cast<int32_t>(sizeof(normalized_key_t));
   for (; probeIndex + kPrefetchSize <= numProbes; probeIndex += kPrefetchSize) {
@@ -1960,14 +2097,21 @@ void HashTable<ignoreNullKeys>::joinNormalizedKeyProbe(HashLookup& lookup) {
       states[i].firstProbe(*this, kKeyOffset);
     }
     for (int32_t i = 0; i < kPrefetchSize; ++i) {
-      hits[states[i].row()] = states[i].joinNormalizedKeyFullProbe(*this, keys);
+      lookup.hits[states[i].row()] =
+          states[i].joinNormalizedKeyFullProbe(*this, keys); // NOLINT
+      if (aosLayout) {
+        lookup.hotEntries[states[i].row()].hit = lookup.hits[states[i].row()];
+      }
     }
   }
   for (; probeIndex < numProbes; ++probeIndex) {
     int32_t row = rows[probeIndex];
-    states[0].preProbe(*this, lookup.hashes[row], row);
+    states[0].preProbe(*this, hashes[row], row);
     states[0].firstProbe(*this, 0);
-    hits[row] = states[0].joinNormalizedKeyFullProbe(*this, keys);
+    lookup.hits[row] = states[0].joinNormalizedKeyFullProbe(*this, keys);
+    if (aosLayout) {
+      lookup.hotEntries[row].hit = lookup.hits[row];
+    }
   }
 }
 
@@ -2419,10 +2563,11 @@ void HashTable<ignoreNullKeys>::insertForGroupBy(
       VELOX_CHECK_NULL(table_[index]);
       table_[index] = groups[i];
     }
-  } else if (
-      hashMode_ == HashMode::kNormalizedKey &&
-      normalizedKeyMode_ == NormalizedKeyMode::sve) {
-    constexpr int32_t kVectorWidth = 4;
+  } else {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+    if (hashMode_ == HashMode::kNormalizedKey &&
+        normalizedKeyMode_ == NormalizedKeyMode::sve) {
+      constexpr int32_t kVectorWidth = 4;
     constexpr int32_t kTagShiftBits = 38;
     constexpr uint64_t kTagMask = 0x80;
     constexpr int32_t kProbeStep = 32;
@@ -2667,8 +2812,10 @@ void HashTable<ignoreNullKeys>::insertForGroupBy(
         }
         conflictFlag &= (conflictFlag - 1);
       }
-  } else {
-    constexpr int32_t kPrefetchDistance = 10;
+    } else
+#endif // __aarch64__ && __ARM_FEATURE_SVE
+    {
+      constexpr int32_t kPrefetchDistance = 10;
     for (int32_t i = 0; i < numGroups; ++i) {
       auto hash = hashes[i];
       auto offset = this->bucketOffset(hash);
@@ -2704,6 +2851,7 @@ void HashTable<ignoreNullKeys>::insertForGroupBy(
           "Have looped through all the buckets in table: {}",
           toString());
     }
+  }
   }
 }
 
@@ -3384,7 +3532,7 @@ int32_t HashTable<ignoreNullKeys>::listJoinResults(
   uint64_t totalBytes{0};
   while (iter.lastRowIndex < iter.rows->size()) {
     auto row = (*iter.rows)[iter.lastRowIndex];
-    auto hit = (*iter.hits)[row]; // NOLINT
+    auto hit = iter.hitAt(row); // NOLINT
     if (!hit) {
       ++iter.lastRowIndex;
       if (includeMisses) {
@@ -3457,42 +3605,62 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsFastPath(
   int32_t i = iter.lastRowIndex;
   const auto numRows = iter.rows->size();
 
-  constexpr int32_t kWidth = xsimd::batch<int64_t>::size;
-  auto sourceHits = reinterpret_cast<int64_t*>(iter.hits->data());
-  auto sourceRows = iter.rows->data();
-  // We pass the pointers as int64_t's in 'hitWords'.
-  auto resultHits = reinterpret_cast<int64_t*>(hits.data());
-  auto resultRows = inputRows.data();
-  const int64_t simdOutLimit = maxOut - kWidth;
-  for (; i + kWidth <= numRows && numOut < simdOutLimit; i += kWidth) {
-    auto indices = simd::loadGatherIndices<int64_t, int32_t>(sourceRows + i);
-    auto hitWords = simd::gather(sourceHits, indices);
-    auto misses = includeMisses ? 0 : simd::toBitMask(hitWords == 0);
-    if (misses == 0xf) {
-      continue;
+  if (hashLookupAosEnabled()) {
+    // AoS layout: iterations read through JoinResultIterator::hitAt(), which
+    // accesses hits (kept in sync with hotEntries).
+    auto sourceRows = iter.rows->data();
+    auto resultRows = inputRows.data();
+    for (; i < numRows; ++i) {
+      auto row = sourceRows[i];
+      auto hit = iter.hitAt(row);
+      if (includeMisses || hit) {
+        hits[numOut] = hit;
+        resultRows[numOut] = row;
+        ++numOut;
+        if (numOut >= maxOut) {
+          ++i;
+          break;
+        }
+      }
     }
-    if (!misses) {
-      hitWords.store_unaligned(resultHits + numOut);
-      indices.store_unaligned(resultRows + numOut);
-      numOut += kWidth;
-      continue;
+  } else {
+    // Original SoA SIMD gather + filter path (6320be2eb~1).
+    constexpr int32_t kWidth = xsimd::batch<int64_t>::size;
+    auto sourceHits = reinterpret_cast<int64_t*>(iter.hits->data());
+    auto sourceRows = iter.rows->data();
+    auto resultHits = reinterpret_cast<int64_t*>(hits.data());
+    auto resultRows = inputRows.data();
+    const int64_t simdOutLimit = maxOut - kWidth;
+    for (; i + kWidth <= numRows && numOut < simdOutLimit; i += kWidth) {
+      auto indices = simd::loadGatherIndices<int64_t, int32_t>(sourceRows + i);
+      auto hitWords = simd::gather(sourceHits, indices);
+      auto misses = includeMisses ? 0 : simd::toBitMask(hitWords == 0);
+      if (misses == 0xf) {
+        continue;
+      }
+      if (!misses) {
+        hitWords.store_unaligned(resultHits + numOut);
+        indices.store_unaligned(resultRows + numOut);
+        numOut += kWidth;
+        continue;
+      }
+      auto matches = misses ^ bits::lowMask(kWidth);
+      simd::filter<int64_t>(hitWords, matches, xsimd::default_arch{})
+          .store_unaligned(resultHits + numOut);
+      simd::filter<int32_t>(indices, matches, xsimd::default_arch{})
+          .store_unaligned(resultRows + numOut);
+      numOut += __builtin_popcount(matches);
     }
-    auto matches = misses ^ bits::lowMask(kWidth);
-    simd::filter<int64_t>(hitWords, matches, xsimd::default_arch{})
-        .store_unaligned(resultHits + numOut);
-    simd::filter<int32_t>(indices, matches, xsimd::default_arch{})
-        .store_unaligned(resultRows + numOut);
-    numOut += __builtin_popcount(matches);
-  }
-  for (; i < numRows; ++i) {
-    auto row = sourceRows[i];
-    if (includeMisses || sourceHits[row]) {
-      resultHits[numOut] = sourceHits[row];
-      resultRows[numOut] = row;
-      ++numOut;
-      if (numOut >= maxOut) {
-        ++i;
-        break;
+    for (; i < numRows; ++i) {
+      auto row = sourceRows[i];
+      if (includeMisses || sourceHits[row]) {
+        resultHits[numOut] = sourceHits[row];
+        resultRows[numOut] = row;
+        ++numOut;
+        if (numOut >= maxOut) {
+          ++i;
+          break;
+        }
       }
     }
   }
@@ -3592,7 +3760,12 @@ int32_t HashTable<false>::listNullKeyRows(
       lookup.hashes.push_back(0);
     }
     lookup.rows.push_back(0);
-    lookup.hits.resize(1);
+    if (hashLookupAosEnabled()) {
+      lookup.hotEntries.resize(1);
+      lookup.hotEntries[0].hash = lookup.hashes[0];
+      lookup.hotEntries[0].tag = BaseHashTable::hashTag(lookup.hashes[0]);
+      lookup.hotEntries[0].row = 0;
+    }
     joinProbe(lookup);
     iter->nextHit = lookup.hits[0];
     iter->initialized = true;
@@ -3818,6 +3991,21 @@ void HashTable<ignoreNullKeys>::prepareForGroupProbe(
   }
 
   populateLookupRows(rows, lookup.rows);
+
+  // Populate hotEntries from computed hashes for AoS hot path.
+  if (hashLookupAosEnabled()) {
+    auto& hotEntries = lookup.hotEntries;
+    auto numSelected = lookup.rows.size();
+    const auto* selectedRows = lookup.rows.data();
+    for (int32_t i = 0; i < numSelected; ++i) {
+      auto r = selectedRows[i];
+      hotEntries[r].hash = lookup.hashes[r];
+      hotEntries[r].hit = nullptr;
+      lookup.hits[r] = nullptr;
+      hotEntries[r].row = r;
+      hotEntries[r].tag = BaseHashTable::hashTag(lookup.hashes[r]);
+    }
+  }
 }
 
 template <bool ignoreNullKeys>
@@ -3860,6 +4048,21 @@ void HashTable<ignoreNullKeys>::prepareForJoinProbe(
   }
 
   populateLookupRows(rows, lookup.rows);
+
+  // Populate hotEntries from computed hashes for AoS hot path.
+  if (hashLookupAosEnabled()) {
+    auto& hotEntries = lookup.hotEntries;
+    auto numSelected = lookup.rows.size();
+    const auto* selectedRows = lookup.rows.data();
+    for (int32_t i = 0; i < numSelected; ++i) {
+      auto r = selectedRows[i];
+      hotEntries[r].hash = lookup.hashes[r];
+      hotEntries[r].hit = nullptr;
+      lookup.hits[r] = nullptr;
+      hotEntries[r].row = r;
+      hotEntries[r].tag = BaseHashTable::hashTag(lookup.hashes[r]);
+    }
+  }
 }
 
 } // namespace facebook::velox::exec
