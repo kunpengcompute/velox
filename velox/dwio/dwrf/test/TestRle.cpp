@@ -3449,3 +3449,47 @@ TEST_F(RLEv2Test, skipDeltaVariable3) {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+//
+// L2: RleDecoderV2::readWithVisitor has a batched loop (batchReadLoop) taken
+// when useBatchRead() is true (Visitor::dense && hasSimd() && !int128 &&
+// deterministic filter). It preserves the exact per-value null semantics but
+// decodes consecutive non-null rows via nextBatch (one next* call instead of
+// one readValue per row).
+//
+// L3: readLongs has a bulk fast path (readLongsSimd) taken when nulls==nullptr,
+// fb in [1,32], len>=8, and the whole bit range fits in the current contiguous
+// buffer window (no refill). It reads bytes directly from bufferStart_ instead
+// of per-byte readByte(), with the same MSB-first bit extraction. nextDirect's
+// ZigZag decode is NEON-vectorized (2x int64/iter) for the no-nulls signed
+// case. All paths fall back to the original scalar code when preconditions are
+// not met.
+//
+// The existing tests below exercise both paths: chunk sizes < 8 hit the scalar
+// readLongs; chunk sizes >= 8 with fb<=32 hit readLongsSimd. The large-count
+// cases (e.g. multipleRunsDirect with 40 values) cross run boundaries and
+// verify the fast path + fallback interplay. ColumnWriterTest and E2EFilterTest
+// provide end-to-end coverage through the real reader stack.
+// ---------------------------------------------------------------------------
+ 
+// Regression: the next()/doNext path (used by skip and the fallback loop) must
+// be unaffected. Exercises DIRECT across multiple chunk sizes and run
+// boundaries. Uses the verified bitSize2Direct bytes (0,1 repeated 10x).
+TEST_F(RLEv2Test, nextPathUnchangedDirectMultiChunk) {
+  const unsigned char bytes[] = {0x42, 0x13, 0x22, 0x22, 0x22, 0x22, 0x22};
+  unsigned long l = sizeof(bytes) / sizeof(char);
+  const size_t count = 20;
+  std::vector<int64_t> expected;
+  for (size_t i = 0; i < count; ++i) {
+    expected.push_back(i % 2);
+  }
+  for (size_t n : std::vector<size_t>{1, 2, 3, 7, count}) {
+    auto got = decodeRLEv2(bytes, l, n, count, nullptr);
+    ASSERT_EQ(got.size(), count) << "chunk size " << n;
+    for (size_t i = 0; i < count; ++i) {
+      EXPECT_EQ(expected[i], got[i])
+          << "chunk size " << n << " at " << i;
+    }
+  }
+}
