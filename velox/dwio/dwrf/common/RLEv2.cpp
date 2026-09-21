@@ -1103,6 +1103,116 @@ template uint64_t RleDecoderV2<false>::nextDelta(
     const uint64_t* const nulls);
 
 template <bool isSigned>
+uint64_t RleDecoderV2<isSigned>::readLongsSveBatch(
+    int64_t* const data,
+    uint64_t offset,
+    uint64_t len,
+    uint64_t fb) {
+#if defined(__ARM_FEATURE_SVE)
+  // Vectorized MSB-first bit unpack for DIRECT/DELTA/PATCHED_BASE payloads.
+  // Each iteration decodes svcntd() values. For value k of the group its 'fb'
+  // bits are read from an 8-byte big-endian window starting at bit
+  // (rbase + k*fb) of the group: svtbl_u8 gathers the window bytes (the byte
+  // indices also reverse them into big-endian order per lane) and one variable
+  // right shift extracts the value. readLongsSimd decodes the remaining tail
+  // with the scalar loop.
+  const uint64_t lanes = svcntd();
+  const uint64_t vecLen = (len / lanes) * lanes;
+  if (fb == 0 || fb > 32 || vecLen == 0) {
+    return 0;
+  }
+
+  // 'base' is the byte holding the residual curByte_ bits and 'r' is the bit
+  // offset of the next unread bit inside it. The widest table load starts at
+  // base + ((r + (vecLen-1)*fb) >> 3) and reads svcntb() bytes, so require
+  // that whole range to stay inside the current contiguous stream buffer.
+  const uint8_t* base =
+      reinterpret_cast<const uint8_t*>(this->bufferStart_) - 1;
+  const uint64_t r = 8 - bitsLeft_;
+  const uint64_t tableBytes = svcntb();
+  if (this->bufferEnd_ - reinterpret_cast<const char*>(base) <
+      static_cast<int64_t>(((r + (vecLen - 1) * fb) >> 3) + tableBytes)) {
+    return 0;
+  }
+
+  const svbool_t pg64 = svptrue_b64();
+  const svbool_t pg16 = svptrue_b16();
+  const svbool_t pg8 = svptrue_b8();
+  const svuint16_t elem = svindex_u16(0, 1);
+  // u16 element e of the table index vector covers bytes 2e and 2e+1, i.e.
+  // u64 lane e>>2 and byte pair (2*(e&3), 2*(e&3)+1) inside that lane.
+  const svuint16_t lane16 = svlsr_n_u16_x(pg16, elem, 2);
+  const svuint16_t pairInLane = svand_n_u16_x(pg16, elem, 3);
+  const svuint64_t lane64 = svindex_u64(0, 1);
+  const svuint64_t vfb = svdup_n_u64(fb);
+  const svuint64_t vMask = svdup_n_u64((1ULL << fb) - 1);
+
+  for (uint64_t i = 0; i < vecLen; i += lanes) {
+    const uint64_t t0 = r + i * fb;
+    const uint64_t rbase = t0 & 7;
+    const uint8_t* g = base + (t0 >> 3);
+
+    // Byte j of lane k is loaded from stream byte (windowStart(k) + 7 - j),
+    // so the lane reads as a big-endian window of the stream.
+    const svuint16_t bit = svadd_n_u16_x(
+        pg16,
+        svmul_n_u16_x(pg16, lane16, static_cast<uint16_t>(fb)),
+        static_cast<uint16_t>(rbase));
+    const svuint16_t lo = svsub_u16_x(
+        pg16,
+        svadd_n_u16_x(pg16, svlsr_n_u16_x(pg16, bit, 3), 7),
+        svadd_u16_x(pg16, pairInLane, pairInLane));
+    const svuint16_t idx16 = svorr_u16_x(
+        pg16, lo, svlsl_n_u16_x(pg16, svsub_n_u16_x(pg16, lo, 1), 8));
+    const svuint64_t words = svreinterpret_u64_u8(
+        svtbl_u8(svld1_u8(pg8, g), svreinterpret_u8_u16(idx16)));
+
+    // Extract bits [64-fb-(t&7), 64-(t&7)) of each big-endian window.
+    const svuint64_t bit64 = svadd_u64_x(
+        pg64, svmul_u64_x(pg64, lane64, vfb), svdup_n_u64(rbase));
+    const svuint64_t shift = svsub_u64_x(
+        pg64,
+        svsub_u64_x(pg64, svdup_n_u64(64), vfb),
+        svand_n_u64_x(pg64, bit64, 7));
+    svst1_u64(
+        pg64,
+        reinterpret_cast<uint64_t*>(data + offset + i),
+        svand_u64_x(pg64, svlsr_u64_x(pg64, words, shift), vMask));
+  }
+
+  // Advance the cursor exactly as the scalar loop would after vecLen values.
+  const uint64_t totalBits = r + vecLen * fb;
+  const uint64_t m = totalBits & 7;
+  const uint8_t* pNew = base + (totalBits >> 3) + (m != 0 ? 1 : 0);
+  if (pNew - 1 != base) {
+    curByte_ = *(pNew - 1);
+  }
+  // When pNew - 1 == base no byte past the residual curByte_ was consumed;
+  // its value is left unchanged.
+  bitsLeft_ = m != 0 ? static_cast<uint32_t>(8 - m) : 0;
+  this->bufferStart_ = reinterpret_cast<const char*>(pNew);
+  return vecLen;
+#else
+  (void)data;
+  (void)offset;
+  (void)len;
+  (void)fb;
+  return 0;
+#endif
+}
+
+template uint64_t RleDecoderV2<true>::readLongsSveBatch(
+    int64_t* const data,
+    uint64_t offset,
+    uint64_t len,
+    uint64_t fb);
+template uint64_t RleDecoderV2<false>::readLongsSveBatch(
+    int64_t* const data,
+    uint64_t offset,
+    uint64_t len,
+    uint64_t fb);
+
+template <bool isSigned>
 int64_t RleDecoderV2<isSigned>::readValue() {
   if (runRead_ == runLength_) {
     resetRun();

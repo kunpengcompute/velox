@@ -153,6 +153,11 @@ class ColumnVisitor {
   using DataType = T;
   static constexpr bool dense = isDense;
   static constexpr bool kHasBulkPath = true;
+  // Visitor can be fed by a decoder-side bulk read that decodes whole runs
+  // into the output buffer (see RleDecoderV2::bulkReadDense). Only direct
+  // column visitors implement the matching value/filter conventions; the
+  // dictionary visitors keep using the per-value loops.
+  static constexpr bool kSupportsDecoderBulkRead = false;
   static constexpr bool kHasFilter =
       !std::is_same_v<FilterType, velox::common::AlwaysTrue>;
   static constexpr bool kHasHook = !std::is_same_v<HookType, NoHook>;
@@ -1395,6 +1400,8 @@ class DirectRleColumnVisitor
   using super = ColumnVisitor<T, TFilter, ExtractValues, isDense>;
 
  public:
+  static constexpr bool kSupportsDecoderBulkRead = true;
+
   DirectRleColumnVisitor(
       TFilter& filter,
       SelectiveColumnReader* reader,
