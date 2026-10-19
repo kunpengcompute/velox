@@ -3493,3 +3493,105 @@ TEST_F(RLEv2Test, nextPathUnchangedDirectMultiChunk) {
     }
   }
 }
+
+namespace {
+
+// fbo field accepted by decodeBitWidth() for the widths used below: 1..24 map
+// to n-1, 26/28/30/32 map to FixedBitSizes::TWENTYSIX..THIRTYTWO.
+uint32_t directBitWidthField(int fb) {
+  VELOX_CHECK_LE(fb, 32);
+  return fb <= 24 ? static_cast<uint32_t>(fb - 1)
+                  : static_cast<uint32_t>(fb - 26) / 2 + 24;
+}
+
+// Builds a single DIRECT run (header + MSB-first packed payload) for values of
+// the given bit width. Mirrors the header layout decoded by nextDirect.
+std::vector<unsigned char> encodeDirectRun(
+    const std::vector<int64_t>& values,
+    int fb) {
+  const uint64_t runMinus1 = values.size() - 1;
+  VELOX_CHECK_LE(runMinus1, 0x1ff);
+  std::vector<unsigned char> out;
+  out.push_back(static_cast<unsigned char>(
+      (0x1u << 6) | (directBitWidthField(fb) << 1) |
+      static_cast<uint32_t>(runMinus1 >> 8)));
+  out.push_back(static_cast<unsigned char>(runMinus1 & 0xff));
+  const uint64_t mask = (1ULL << fb) - 1;
+  uint64_t pending = 0;
+  int pendingBits = 0;
+  for (auto value : values) {
+    pending = (pending << fb) | (static_cast<uint64_t>(value) & mask);
+    pendingBits += fb;
+    while (pendingBits >= 8) {
+      pendingBits -= 8;
+      out.push_back(
+          static_cast<unsigned char>((pending >> pendingBits) & 0xff));
+    }
+  }
+  if (pendingBits > 0) {
+    out.push_back(
+        static_cast<unsigned char>((pending << (8 - pendingBits)) & 0xff));
+  }
+  return out;
+}
+
+// Decodes 'count' unsigned values in chunks of 'chunk' (raw values, no ZigZag).
+std::vector<int64_t> decodeUnsignedRLEv2(
+    const std::vector<unsigned char>& bytes,
+    size_t chunk,
+    size_t count) {
+  auto pool = memory::memoryManager()->addLeafPool();
+  std::unique_ptr<dwio::common::IntDecoder<false>> rle =
+      createRleDecoder<false>(
+          std::make_unique<dwio::common::SeekableArrayInputStream>(
+              bytes.data(), bytes.size()),
+          RleVersion_2,
+          *pool,
+          true /* doesn't matter */,
+          dwio::common::INT_BYTE_SIZE /* doesn't matter */);
+  std::vector<int64_t> results;
+  results.reserve(count);
+  std::vector<int64_t> buffer(chunk);
+  for (size_t i = 0; i < count; i += chunk) {
+    const size_t n = std::min(chunk, count - i);
+    rle->next(buffer.data(), n, nullptr);
+    results.insert(results.end(), buffer.begin(), buffer.begin() + n);
+  }
+  return results;
+}
+
+} // namespace
+
+// Exercises the SVE bulk bit unpack in readLongsSveBatch: DIRECT runs long
+// enough to cover several svcntd()-wide groups plus a tail, decoded in chunk
+// sizes that cross the len>=8 fast-path gate and hit several bit phases
+// (chunk 9 leaves a non-zero bitsLeft_ for widths that are not byte aligned).
+TEST_F(RLEv2Test, directRunSveBulkBitUnpack) {
+  const std::vector<int> widths =
+      {1, 2, 3, 5, 7, 8, 11, 13, 16, 17, 24, 26, 32};
+  const std::vector<size_t> counts = {8, 9, 63, 64, 65, 259};
+  const std::vector<size_t> chunks = {1, 3, 8, 9, 64, 259};
+  for (int fb : widths) {
+    const uint64_t mask = (1ULL << fb) - 1;
+    for (size_t count : counts) {
+      std::vector<int64_t> expected(count);
+      for (size_t i = 0; i < count; ++i) {
+        expected[i] = static_cast<int64_t>(
+            (i * 2654435761ULL + static_cast<uint64_t>(fb) * 40503ULL) & mask);
+      }
+      auto bytes = encodeDirectRun(expected, fb);
+      // Slack emulating the reader's contiguous buffer: readLongsSveBatch
+      // only vectorizes when its svcntb()-byte table load stays in bounds.
+      bytes.insert(bytes.end(), 64, 0);
+      for (size_t chunk : chunks) {
+        const auto actual = decodeUnsignedRLEv2(bytes, chunk, count);
+        ASSERT_EQ(actual.size(), count);
+        for (size_t i = 0; i < count; ++i) {
+          ASSERT_EQ(expected[i], actual[i])
+              << "fb=" << fb << " count=" << count << " chunk=" << chunk
+              << " row=" << i;
+        }
+      }
+    }
+  }
+}
