@@ -1199,11 +1199,11 @@ void RowContainer::extractStringsBatch(
         auto stream = HashStringAllocator::prepareRead(
             HashStringAllocator::headerOf(meta[i].data));
         stream->readBytes(dst, size);
-      } else if (size <= 16) {
+      } else if (size <= 16 && bufferOffset + 16 <= totalBytes) {
         // Single 128-bit load/store covers up to 16 bytes.
         uint8x16_t chunk = vld1q_u8(reinterpret_cast<const uint8_t*>(meta[i].data));
         vst1q_u8(reinterpret_cast<uint8_t*>(dst), chunk);
-      } else if (size <= 32) {
+      } else if (size <= 32 && bufferOffset + 32 <= totalBytes) {
         // Two 128-bit load/stores cover 17-32 bytes.
         uint8x16_t lo = vld1q_u8(reinterpret_cast<const uint8_t*>(meta[i].data));
         uint8x16_t hi = vld1q_u8(reinterpret_cast<const uint8_t*>(meta[i].data + 16));

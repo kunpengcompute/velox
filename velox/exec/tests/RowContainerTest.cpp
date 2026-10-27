@@ -934,6 +934,25 @@ static int32_t sign(int32_t n) {
 }
 } // namespace
 
+// Verifies that the NEON fast path in extractStringsBatch does not write
+// past the reserved buffer. The 19+13 byte batch makes the second string's
+// 16-byte NEON store extend 3 bytes past the 32-byte reservation. Before
+// the bounds guard, this corrupts the AlignedBuffer end guard (assertion
+// in debug builds); with the guard, the string falls back to memcpy.
+TEST_F(RowContainerTest, ExtractStringsBatchNEONBounds) {
+  facebook::velox::test::VectorMaker vectorMaker{pool_.get()};
+  std::vector<std::string> strings{
+      std::string(19, 'a'),
+      std::string(13, 'b'),
+  };
+  auto input = vectorMaker.flatVector<StringView>(
+      static_cast<vector_size_t>(strings.size()),
+      [&](vector_size_t row) {
+        return StringView(strings[row]);
+      });
+  roundTrip(input);
+}
+
 TEST_F(RowContainerTest, storeExtractArrayOfVarchar) {
   // Make a string vector with two rows each having 2 elements.
   // Here it is important, that one of the 1st row's elements has more than 12
