@@ -29,56 +29,57 @@ add_subdirectory(external/hdfs)
 
 # examples depend on expression
 if(${VELOX_ENABLE_EXAMPLES} AND ${VELOX_ENABLE_EXPRESSION})
-  add_subdirectory(examples)
+    add_subdirectory(examples)
 endif()
 
 if(${VELOX_ENABLE_BENCHMARKS} OR ${VELOX_ENABLE_BENCHMARKS_BASIC})
-  add_subdirectory(benchmarks)
+    add_subdirectory(benchmarks)
 endif()
 
 if(${VELOX_ENABLE_EXPRESSION})
-  add_subdirectory(expression)
+    add_subdirectory(expression)
+    add_subdirectory(optimizer)
 endif()
 
 if(${VELOX_ENABLE_PARSE})
-  add_subdirectory(parse)
+    add_subdirectory(parse)
 endif()
 
 # hive connector depends on dwio
 if(${VELOX_BUILD_MINIMAL_WITH_DWIO} OR ${VELOX_ENABLE_HIVE_CONNECTOR})
-  add_subdirectory(dwio)
+    add_subdirectory(dwio)
 endif()
 
 if(${VELOX_ENABLE_TPCH_CONNECTOR})
-  add_subdirectory(tpch/gen)
+    add_subdirectory(tpch/gen)
 endif()
 
 add_subdirectory(functions) # depends on md5 (postgresql)
 add_subdirectory(connectors)
 
 if(${VELOX_ENABLE_EXEC})
-  add_subdirectory(exec)
-  # Disable runner from pyvelox builds
-  if(${VELOX_BUILD_RUNNER})
-    add_subdirectory(runner)
-  endif()
+    add_subdirectory(exec)
+    # Disable runner from pyvelox builds
+    if(${VELOX_BUILD_RUNNER})
+        add_subdirectory(runner)
+    endif()
 endif()
 
 if(${VELOX_ENABLE_DUCKDB})
-  add_subdirectory(duckdb)
+    add_subdirectory(duckdb)
 endif()
 
 if(${VELOX_ENABLE_GPU})
-  add_subdirectory(experimental/gpu)
-  add_subdirectory(experimental/wave)
-  add_subdirectory(external/jitify)
+    add_subdirectory(experimental/gpu)
+    add_subdirectory(experimental/wave)
+    add_subdirectory(external/jitify)
 endif()
 
 # substrait converter
 if(${VELOX_ENABLE_SUBSTRAIT})
-  add_subdirectory(substrait)
+    add_subdirectory(substrait)
 endif()
 
 if(${VELOX_BUILD_TESTING})
-  add_subdirectory(tool)
+    add_subdirectory(tool)
 endif()
