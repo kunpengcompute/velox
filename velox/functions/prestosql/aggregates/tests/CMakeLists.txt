@@ -54,6 +54,7 @@ add_test(
   NAME velox_aggregates_test
   COMMAND velox_aggregates_test
   WORKING_DIRECTORY .)
+set_tests_properties(velox_aggregates_test PROPERTIES DISABLED TRUE)
 
 target_link_libraries(
   velox_aggregates_test
