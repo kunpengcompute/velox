@@ -88,7 +88,11 @@ void SelectiveIntegerDictionaryColumnReader::read(
   // Read the stream of booleans indicating whether a given data entry is an
   // offset or a literal value.
   if (inDictionaryReader_) {
+#if defined(__aarch64__)
+    const bool isBulk = useArmBulkPath();
+#else
     const bool isBulk = useBulkPath();
+#endif
     const int32_t numFlags = (isBulk && nullsInReadRange_)
         ? bits::countNonNulls(nullsInReadRange_->as<uint64_t>(), 0, end)
         : end;
