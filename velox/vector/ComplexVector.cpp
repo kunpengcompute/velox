@@ -163,23 +163,8 @@ void RowVector::copy(
   if (count == 0) {
     return;
   }
-  SelectivityVector rows(targetIndex + count);
-  rows.setValidRange(0, targetIndex, false);
-  rows.updateBounds();
-
-  BufferPtr indices;
-  vector_size_t* toSourceRow = nullptr;
-  if (sourceIndex != targetIndex) {
-    indices =
-        AlignedBuffer::allocate<vector_size_t>(targetIndex + count, pool_);
-    toSourceRow = indices->asMutable<vector_size_t>();
-    std::iota(
-        toSourceRow + targetIndex,
-        toSourceRow + targetIndex + count,
-        sourceIndex);
-  }
-
-  copy(source, rows, toSourceRow);
+  CopyRange range{sourceIndex, targetIndex, count};
+  copyRanges(source, folly::Range(&range, 1));
 }
 
 void RowVector::copy(
@@ -343,7 +328,11 @@ void RowVector::copyRanges(
     }
     auto* rowSource = source->loadedVector()->as<RowVector>();
     for (int i = 0; i < children_.size(); ++i) {
-      children_[i]->copyRanges(rowSource->childAt(i)->loadedVector(), ranges);
+      if (rowSource->childAt(i)) {
+        children_[i]->copyRanges(rowSource->childAt(i)->loadedVector(), ranges);
+      } else {
+        children_[i].reset();
+      }
     }
   } else {
     std::vector<BaseVector::CopyRange> baseRanges;
@@ -370,8 +359,12 @@ void RowVector::copyRanges(
 
     auto* rowSource = decoded.base()->as<RowVector>();
     for (int i = 0; i < children_.size(); ++i) {
-      children_[i]->copyRanges(
-          rowSource->childAt(i)->loadedVector(), baseRanges);
+      if (rowSource->childAt(i)) {
+        children_[i]->copyRanges(
+            rowSource->childAt(i)->loadedVector(), baseRanges);
+      } else {
+        children_[i].reset();
+      }
     }
   }
 }
