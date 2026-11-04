@@ -296,6 +296,10 @@ class DecodedVector {
   /// Pre-allocated vector of 0, 1, 2,..
   static const std::vector<vector_size_t>& consecutiveIndices();
 
+  uint64_t* getNulls() {
+    return const_cast<uint64_t*>(nulls_);
+  }
+
  private:
   DecodedVector(
       const BaseVector& vector,
