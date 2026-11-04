@@ -1024,11 +1024,12 @@ void RowContainer::extractStringsBatch(
       } else {
         const char* r = (k == 0) ? row0 : (k == 1) ? row1 : (k == 2) ? row2 : row3;
         auto value = valueAt<StringView>(r, offset);
-        sizes[k] = static_cast<uint32_t>(value.size());
         if (value.isInline()) {
           rawValues[ri] = value;
           meta[i + k] = {nullptr, 0, false};
+          sizes[k] = 0;
         } else {
+          sizes[k] = static_cast<uint32_t>(value.size());
           auto* header = reinterpret_cast<const HashStringAllocator::Header*>(
               value.data()) - 1;
           bool isMultiPiece =
