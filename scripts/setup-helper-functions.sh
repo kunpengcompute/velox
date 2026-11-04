@@ -153,7 +153,7 @@ function get_cxx_flags {
         elif [ "$ARM_CPU_PRODUCT" = "$Neoverse_V1" ]; then
           echo -n "-mcpu=neoverse-v1 "
         else
-          echo -n "-march=armv8-a+crc+crypto${arm_sve_extension} "
+          echo -n "-march=armv8.2-a+sve+crc+crypto+nolse -mno-outline-atomics -msve-vector-bits=256 -DSVE_BITS=256"
         fi
       elif [[ -n "$arm_sve_extension" ]]; then
         echo -n "-march=armv8-a${arm_sve_extension} "
