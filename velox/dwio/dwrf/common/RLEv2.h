@@ -17,8 +17,10 @@
 #pragma once
 
 #include "velox/common/memory/Memory.h"
+#include "velox/common/process/ProcessBase.h"
 #include "velox/dwio/common/Adaptor.h"
 #include "velox/dwio/common/DataBuffer.h"
+#include "velox/dwio/common/DecoderUtil.h"
 #include "velox/dwio/common/IntDecoder.h"
 #include "velox/dwio/common/exception/Exception.h"
 
@@ -62,13 +64,31 @@ class RleDecoderV2 : public dwio::common::IntDecoder<isSigned> {
   template <bool hasNulls, typename Visitor>
   void readWithVisitor(const uint64_t* nulls, Visitor visitor) {
     skipPending();
+
+    // Dense filtered reads decode the whole range in batches and run the
+    // shared SIMD filter/extract path instead of the per-value loop below.
+    if constexpr (
+        Visitor::dense && Visitor::kSupportsDecoderBulkRead &&
+        Visitor::kHasFilter) {
+      if (dwio::common::useDecoderBulkPath<Visitor, hasNulls>(visitor)) {
+        bulkReadDense<hasNulls>(nulls, visitor);
+        return;
+      }
+    }
+
     int32_t current = visitor.start();
     this->template skip<hasNulls>(current, 0, nulls);
 
-    int32_t toSkip;
     bool atEnd = false;
     const bool allowNulls = hasNulls && visitor.allowNulls();
 
+    if (useBatchRead<hasNulls>(visitor)) {
+      batchReadLoop<hasNulls>(
+          nulls, visitor, current, atEnd, allowNulls);
+      return;
+    }
+
+    int32_t toSkip;
     for (;;) {
       if (hasNulls && allowNulls && bits::isBitNull(nulls, current)) {
         toSkip = visitor.processNull(atEnd);
@@ -97,6 +117,293 @@ class RleDecoderV2 : public dwio::common::IntDecoder<isSigned> {
         return;
       }
     }
+  }
+
+  /// Gate for the batched decode loop. Requires dense rows: the batch path
+  /// pre-decodes a run of consecutive non-null rows assuming they map to
+  /// consecutive decoder values with no gaps, which holds only for dense rows
+  /// (where process() returns toSkip==0 for adjacent rows). For sparse rows
+  /// process() may return toSkip>0 (gaps), which would invalidate the
+  /// pre-decoded buffer, so sparse falls back to per-value.
+  template <bool hasNulls, typename Visitor>
+  bool useBatchRead(Visitor& visitor) {
+    return Visitor::dense &&
+        process::hasSimd() &&
+        !std::is_same_v<typename Visitor::DataType, int128_t> &&
+        Visitor::FilterType::deterministic;
+  }
+
+  /// Batched version of the per-value loop. Walks rows exactly like the
+  /// fallback (same null checks, same visitor calls, same skip logic), but when
+  /// it reaches a non-null row it peeks ahead in the null bitmap to find the
+  /// longest run of consecutive non-null rows and decodes them with a single
+  /// next* call into a scratch buffer, then processes each value. This amortizes
+  /// the per-value readValue() dispatch (run-state-machine re-entry + single-
+  /// value next* call) over the run length. Null handling is unchanged: null
+  /// rows go through processNull / checkAndSkipNulls exactly as before, and
+  /// decoder skips between non-contiguous rows use the same skip<hasNulls>.
+  template <bool hasNulls, typename Visitor>
+  void batchReadLoop(
+      const uint64_t* nulls,
+      Visitor& visitor,
+      int32_t current,
+      bool& atEnd,
+      bool allowNulls) {
+    using T = typename Visitor::DataType;
+    int32_t toSkip;
+    for (;;) {
+      if (hasNulls && allowNulls && bits::isBitNull(nulls, current)) {
+        toSkip = visitor.processNull(atEnd);
+        ++current;
+        if (toSkip) {
+          this->template skip<hasNulls>(toSkip, current, nulls);
+          current += toSkip;
+        }
+        if (atEnd) {
+          return;
+        }
+        continue;
+      }
+      if (hasNulls && !allowNulls) {
+        toSkip = visitor.checkAndSkipNulls(nulls, current, atEnd);
+        if (!Visitor::dense) {
+          this->template skip<false>(toSkip, current, nullptr);
+        }
+        if (atEnd) {
+          return;
+        }
+      }
+      // We are at a non-null row. Peek ahead to find the longest run of
+      // consecutive non-null rows starting at 'current' (bounded by the
+      // visitor's remaining rows). next* reads that many consecutive decoder
+      // values. This is correct because decoder values are 1:1 with non-null
+      // rows, and consecutive non-null rows map to consecutive decoder values.
+      int32_t numValues = visitor.numRows() - visitor.rowIndex();
+      if (hasNulls && numValues > 1) {
+        // Count consecutive non-nulls in [current+1, current+numValues).
+        int32_t contiguous = 1;
+        while (contiguous < numValues &&
+               !bits::isBitNull(nulls, current + contiguous)) {
+          ++contiguous;
+        }
+        numValues = contiguous;
+      }
+      if (numValues > 1) {
+        // Batch decode numValues values into scratch, then process each.
+        if (bulkScratch_.size() < static_cast<uint64_t>(numValues)) {
+          bulkScratch_.resize(static_cast<uint64_t>(numValues));
+        }
+        int64_t* buf = bulkScratch_.data();
+        // Decode consecutive values. nextBatch advances runRead_ across run
+        // boundaries as needed (doNext-style), so this works even if the
+        // contiguous non-null run spans multiple RLE runs.
+        nextBatch(buf, numValues);
+        for (int32_t i = 0; i < numValues; ++i) {
+          toSkip = visitor.process(static_cast<T>(buf[i]), atEnd);
+          ++current;
+          if (toSkip) {
+            // For dense rows toSkip is normally 0 (adjacent rows). If non-zero
+            // (e.g. filter dropped trailing rows), the remaining pre-decoded
+            // values are at wrong decoder positions, so skip the gap and break
+            // to re-enter single-value mode. The skipped decoder values were
+            // NOT pre-decoded (nextBatch decoded exactly numValues), so the
+            // gap skip is correct.
+            this->template skip<hasNulls>(toSkip, current, nulls);
+            current += toSkip;
+          }
+          if (atEnd) {
+            return;
+          }
+          if (toSkip) {
+            break; // re-enter loop; remaining buffered values are discarded
+          }
+        }
+      } else {
+        // Single non-null row (or last in run): per-value decode.
+        auto value = readValue();
+        toSkip = visitor.process(value, atEnd);
+        ++current;
+        if (toSkip) {
+          this->template skip<hasNulls>(toSkip, current, nulls);
+          current += toSkip;
+        }
+        if (atEnd) {
+          return;
+        }
+      }
+    }
+  }
+
+  /// Decodes up to 'numValues' consecutive values into 'buf', advancing the
+  /// run state machine across run boundaries (like doNext but without null
+  /// handling, since batchReadLoop only calls this for consecutive non-null
+  /// rows). Returns the number of values decoded. The current run's header
+  /// must already be parsed (runRead_ < runLength_ or caller resets).
+  uint64_t nextBatch(int64_t* buf, int32_t numValues) {
+    uint64_t nRead = 0;
+    while (nRead < static_cast<uint64_t>(numValues)) {
+      if (runRead_ == runLength_) {
+        resetRun();
+      }
+      uint64_t offset = nRead;
+      uint64_t length = static_cast<uint64_t>(numValues) - nRead;
+      switch (type_) {
+        case SHORT_REPEAT:
+          nRead += nextShortRepeats(buf, offset, length, nullptr);
+          break;
+        case DIRECT:
+          nRead += nextDirect(buf, offset, length, nullptr);
+          break;
+        case PATCHED_BASE:
+          nRead += nextPatched(buf, offset, length, nullptr);
+          break;
+        case DELTA:
+          nRead += nextDelta(buf, offset, length, nullptr);
+          break;
+        default:
+          VELOX_FAIL("unknown encoding: {}", static_cast<int>(type_));
+      }
+    }
+    return nRead;
+  }
+
+  unsigned char readByte() {
+    if (dwio::common::IntDecoder<isSigned>::bufferStart_ ==
+        dwio::common::IntDecoder<isSigned>::bufferEnd_) {
+      int32_t bufferLength;
+      const void* bufferPointer;
+      const bool ret = dwio::common::IntDecoder<isSigned>::inputStream_->Next(
+          &bufferPointer, &bufferLength);
+      VELOX_CHECK(
+          ret,
+          "bad read in RleDecoderV2::readByte, ",
+          dwio::common::IntDecoder<isSigned>::inputStream_->getName());
+      dwio::common::IntDecoder<isSigned>::bufferStart_ =
+          static_cast<const char*>(bufferPointer);
+      dwio::common::IntDecoder<isSigned>::bufferEnd_ =
+          dwio::common::IntDecoder<isSigned>::bufferStart_ + bufferLength;
+    }
+
+    unsigned char result = static_cast<unsigned char>(
+        *dwio::common::IntDecoder<isSigned>::bufferStart_++);
+    return result;
+  }
+
+  int64_t readLongBE(uint64_t bsz);
+  uint64_t readLongs(
+      int64_t* data,
+      uint64_t offset,
+      uint64_t len,
+      uint64_t fb,
+      const uint64_t* nulls = nullptr) {
+    // SIMD/bulk fast path: no nulls, fb in [1,32], enough values, and the
+    // remaining bytes are all in the current contiguous buffer (no refill
+    // needed). This eliminates the per-byte readByte() overhead (buffer-boundary
+    // check + call) by reading bytes directly from bufferStart_. The bit
+    // extraction is SVE-vectorized in whole-vector batches inside
+    // readLongsSimd (MSB-first, matching ORC RLEv2), which is correct for all
+    // fb in [1,32]; the win is from removing readByte() churn and per-value bit
+    // state machine work. The buffer-availability check is done inline here
+    // (cheap) so that small runs with insufficient buffer skip readLongsSimd
+    // entirely with no
+    // inlined overhead, avoiding regression on queries with small RLEv2 runs.
+    if (nulls == nullptr && fb >= 1 && fb <= 32 && len >= 8) {
+      const uint64_t bitsFromBuffer =
+          (len * fb > bitsLeft_) ? (len * fb - bitsLeft_) : 0;
+      const uint64_t neededBytes = (bitsFromBuffer + 7) / 8 + 8;
+      if (static_cast<uint64_t>(this->bufferEnd_ - this->bufferStart_) >=
+          neededBytes) {
+        readLongsSimd(data, offset, len, fb);
+        return len;
+      }
+    }
+
+    uint64_t ret = 0;
+
+    // TODO: unroll to improve performance
+    for (uint64_t i = offset; i < (offset + len); i++) {
+      // skip null positions
+      if (nulls && bits::isBitNull(nulls, i)) {
+        continue;
+      }
+      uint64_t result = 0;
+      uint64_t bitsLeftToRead = fb;
+      while (bitsLeftToRead > bitsLeft_) {
+        result <<= bitsLeft_;
+        result |= curByte_ & ((1 << bitsLeft_) - 1);
+        bitsLeftToRead -= bitsLeft_;
+        curByte_ = readByte();
+        bitsLeft_ = 8;
+      }
+
+      // handle the left over bits
+      if (bitsLeftToRead > 0) {
+        result <<= bitsLeftToRead;
+        bitsLeft_ -= static_cast<uint32_t>(bitsLeftToRead);
+        result |= (curByte_ >> bitsLeft_) & ((1 << bitsLeftToRead) - 1);
+      }
+      data[i] = static_cast<int64_t>(result);
+      ++ret;
+    }
+
+    return ret;
+  }
+
+  /// Bulk bit-unpack fast path for readLongs. Reads 'len' values of 'fb' bits
+  /// each (fb in [1,32]) directly from bufferStart_, avoiding the per-byte
+  /// readByte() overhead. Requires nulls==nullptr (handled by caller) and that
+  /// the whole bit range fits in the current contiguous buffer window
+  /// [bufferStart_, bufferEnd_) with a few bytes of padding for safe wide reads.
+  ///
+  /// Bit order is ORC RLEv2 MSB-first: within each byte the high bits are
+  /// consumed first (curByte_ >> bitsLeft_).
+  ///
+  /// On SVE the leading whole vectors are decoded by readLongsSveBatch: each
+  /// output vector of svcntd() values is extracted from per-lane 8-byte
+  /// big-endian windows gathered with svtbl_u8 and a single variable shift.
+  /// The scalar loop below drains any residual sub-byte alignment, the tail
+  /// shorter than one vector, and the whole range when SVE is unavailable.
+  /// Both paths leave curByte_/bitsLeft_/bufferStart_ in the same state.
+  void readLongsSimd(int64_t* data, uint64_t offset, uint64_t len, uint64_t fb) {
+    const uint64_t bulk = readLongsSveBatch(data, offset, len, fb);
+    offset += bulk;
+    len -= bulk;
+
+    const uint64_t mask = (1ULL << fb) - 1;
+
+    // The byte buffer we read from. curByte_/bitsLeft_ hold residual bits from
+    // *(bufferStart_ - 1); once those are drained the stream continues at
+    // *bufferStart_. We process values one at a time but pull bytes straight
+    // from 'p' (no readByte() boundary checks), which is the main win.
+    const uint8_t* p =
+        reinterpret_cast<const uint8_t*>(this->bufferStart_);
+    uint32_t bitsLeft = bitsLeft_;
+    uint32_t curByte = curByte_;
+
+    for (uint64_t i = 0; i < len; ++i) {
+      uint64_t result = 0;
+      uint64_t bitsLeftToRead = fb;
+      while (bitsLeftToRead > bitsLeft) {
+        result <<= bitsLeft;
+        result |= curByte & ((1u << bitsLeft) - 1);
+        bitsLeftToRead -= bitsLeft;
+        curByte = *p++;
+        bitsLeft = 8;
+      }
+      if (bitsLeftToRead > 0) {
+        result <<= bitsLeftToRead;
+        bitsLeft -= static_cast<uint32_t>(bitsLeftToRead);
+        result |= (curByte >> bitsLeft) & ((1u << bitsLeftToRead) - 1);
+      }
+      data[offset + i] = static_cast<int64_t>(result & mask);
+    }
+
+    // Commit cursor state. 'p' advanced past the bytes consumed from
+    // bufferStart_; the last partially-consumed byte (if any) is at *(p - 1)
+    // and its remaining low bits are 'bitsLeft' in 'curByte'.
+    this->bufferStart_ = reinterpret_cast<const char*>(p);
+    bitsLeft_ = bitsLeft;
+    curByte_ = curByte;
   }
 
  private:
@@ -131,66 +438,6 @@ class RleDecoderV2 : public dwio::common::IntDecoder<isSigned> {
     type_ = static_cast<EncodingType>((firstByte_ >> 6) & 0x03);
   }
 
-  unsigned char readByte() {
-    if (dwio::common::IntDecoder<isSigned>::bufferStart_ ==
-        dwio::common::IntDecoder<isSigned>::bufferEnd_) {
-      int32_t bufferLength;
-      const void* bufferPointer;
-      const bool ret = dwio::common::IntDecoder<isSigned>::inputStream_->Next(
-          &bufferPointer, &bufferLength);
-      VELOX_CHECK(
-          ret,
-          "bad read in RleDecoderV2::readByte, ",
-          dwio::common::IntDecoder<isSigned>::inputStream_->getName());
-      dwio::common::IntDecoder<isSigned>::bufferStart_ =
-          static_cast<const char*>(bufferPointer);
-      dwio::common::IntDecoder<isSigned>::bufferEnd_ =
-          dwio::common::IntDecoder<isSigned>::bufferStart_ + bufferLength;
-    }
-
-    unsigned char result = static_cast<unsigned char>(
-        *dwio::common::IntDecoder<isSigned>::bufferStart_++);
-    return result;
-  }
-
-  int64_t readLongBE(uint64_t bsz);
-  uint64_t readLongs(
-      int64_t* data,
-      uint64_t offset,
-      uint64_t len,
-      uint64_t fb,
-      const uint64_t* nulls = nullptr) {
-    uint64_t ret = 0;
-
-    // TODO: unroll to improve performance
-    for (uint64_t i = offset; i < (offset + len); i++) {
-      // skip null positions
-      if (nulls && bits::isBitNull(nulls, i)) {
-        continue;
-      }
-      uint64_t result = 0;
-      uint64_t bitsLeftToRead = fb;
-      while (bitsLeftToRead > bitsLeft_) {
-        result <<= bitsLeft_;
-        result |= curByte_ & ((1 << bitsLeft_) - 1);
-        bitsLeftToRead -= bitsLeft_;
-        curByte_ = readByte();
-        bitsLeft_ = 8;
-      }
-
-      // handle the left over bits
-      if (bitsLeftToRead > 0) {
-        result <<= bitsLeftToRead;
-        bitsLeft_ -= static_cast<uint32_t>(bitsLeftToRead);
-        result |= (curByte_ >> bitsLeft_) & ((1 << bitsLeftToRead) - 1);
-      }
-      data[i] = static_cast<int64_t>(result);
-      ++ret;
-    }
-
-    return ret;
-  }
-
   uint64_t nextShortRepeats(
       int64_t* data,
       uint64_t offset,
@@ -219,6 +466,109 @@ class RleDecoderV2 : public dwio::common::IntDecoder<isSigned> {
       const uint64_t numValues,
       const uint64_t* const nulls);
 
+  // Encoding-aware skip of `numValues` non-null values from the current run
+  // position. Advances runRead_ and the underlying bit stream / unpacked
+  // index exactly as doNext would, but without materializing values into an
+  // output buffer. Called by skipPending; numValues is already the non-null
+  // count (callers convert nulls to non-null counts before reaching here).
+  void skipValues(uint64_t numValues);
+
+  /// SVE-vectorized MSB-first bit unpack shared by readLongsSimd. Decodes
+  /// whole vectors of svcntd() values from the current cursor, advancing
+  /// curByte_/bitsLeft_/bufferStart_ exactly as the scalar loop would, and
+  /// returns the number of values decoded. Returns 0 when SVE is unavailable,
+  /// 'fb' is outside [1,32], the input holds less than one vector, or the
+  /// table load would leave the current contiguous stream buffer.
+  uint64_t readLongsSveBatch(
+      int64_t* const data,
+      uint64_t offset,
+      uint64_t len,
+      uint64_t fb);
+
+  /// Decodes 'numValues' consecutive values into 'dst', narrowing from the
+  /// decoder's int64 output when the visitor's data type is narrower.
+  template <typename T>
+  void decodeToValues(T* dst, int32_t numValues) {
+    if constexpr (std::is_same_v<T, int64_t>) {
+      next(reinterpret_cast<int64_t*>(dst), numValues, nullptr);
+    } else {
+      constexpr int32_t kChunk = 1024;
+      int32_t done = 0;
+      while (done < numValues) {
+        const int32_t chunk = std::min(kChunk, numValues - done);
+        if (bulkScratch_.size() < static_cast<uint64_t>(chunk)) {
+          bulkScratch_.resize(chunk);
+        }
+        next(bulkScratch_.data(), chunk, nullptr);
+        for (int32_t i = 0; i < chunk; ++i) {
+          dst[done + i] = static_cast<T>(bulkScratch_[i]);
+        }
+        done += chunk;
+      }
+    }
+  }
+
+  /// Bulk decode for dense, filtered reads: decodes the values of the whole
+  /// range (or of all non-null rows when 'hasNulls') into the visitor's output
+  /// buffer and applies the filter plus extraction with the shared SIMD path
+  /// (processFixedWidthRun), mirroring DirectDecoder::fastPath. This removes
+  /// the per-value process() and per-gap skip work from the visitor loop.
+  template <bool hasNulls, typename Visitor>
+  void bulkReadDense(const uint64_t* nulls, Visitor& visitor) {
+    using T = typename Visitor::DataType;
+    constexpr bool filterOnly = Visitor::kFilterOnly;
+    constexpr bool hasHook = Visitor::kHasHook;
+    const int32_t numRows = visitor.numRows();
+    const auto* rows = visitor.rows();
+    auto rowsAsRange = folly::Range<const int32_t*>(rows, numRows);
+    auto* values = visitor.rawValues(numRows);
+    int32_t* filterHits = visitor.outputRows(numRows);
+    int32_t numValues = 0;
+
+    if (hasNulls) {
+      auto* outerRows = &visitor.outerNonNullRows();
+      dwio::common::nonNullRowsFromDense(nulls, numRows, *outerRows);
+      const int32_t numNonNull = outerRows->size();
+      if (numNonNull == 0) {
+        visitor.setAllNull(0);
+        return;
+      }
+      if (hasHook && visitor.numValuesBias() > 0) {
+        for (auto& row : *outerRows) {
+          row += visitor.numValuesBias();
+        }
+      }
+      decodeToValues<T>(values, numNonNull);
+      dwio::common::processFixedWidthRun<T, filterOnly, true, Visitor::dense>(
+          folly::Range<const int32_t*>(rows, numNonNull),
+          0,
+          numNonNull,
+          outerRows->data(),
+          values,
+          filterHits,
+          numValues,
+          visitor.filter(),
+          visitor.hook());
+    } else {
+      decodeToValues<T>(values, numRows);
+      dwio::common::processFixedWidthRun<T, filterOnly, false, Visitor::dense>(
+          rowsAsRange,
+          0,
+          numRows,
+          hasHook ? velox::iota(
+                        numRows,
+                        visitor.innerNonNullRows(),
+                        visitor.numValuesBias())
+                  : nullptr,
+          values,
+          filterHits,
+          numValues,
+          visitor.filter(),
+          visitor.hook());
+    }
+    visitor.setNumValues(numValues);
+  }
+
   unsigned char firstByte_;
   uint64_t runLength_;
   uint64_t runRead_;
@@ -240,6 +590,10 @@ class RleDecoderV2 : public dwio::common::IntDecoder<isSigned> {
   EncodingType type_;
   dwio::common::DataBuffer<int64_t> unpacked_; // Used by PATCHED_BASE
   dwio::common::DataBuffer<int64_t> unpackedPatch_; // Used by PATCHED_BASE
+  // Scratch buffer for the batched decode loop (batchReadLoop) when the
+  // visitor's value type is narrower than int64_t (int16/int32): next* writes
+  // int64_t here, then values are narrowed into the visitor's buffer.
+  dwio::common::DataBuffer<int64_t> bulkScratch_;
 };
 
 } // namespace facebook::velox::dwrf

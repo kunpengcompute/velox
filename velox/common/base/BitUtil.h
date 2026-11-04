@@ -339,6 +339,24 @@ inline void fillBits(uint64_t* bits, int32_t begin, int32_t end, bool value) {
 }
 
 inline int32_t countBits(const uint64_t* bits, int32_t begin, int32_t end) {
+  if (begin >= end) {
+    return 0;
+  }
+  // Fast path for ranges contained in a single word. Sparse column readers
+  // count non-nulls per small gap, where the out-of-line forEachWord call
+  // dominates; this keeps the whole count in a few inline instructions.
+  const int32_t firstWord = begin >> 6;
+  if (firstWord == ((end - 1) >> 6)) {
+    uint64_t mask = ~0ULL;
+    const int32_t wordBegin = firstWord << 6;
+    if (begin != wordBegin) {
+      mask = highMask(wordBegin + 64 - begin);
+    }
+    if (wordBegin + 64 != end) {
+      mask &= lowMask(end - wordBegin);
+    }
+    return __builtin_popcountll(bits[firstWord] & mask);
+  }
   int32_t count = 0;
   forEachWord(
       begin,
