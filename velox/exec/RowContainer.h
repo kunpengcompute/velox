@@ -320,6 +320,23 @@ class RowContainer {
   /// Allocates a new row and initializes possible aggregates to null.
   char* newRow();
 
+  /// Allocates 'numRows' new rows in a single bump-pointer pass and writes
+  /// their addresses to 'newRows[0 .. numRows)'. The returned rows are
+  /// initialized with the same semantics as 'newRow()' (i.e. zeroed fixed
+  /// portion, default null flags, free flag cleared, normalized-key counter
+  /// updated). This avoids the per-row cost of 'AllocationPool::allocateFixed'
+  /// + 'initializeRow', which dominates hot paths such as hash-join build
+  /// spill restoration where many fixed-schema rows are appended back-to-back.
+  ///
+  /// Notes:
+  ///  - 'newRows' must point to space for at least 'numRows' pointers.
+  ///  - This call never touches the 'firstFreeRow_' free list; callers that
+  ///    rely on free-list reuse should keep using 'newRow()'.
+  ///  - 'numRows' may exceed the bytes available in the current allocation
+  ///    run; in that case the work is split across multiple chunks under the
+  ///    hood.
+  void newRows(int32_t numRows, char** newRows);
+
   uint32_t rowSize(const char* row) const {
     return fixedRowSize_ +
         (rowSizeOffset_
