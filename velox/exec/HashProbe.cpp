@@ -1389,6 +1389,51 @@ SelectivityVector HashProbe::evalFilterForNullAwareJoin(
   return filterPassedRows;
 }
 
+void HashProbe::computePassedBits(int32_t numRows) {
+  // Ensure bitmap is large enough and zeroed.
+  int32_t numWords = bits::nwords(numRows);
+  if (static_cast<int32_t>(passedBits_.size()) < numWords) {
+    passedBits_.resize(numWords);
+  }
+  // Start with filterInputRows_ bits (isValid).
+  const auto* inputBits = filterInputRows_.allBits();
+  std::memcpy(passedBits_.data(), inputBits, numWords * sizeof(uint64_t));
+
+  // AND with filter result: !isNullAt(row) && valueAt<bool>(row).
+  // For a flat bool vector, valueAt<bool> = isBitSet(data_, row) and
+  // !isNullAt = isBitSet(nulls_, row) (velox convention: bit=1 = non-null).
+  // So the combined check is: isBitSet(data_, row) && isBitSet(nulls_, row).
+  if (decodedFilterResult_.isIdentityMapping()) {
+    const auto* values = decodedFilterResult_.data<uint64_t>();
+    const auto* nulls = decodedFilterResult_.nulls();
+    if (nulls) {
+      // AND values with nulls (non-null AND true), then AND with input bits.
+      // Do this in-place on passedBits_.
+      bits::andBits(passedBits_.data(), values, 0, numRows);
+      bits::andBits(passedBits_.data(), nulls, 0, numRows);
+    } else {
+      // No nulls: just AND values with input bits.
+      bits::andBits(passedBits_.data(), values, 0, numRows);
+    }
+  } else if (decodedFilterResult_.isConstantMapping()) {
+    // Constant result: if true and non-null, passedBits_ already has input bits.
+    // If false or null, clear all.
+    if (decodedFilterResult_.isNullAt(0) ||
+        !decodedFilterResult_.valueAt<bool>(0)) {
+      std::memset(passedBits_.data(), 0, numWords * sizeof(uint64_t));
+    }
+  } else {
+    // Dictionary or other encoding: fall back to per-row check.
+    for (auto i = 0; i < numRows; ++i) {
+      if (!filterInputRows_.isValid(i) ||
+          decodedFilterResult_.isNullAt(i) ||
+          !decodedFilterResult_.valueAt<bool>(i)) {
+        bits::clearBit(passedBits_.data(), i);
+      }
+    }
+  }
+}
+
 int32_t HashProbe::evalFilter(int32_t numRows) {
   if (!filter_) {
     return numRows;
@@ -1426,6 +1471,11 @@ int32_t HashProbe::evalFilter(int32_t numRows) {
   filter_->eval(0, 1, true, filterInputRows_, evalCtx, filterResult_);
 
   decodedFilterResult_.decode(*filterResult_[0], filterInputRows_);
+
+  // Pre-compute passed bitmap once, merging isValid + !isNullAt + valueAt<bool>
+  // into a single bitmap. All subsequent filterPassed(row) calls read this
+  // bitmap instead of doing three separate per-row checks.
+  computePassedBits(numRows);
 
   int32_t numPassed = 0;
   if (isLeftJoin(joinType_) || isFullJoin(joinType_)) {
