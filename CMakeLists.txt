@@ -136,6 +136,10 @@ option(VELOX_ENABLE_S3 "Build S3 Connector" OFF)
 option(VELOX_ENABLE_GCS "Build GCS Connector" OFF)
 option(VELOX_ENABLE_ABFS "Build Abfs Connector" OFF)
 option(VELOX_ENABLE_HDFS "Build Hdfs Connector" OFF)
+option(
+  VELOX_ENABLE_ISAL_CRYPTO_MD5
+  "Auto-detect ISA-L Crypto for Spark vectorized MD5. Off keeps scalar md5."
+  ON)
 option(VELOX_ENABLE_PARQUET "Enable Parquet support" OFF)
 option(VELOX_ENABLE_ARROW "Enable Arrow support" OFF)
 option(VELOX_ENABLE_REMOTE_FUNCTIONS "Enable remote function support" OFF)
@@ -245,6 +249,10 @@ if(VELOX_ENABLE_CCACHE
     # keep comments as they might matter to the compiler
     set(ENV{CCACHE_COMMENTS} "1")
   endif()
+endif()
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+  add_compile_options(-march=armv8.2-a+crc+sve)
 endif()
 
 if(${VELOX_FORCE_COLORED_OUTPUT})

@@ -22,6 +22,9 @@
 #include "velox/functions/sparksql/Split.h"
 #include "velox/functions/sparksql/String.h"
 #include "velox/functions/sparksql/StringToMap.h"
+#ifdef VELOX_HAVE_ISAL_CRYPTO_MD5
+#include "velox/functions/sparksql/Md5VectorFunction.h"
+#endif
 
 namespace facebook::velox::functions {
 void registerSparkStringFunctions(const std::string& prefix) {
@@ -34,6 +37,24 @@ void registerSparkStringFunctions(const std::string& prefix) {
 namespace sparksql {
 void registerStringFunctions(const std::string& prefix) {
   registerSparkStringFunctions(prefix);
+#ifdef VELOX_HAVE_ISAL_CRYPTO_MD5
+  // XOR with RegisterBinary: scalar Md5Function is registered only when
+  // ISA-L is absent.
+  std::vector<std::shared_ptr<exec::FunctionSignature>> md5Signatures = {
+      exec::FunctionSignatureBuilder()
+          .returnType("varchar")
+          .argumentType("varchar")
+          .build(),
+      exec::FunctionSignatureBuilder()
+          .returnType("varchar")
+          .argumentType("varbinary")
+          .build()};
+
+  exec::registerVectorFunction(
+      prefix + "md5",
+      md5Signatures,
+      std::make_unique<SparkMd5VectorFunction>());
+#endif
   registerFunction<StartsWithFunction, bool, Varchar, Varchar>(
       {prefix + "startswith"});
   registerFunction<EndsWithFunction, bool, Varchar, Varchar>(

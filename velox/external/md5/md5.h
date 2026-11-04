@@ -44,6 +44,10 @@ namespace facebook::velox::crypto {
         //! Returns the 32-character digest (in hexadecimal format) as a string
         std::string FinishHex();
 
+        //! Reset the context to initial state (equivalent to constructing a new one).
+        //! Allows reusing the same context object across rows without reallocation.
+        void reset();
+
     private:
         void MD5Update(const unsigned char* data, unsigned long long len);
         static void DigestToBase16(const unsigned char* digest, char *zBuf);

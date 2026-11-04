@@ -42,6 +42,7 @@ add_executable(
   MakeTimestampTest.cpp
   MapTest.cpp
   MaskTest.cpp
+  Md5ConcatWsTest.cpp
   MightContainTest.cpp
   MonotonicallyIncreasingIdTest.cpp
   RaiseErrorTest.cpp
