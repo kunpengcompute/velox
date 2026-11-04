@@ -196,7 +196,9 @@ RowContainer::RowContainer(
   }
   // Make offset at least sizeof pointer so that there is space for a
   // free list next pointer below the bit at 'freeFlagOffset_'.
-  offset = std::max<int32_t>(offset, sizeof(void*));
+  if (offset) {
+    offset = std::max<int32_t>(offset, sizeof(void*));
+  }
   const int32_t firstAggregateOffset = offset;
   if (!accumulators.empty()) {
     // This moves nullOffset to the start of the next byte.
@@ -436,6 +438,38 @@ void RowContainer::eraseRows(folly::Range<char**> rows) {
   // for the next consumer. The per-row incremental update
   // (removeOrUpdateRowColumnStats) is no longer needed: a fresh full scan on
   // next read will reflect the erased rows (free rows are skipped).
+  invalidateColumnStatsCache();
+}
+
+void RowContainer::eraseRowsSkippingKeys(folly::Range<char**> rows) {
+  for (auto i = keyTypes_.size(); i < types_.size(); ++i) {
+    switch (typeKinds_[i]) {
+      case TypeKind::VARCHAR:
+      case TypeKind::VARBINARY: {
+        freeVariableWidthFieldsAtColumn<StringView>(i, rows);
+        break;
+      }
+      case TypeKind::ROW:
+      case TypeKind::ARRAY:
+      case TypeKind::MAP: {
+        freeVariableWidthFieldsAtColumn<std::string_view>(i, rows);
+        break;
+      }
+      default:;
+    }
+  }
+
+  freeAggregates(rows);
+  numRows_ -= rows.size();
+  for (auto* row : rows) {
+    VELOX_CHECK(!bits::isBitSet(row, freeFlagOffset_), "Double free of row");
+
+    bits::setBit(row, freeFlagOffset_);
+    nextFree(row) = firstFreeRow_;
+    firstFreeRow_ = row;
+  }
+  numFreeRows_ += rows.size();
+  // Same lazy-stats contract as eraseRows: the per-row updater is gone.
   invalidateColumnStatsCache();
 }
 
@@ -1206,6 +1240,7 @@ void RowContainer::extractStringsBatch(
   }
 }
 
+template <DVecLayout Layout>
 void RowContainer::storeComplexType(
     const DecodedVector& decoded,
     vector_size_t index,
@@ -1215,7 +1250,7 @@ void RowContainer::storeComplexType(
     int32_t nullByte,
     uint8_t nullMask,
     int32_t column) {
-  if (decoded.isNullAt(index)) {
+  if (decoded.isNullAt<Layout>(index)) {
     VELOX_DCHECK(nullMask);
     row[nullByte] |= nullMask;
     columnHasNulls_[column] = true;
@@ -1226,7 +1261,7 @@ void RowContainer::storeComplexType(
   auto position = stringAllocator_->newWrite(stream);
   ContainerRowSerdeOptions options{.isKey = isKey};
   ContainerRowSerde::serialize(
-      *decoded.base(), decoded.index(index), stream, options);
+      *decoded.base(), decoded.index<Layout>(index), stream, options);
   stringAllocator_->finishWrite(stream, 0);
 
   valueAt<std::string_view>(row, offset) = std::string_view(
@@ -1719,4 +1754,29 @@ bool RowComparator::operator()(
   }
   return false;
 }
+
+#define INSTANTIATE_STORE_COMPLEX(LAYOUT)                         \
+  template void RowContainer::storeComplexType<LAYOUT>(             \
+      const DecodedVector&,                                         \
+      vector_size_t,                                                \
+      bool,                                                         \
+      char*,                                                        \
+      int32_t,                                                      \
+      int32_t,                                                      \
+      uint8_t,                                                      \
+      int32_t);
+
+FOREACH_VALID_LAYOUT(INSTANTIATE_STORE_COMPLEX)
+#undef INSTANTIATE_STORE_COMPLEX
+
+template void RowContainer::storeComplexType<DVecLayout::kUnknown>(
+    const DecodedVector&,
+    vector_size_t,
+    bool,
+    char*,
+    int32_t,
+    int32_t,
+    uint8_t,
+    int32_t);
+
 } // namespace facebook::velox::exec

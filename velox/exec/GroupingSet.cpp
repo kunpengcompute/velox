@@ -14,7 +14,13 @@
  * limitations under the License.
  */
 #include "velox/exec/GroupingSet.h"
+
+#include <algorithm>
+
 #include "velox/common/testutil/TestValue.h"
+#include "velox/common/base/TemplateHelpers.h"
+#include "velox/exec/AggregateInfo.h"
+#include "velox/exec/HashTable.h"
 #include "velox/exec/Task.h"
 
 using facebook::velox::common::testutil::TestValue;
@@ -54,7 +60,8 @@ GroupingSet::GroupingSet(
     const common::SpillConfig* spillConfig,
     tsan_atomic<bool>* nonReclaimableSection,
     OperatorCtx* operatorCtx,
-    folly::Synchronized<common::SpillStats>* spillStats)
+    folly::Synchronized<common::SpillStats>* spillStats,
+    bool enableTaper)
     : preGroupedKeyChannels_(std::move(preGroupedKeys)),
       groupingKeyOutputProjections_(std::move(groupingKeyOutputProjections)),
       hashers_(std::move(hashers)),
@@ -73,7 +80,8 @@ GroupingSet::GroupingSet(
       rows_(operatorCtx->pool()),
       isAdaptive_(queryConfig_.hashAdaptivityEnabled()),
       pool_(*operatorCtx->pool()),
-      spillStats_(spillStats) {
+      spillStats_(spillStats),
+      enableTaper_(enableTaper) {
   VELOX_CHECK_NOT_NULL(nonReclaimableSection_);
   VELOX_CHECK(pool_.trackUsage());
 
@@ -244,6 +252,10 @@ void GroupingSet::addInputForActiveRows(
   TestValue::adjust(
       "facebook::velox::exec::GroupingSet::addInputForActiveRows", this);
 
+  // When true, aggregation is fused into groupProbe (flat taper); lookup hits
+  // and newGroups are not filled.
+  auto aggregateDoneInProbe = false;
+
   table_->prepareForGroupProbe(
       *lookup_,
       input,
@@ -255,8 +267,24 @@ void GroupingSet::addInputForActiveRows(
     return;
   }
 
-  table_->groupProbe(*lookup_, BaseHashTable::kNoSpillInputStartPartitionBit);
   masks_.addInput(input, activeRows_);
+
+  if (BaseHashTable::isTaperFlatMode(table_->hashMode())) {
+    auto aggIndex = getIndexOfTheOnlyAggregateFunction(false);
+    VELOX_CHECK(aggIndex.has_value());
+    auto i = aggIndex.value();
+    populateTempVectors(i, input);
+    const auto& rows = getSelectivityVector(i);
+    table_->groupProbe(
+        *lookup_, aggregates_[i], tempVectors_, rows, isRawInput_);
+    aggregateDoneInProbe = true;
+  } else {
+    table_->groupProbe(*lookup_, BaseHashTable::kNoSpillInputStartPartitionBit);
+  }
+
+  if (aggregateDoneInProbe) {
+    return;
+  }
 
   auto* groups = lookup_->hits.data();
   const auto& newGroups = lookup_->newGroups;
@@ -371,13 +399,62 @@ std::vector<Accumulator> GroupingSet::accumulators(bool excludeToIntermediate) {
   return accumulators;
 }
 
+std::optional<int> GroupingSet::getIndexOfTheOnlyAggregateFunction(
+    bool excludeToIntermediate) {
+  if (sortedAggregations_ != nullptr) {
+    return std::nullopt;
+  }
+
+  std::optional<int> result;
+  for (size_t i = 0; i < aggregates_.size(); ++i) {
+    if (aggregates_[i].distinct) {
+      return std::nullopt;
+    }
+    if (!excludeToIntermediate ||
+        !aggregates_[i].function->supportsToIntermediate()) {
+      if (result.has_value()) {
+        return std::nullopt;
+      }
+      result = i;
+    }
+  }
+  return result;
+}
+
+namespace {
+bool isFlatCompatible(AggregateInfo& agg) {
+  if (agg.inputs.size() != 1) {
+    return false;
+  }
+  return std::visit(
+      velox::Overload{
+          [&](std::monostate&) { return false; },
+          [&](auto& aggFuncRef) {
+            auto* func = static_cast<Aggregate*>(&aggFuncRef.get());
+            return BaseHashTable::isFlatCompatibleAggregate(func);
+          }},
+      agg.rowBasedAggVars.vars);
+}
+} // namespace
+
 void GroupingSet::createHashTable() {
+  auto aggIndex = getIndexOfTheOnlyAggregateFunction(false);
+  bool supportFlatTaper = !ignoreNullKeys_ && aggIndex.has_value() &&
+      isFlatCompatible(aggregates_[aggIndex.value()]);
   if (ignoreNullKeys_) {
     table_ = HashTable<true>::createForAggregation(
-        std::move(hashers_), accumulators(false), &pool_);
+        std::move(hashers_),
+        accumulators(false),
+        &pool_,
+        enableTaper_,
+        supportFlatTaper);
   } else {
     table_ = HashTable<false>::createForAggregation(
-        std::move(hashers_), accumulators(false), &pool_);
+        std::move(hashers_),
+        accumulators(false),
+        &pool_,
+        enableTaper_,
+        supportFlatTaper);
   }
 
   RowContainer& rows = *table_->rows();
@@ -417,7 +494,8 @@ void GroupingSet::createHashTable() {
   }
 
   lookup_ = std::make_unique<HashLookup>(table_->hashers());
-  if (!isAdaptive_ && table_->hashMode() != BaseHashTable::HashMode::kHash) {
+  if (!isAdaptive_ &&
+      !BaseHashTable::isGenericHashMode(table_->hashMode())) {
     table_->forceGenericHashMode(BaseHashTable::kNoSpillInputStartPartitionBit);
   }
 }
@@ -755,10 +833,16 @@ bool GroupingSet::getOutput(
 
   // @lint-ignore CLANGTIDY
   char* groups[maxOutputRows];
-  const int32_t numGroups = table_
-      ? table_->rows()->listRows(
-            &iterator, maxOutputRows, maxOutputBytes, groups)
-      : 0;
+  int32_t numGroups = 0;
+  if (table_) {
+    if (BaseHashTable::isTaperFlatMode(table_->hashMode())) {
+      numGroups = table_->flatRows()->listRows(
+          &iterator, maxOutputRows, maxOutputBytes, groups);
+    } else {
+      numGroups = table_->rows()->listRows(
+          &iterator, maxOutputRows, maxOutputBytes, groups);
+    }
+  }
   if (numGroups == 0) {
     if (table_ != nullptr) {
       table_->clear(/*freeTable=*/true);
@@ -1031,7 +1115,13 @@ void GroupingSet::spill() {
   // allocate/deallocate memory during spilling it can lead to concurrency bugs.
   // Freeze the HashStringAllocator to make it effectively immutable and
   // guarantee we don't accidentally enter an unsafe situation.
-  rows->stringAllocator().freezeAndExecute([&]() { inputSpiller_->spill(); });
+  rows->stringAllocator().freezeAndExecute([&]() {
+    if (BaseHashTable::isTaperFlatMode(table_->hashMode())) {
+      inputSpiller_->spill(table_->flatRows());
+    } else {
+      inputSpiller_->spill();
+    }
+  });
   if (isDistinct() && numDistinctSpillFilesPerPartition_.empty()) {
     size_t totalNumDistinctSpilledFiles{0};
     numDistinctSpillFilesPerPartition_.resize(
@@ -1068,8 +1158,13 @@ void GroupingSet::spill(const RowContainerIterator& rowIterator) {
   // allocate/deallocate memory during spilling it can lead to concurrency bugs.
   // Freeze the HashStringAllocator to make it effectively immutable and
   // guarantee we don't accidentally enter an unsafe situation.
-  rows->stringAllocator().freezeAndExecute(
-      [&]() { outputSpiller_->spill(rowIterator); });
+  rows->stringAllocator().freezeAndExecute([&]() {
+    if (BaseHashTable::isTaperFlatMode(table_->hashMode())) {
+      outputSpiller_->spill(rowIterator, table_->flatRows());
+    } else {
+      outputSpiller_->spill(rowIterator);
+    }
+  });
   table_->clear(/*freeTable=*/true);
 }
 
@@ -1434,7 +1529,36 @@ std::optional<int64_t> GroupingSet::estimateOutputRowSize() const {
   if (table_ == nullptr) {
     return std::nullopt;
   }
+  if (BaseHashTable::isTaperFlatMode(table_->hashMode())) {
+    return table_->rows()->fixedRowSize();
+  }
   return table_->rows()->estimateRowSize();
+}
+
+void GroupingSet::updateRuntimeStats(RuntimeStats& runtimeStats) {
+  // Report range sizes and number of distinct values for the group-by keys.
+  const auto& hashers = lookup_->hashers;
+  uint64_t asRange{0};
+  uint64_t asDistinct{0};
+  const auto hashTableStats = getHashTableStats();
+
+  for (auto i = 0; i < hashers.size(); i++) {
+    hashers[i]->cardinality(0, asRange, asDistinct);
+    if (asRange != VectorHasher::kRangeTooLarge) {
+      runtimeStats[fmt::format("rangeKey{}", i)] = RuntimeMetric(asRange);
+    }
+    if (asDistinct != VectorHasher::kRangeTooLarge) {
+      runtimeStats[fmt::format("distinctKey{}", i)] = RuntimeMetric(asDistinct);
+    }
+  }
+
+  runtimeStats["hashtable.capacity"] = RuntimeMetric(hashTableStats.capacity);
+  runtimeStats["hashtable.numRehashes"] =
+      RuntimeMetric(hashTableStats.numRehashes);
+  runtimeStats["hashtable.numDistinct"] =
+      RuntimeMetric(hashTableStats.numDistinct);
+  runtimeStats["hashtable.numTombstones"] =
+      RuntimeMetric(hashTableStats.numTombstones);
 }
 
 AggregationInputSpiller::AggregationInputSpiller(
@@ -1476,8 +1600,19 @@ void AggregationInputSpiller::spill() {
   SpillerBase::spill(nullptr);
 }
 
+void AggregationInputSpiller::spill(
+    TaperFlatHashTableWrapper::FlatRowContainer* flatRows) {
+  SpillerBase::spill(flatRows);
+}
+
 void AggregationOutputSpiller::spill(const RowContainerIterator& startRowIter) {
   SpillerBase::spill(&startRowIter);
+}
+
+void AggregationOutputSpiller::spill(
+    const RowContainerIterator& startRowIter,
+    TaperFlatHashTableWrapper::FlatRowContainer* flatRows) {
+  SpillerBase::spill(&startRowIter, flatRows);
 }
 
 void AggregationOutputSpiller::runSpill(bool lastRun) {

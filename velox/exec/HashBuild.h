@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "velox/exec/DebugStat.h"
 #include "velox/exec/HashJoinBridge.h"
 #include "velox/exec/HashTable.h"
 #include "velox/exec/Operator.h"
@@ -55,6 +56,12 @@ class HashBuild final : public Operator {
     kFinish = 5,
   };
   static std::string stateName(State state);
+
+#ifdef DEBUG_STAT_ENABLED
+  ~HashBuild() override {
+    debugStat_.print();
+  }
+#endif
 
   HashBuild(
       int32_t operatorId,
@@ -309,6 +316,8 @@ class HashBuild final : public Operator {
 
   // Maps key channel in 'input_' to channel in key.
   folly::F14FastMap<column_index_t, column_index_t> keyChannelMap_;
+
+  DEBUG_STAT_DEFINE_MEMBER(debugStat_, HashBuild)
 };
 
 inline std::ostream& operator<<(std::ostream& os, HashBuild::State state) {

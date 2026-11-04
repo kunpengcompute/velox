@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include <type_traits>
 #include <vector>
 
 #include "velox/common/base/Exceptions.h"
@@ -75,6 +76,17 @@ namespace facebook::velox {
 /// makeIndices(), wrap(), dictionaryWrapping().
 class DecodedVector {
  public:
+  enum class Layout {
+    kUnknown,
+    kIdentity,
+    kIdentityNullable,
+    kConst,
+    kConstNull,
+    kIndexed,
+    kIndexedNullable,
+    kIndexedNullableExtra,
+  };
+
   /// Default constructor. The caller must call decode() or makeIndices() next.
   DecodedVector() = default;
 
@@ -165,7 +177,22 @@ class DecodedVector {
 
   /// Given a top-level row returns corresponding index in the base vector or
   /// data().
+  template <Layout layout = Layout::kUnknown>
   vector_size_t index(vector_size_t idx) const {
+    if constexpr (layout == Layout::kIdentity ||
+                  layout == Layout::kIdentityNullable) {
+      return idx;
+                  }
+    if constexpr (layout == Layout::kConst ||
+                  layout == Layout::kConstNull) {
+      return constantIndex_;
+                  }
+    if constexpr (layout == Layout::kIndexed ||
+                  layout == Layout::kIndexedNullable ||
+                  layout == Layout::kIndexedNullableExtra) {
+      return indices_[idx];
+                  }
+
     if (isIdentityMapping_) {
       return idx;
     }
@@ -191,9 +218,18 @@ class DecodedVector {
   }
 
   /// Returns a scalar value for the top-level row 'idx'.
-  template <typename T>
+  template <typename T, Layout layout = Layout::kUnknown>
   T valueAt(vector_size_t idx) const {
-    return reinterpret_cast<const T*>(data_)[index(idx)];
+    if constexpr (std::is_same_v<T, bool>) {
+      return bits::isBitSet(
+          reinterpret_cast<const uint64_t*>(data_), index<layout>(idx));
+    } else if constexpr (std::is_same_v<T, int128_t>) {
+      auto valuePosition = reinterpret_cast<const char*>(data_) +
+          sizeof(int128_t) * index<layout>(idx);
+      return HugeInt::deserialize(valuePosition);
+    } else {
+      return reinterpret_cast<const T*>(data_)[index<layout>(idx)];
+    }
   }
 
   /// If false, there are no nulls. Otherwise, there is a possibility that there
@@ -207,7 +243,19 @@ class DecodedVector {
   }
 
   /// Return null flag for the top-level row.
+  template <Layout layout = Layout::kUnknown>
   bool isNullAt(vector_size_t idx) const {
+    if constexpr (withoutNull(layout)) {
+      return false;
+    } else if constexpr (layout == Layout::kConstNull) {
+      return true;
+    } else if constexpr (layout == Layout::kIdentityNullable ||
+                         layout == Layout::kIndexedNullableExtra) {
+      return bits::isBitNull(nulls_, idx);
+    } else if constexpr (layout == Layout::kIndexedNullable) {
+      return bits::isBitNull(nulls_, indices_[idx]);
+    }
+
     if (!nulls_) {
       return false;
     }
@@ -251,6 +299,10 @@ class DecodedVector {
   /// Returns the flat or constant base vector.
   const BaseVector* base() const {
     return baseVector_;
+  }
+
+  const uint64_t* nullBits() const {
+    return nulls_;
   }
 
   /// Returns true if the decoded vector was flat.
@@ -331,6 +383,37 @@ class DecodedVector {
 
   uint64_t* getNulls() {
     return const_cast<uint64_t*>(nulls_);
+  }
+
+  Layout getLayout() const {
+    if (isIdentityMapping()) {
+      if (nulls_) {
+        return Layout::kIdentityNullable;
+      }
+      return Layout::kIdentity;
+    } else if (isConstantMapping()) {
+      if (isNullAt(0)) {
+        return Layout::kConstNull;
+      }
+      return Layout::kConst;
+    }
+    if (!nulls_) {
+      return Layout::kIndexed;
+    }
+    if (hasExtraNulls_) {
+      return Layout::kIndexedNullableExtra;
+    }
+    return Layout::kIndexedNullable;
+  }
+
+  static Layout getLayout(const DecodedVector& decoded) {
+    return decoded.getLayout();
+  }
+
+  static constexpr bool withoutNull(Layout layout) {
+    return layout == Layout::kIdentity ||
+           layout == Layout::kConst ||
+           layout == Layout::kIndexed;
   }
 
  private:
@@ -466,16 +549,15 @@ class DecodedVector {
   static uint64_t constantNullMask_;
 };
 
-template <>
-inline bool DecodedVector::valueAt(vector_size_t idx) const {
-  return bits::isBitSet(reinterpret_cast<const uint64_t*>(data_), index(idx));
-}
+using DVecLayout = DecodedVector::Layout;
 
-template <>
-inline int128_t DecodedVector::valueAt(vector_size_t idx) const {
-  auto valuePosition =
-      reinterpret_cast<const char*>(data_) + sizeof(int128_t) * index(idx);
-  return HugeInt::deserialize(valuePosition);
-}
+#define FOREACH_VALID_LAYOUT(M)    \
+  M(DVecLayout::kIdentity)         \
+  M(DVecLayout::kIdentityNullable) \
+  M(DVecLayout::kConst)            \
+  M(DVecLayout::kConstNull)        \
+  M(DVecLayout::kIndexed)          \
+  M(DVecLayout::kIndexedNullable)  \
+  M(DVecLayout::kIndexedNullableExtra)
 
 } // namespace facebook::velox

@@ -52,17 +52,21 @@ namespace facebook::velox::exec {
   }()
 
 namespace {
-template <bool typeProvidesCustomComparison, TypeKind Kind>
+
+template <
+    bool typeProvidesCustomComparison,
+    TypeKind Kind,
+    DVecLayout Layout = DVecLayout::kUnknown>
 uint64_t hashOne(DecodedVector& decoded, vector_size_t index) {
   if constexpr (
       Kind == TypeKind::ROW || Kind == TypeKind::ARRAY ||
       Kind == TypeKind::MAP) {
     // Virtual function call for complex type.
-    return decoded.base()->hashValueAt(decoded.index(index));
+    return decoded.base()->hashValueAt(decoded.index<Layout>(index));
   } else {
     // Inlined for scalars.
     using T = typename KindToFlatVector<Kind>::HashRowType;
-    T value = decoded.valueAt<T>(index);
+    T value = decoded.valueAt<T, Layout>(index);
 
     if constexpr (typeProvidesCustomComparison) {
       return static_cast<const CanProvideCustomComparisonType<Kind>*>(
@@ -74,6 +78,45 @@ uint64_t hashOne(DecodedVector& decoded, vector_size_t index) {
       return folly::hasher<T>()(value);
     }
   }
+}
+
+template <
+    bool typeProvidesCustomComparison,
+    TypeKind Kind,
+    DVecLayout Layout>
+void hashRows(
+    const SelectivityVector& rows,
+    uint64_t* hashVec,
+    DecodedVector& decoded) {
+  rows.applyToSelected([&](vector_size_t row) {
+    if (decoded.isNullAt<Layout>(row)) {
+      hashVec[row] = VectorHasher::kNullHash;
+      return;
+    }
+    hashVec[row] =
+        hashOne<typeProvidesCustomComparison, Kind, Layout>(decoded, row);
+  });
+}
+
+template <
+    bool typeProvidesCustomComparison,
+    TypeKind Kind,
+    DVecLayout Layout>
+void hashMixRows(
+    const SelectivityVector& rows,
+    uint64_t* result,
+    DecodedVector& decoded,
+    bool mix) {
+  rows.applyToSelected([&](vector_size_t row) {
+    if (decoded.isNullAt<Layout>(row)) {
+      result[row] = mix ? bits::hashMix(result[row], VectorHasher::kNullHash)
+                          : VectorHasher::kNullHash;
+      return;
+    }
+    auto hash =
+        hashOne<typeProvidesCustomComparison, Kind, Layout>(decoded, row);
+    result[row] = mix ? bits::hashMix(result[row], hash) : hash;
+  });
 }
 } // namespace
 
@@ -120,20 +163,42 @@ void VectorHasher::hashValues(
         result[row] = mix ? bits::hashMix(result[row], hash) : hash;
       });
     }
-  } else if (decoded_.mayHaveNulls()) {
-    rows.applyToSelected([&](vector_size_t row) {
-      if (decoded_.isNullAt(row)) {
-        result[row] = mix ? bits::hashMix(result[row], kNullHash) : kNullHash;
-        return;
-      }
-      auto hash = hashOne<typeProvidesCustomComparison, Kind>(decoded_, row);
-      result[row] = mix ? bits::hashMix(result[row], hash) : hash;
-    });
   } else {
-    rows.applyToSelected([&](vector_size_t row) {
-      auto hash = hashOne<typeProvidesCustomComparison, Kind>(decoded_, row);
-      result[row] = mix ? bits::hashMix(result[row], hash) : hash;
-    });
+    if (decoded_.mayHaveNulls()) {
+      auto hashVec = result;
+      std::vector<uint64_t> hashVector(rows.end(), kNullHash);
+      if (mix) {
+        hashVec = hashVector.data();
+      } else {
+        rows.applyToSelected(
+            [&](vector_size_t row) { hashVec[row] = kNullHash; });
+      }
+      if (decoded_.isIdentityMapping()) {
+        hashRows<
+            typeProvidesCustomComparison,
+            Kind,
+            DVecLayout::kIdentityNullable>(rows, hashVec, decoded_);
+      } else if (decoded_.getLayout() == DVecLayout::kIndexedNullableExtra) {
+        hashRows<
+            typeProvidesCustomComparison,
+            Kind,
+            DVecLayout::kIndexedNullableExtra>(rows, hashVec, decoded_);
+      } else {
+        hashRows<typeProvidesCustomComparison, Kind, DVecLayout::kIndexedNullable>(
+            rows, hashVec, decoded_);
+      }
+      if (mix) {
+        rows.applyToSelected([&](vector_size_t row) {
+          result[row] = bits::hashMix(result[row], hashVec[row]);
+        });
+      }
+    } else if (decoded_.isIdentityMapping()) {
+      hashMixRows<typeProvidesCustomComparison, Kind, DVecLayout::kIdentity>(
+          rows, result, decoded_, mix);
+    } else {
+      hashMixRows<typeProvidesCustomComparison, Kind, DVecLayout::kIndexed>(
+          rows, result, decoded_, mix);
+    }
   }
 }
 

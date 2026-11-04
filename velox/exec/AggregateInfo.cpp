@@ -101,7 +101,8 @@ std::vector<AggregateInfo> toAggregateInfo(
                               : core::AggregationNode::Step::kSingle,
         aggregate.rawInputTypes,
         aggResultType,
-        operatorCtx.driverCtx()->queryConfig());
+        operatorCtx.driverCtx()->queryConfig(),
+        info.rowBasedAggVars);
 
     auto lambdas = extractLambdaInputs(aggregate);
     if (!lambdas.empty()) {

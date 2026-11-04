@@ -23,6 +23,8 @@
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/VectorTypeUtils.h"
 
+// #define ENABLE_BOLT_NUMERIC_PREFETCH
+
 namespace facebook::velox::exec {
 namespace test {
 class RowContainerTestHelper;
@@ -368,6 +370,10 @@ class RowContainer {
   /// data.
   void eraseRows(folly::Range<char**> rows);
 
+  /// Adds 'rows' to the free rows list and frees any associated variable length
+  /// data from non-key columns.
+  void eraseRowsSkippingKeys(folly::Range<char**> rows);
+
   /// Copies elements of 'rows' where the char* points to a row inside 'this' to
   /// 'result' and returns the number copied. 'result' should have space for
   /// 'rows.size()'.
@@ -405,6 +411,34 @@ class RowContainer {
       const DecodedVector& decoded,
       folly::Range<char**> rows,
       int32_t columnIndex);
+
+  template <TypeKind Kind, DVecLayout Layout = DVecLayout::kUnknown>
+  inline void storeWithNulls(
+      const DecodedVector& decoded,
+      vector_size_t index,
+      char* row,
+      int32_t offset,
+      int32_t nullByte,
+      uint8_t nullMask) {
+    storeWithNullsDispatch<Layout>(
+        decoded,
+        index,
+        row,
+        offset,
+        nullByte,
+        nullMask,
+        std::integral_constant<TypeKind, Kind>{});
+  }
+
+  template <TypeKind Kind, DVecLayout Layout = DVecLayout::kUnknown>
+  inline void storeNoNulls(
+      const DecodedVector& decoded,
+      vector_size_t index,
+      char* row,
+      int32_t offset) {
+    storeNoNullsDispatch<Layout>(
+        decoded, index, row, offset, std::integral_constant<TypeKind, Kind>{});
+  }
 
   HashStringAllocator& stringAllocator() {
     return *stringAllocator_;
@@ -710,6 +744,32 @@ class RowContainer {
       const DecodedVector& decoded,
       vector_size_t index) const;
 
+  template <TypeKind Kind, DVecLayout Layout>
+  static bool equalsWithNulls(
+      const DecodedVector& decoded,
+      vector_size_t index,
+      char* row,
+      int32_t offset,
+      int32_t nullByte,
+      uint8_t nullMask,
+      std::string& eqHelperStr);
+
+  template <TypeKind Kind, DVecLayout Layout>
+  static bool equalsNoNulls(
+      const DecodedVector& decoded,
+      vector_size_t index,
+      char* row,
+      int32_t offset,
+      std::string& eqHelperStr);
+
+  template <bool mayHaveNulls>
+  bool equals(
+      const char* left,
+      const char* right,
+      RowColumn column,
+      const TypePtr& type,
+      std::string& eqHelperStr);
+
   /// Compares the value at 'column' in 'row' with the value at 'index' in
   /// 'decoded'. Returns 0 for equal, < 0 for 'row' < 'decoded', > 0 otherwise.
   int32_t compare(
@@ -768,6 +828,10 @@ class RowContainer {
   /// width fields or accumulators.
   int32_t rowSizeOffset() const {
     return rowSizeOffset_;
+  }
+
+  int alignment() const {
+    return alignment_;
   }
 
   /// For a hash join table with possible non-unique entries, the offset of the
@@ -997,6 +1061,8 @@ class RowContainer {
     }
   }
 
+  static constexpr int32_t kCacheLine = 64;
+
   template <bool useRowNumbers, TypeKind Kind>
   static void extractColumnTypedInternal(
       const char* const* rows,
@@ -1012,27 +1078,60 @@ class RowContainer {
     if constexpr (
         Kind == TypeKind::ROW || Kind == TypeKind::ARRAY ||
         Kind == TypeKind::MAP) {
-      extractComplexType<useRowNumbers>(
-          rows, rowNumbers, numRows, column, resultOffset, result);
+      auto nullDist = column.nullByte() - column.offset();
+      if (nullDist >= 0 && nullDist < kCacheLine) {
+        extractComplexType<useRowNumbers, kPrefetchByKey>(
+            rows, rowNumbers, numRows, column, resultOffset, result);
+      } else if (nullDist > -kCacheLine) {
+        extractComplexType<useRowNumbers, kPrefetchByNull>(
+            rows, rowNumbers, numRows, column, resultOffset, result);
+      } else {
+        extractComplexType<useRowNumbers, kPrefetchByBoth>(
+            rows, rowNumbers, numRows, column, resultOffset, result);
+      }
       return;
     }
     using T = typename KindToFlatVector<Kind>::HashRowType;
     auto* flatResult = result->as<FlatVector<T>>();
+    auto nullByte = column.nullByte();
     auto nullMask = column.nullMask();
     auto offset = column.offset();
     if (!nullMask || !columnHasNulls) {
       extractValuesNoNulls<useRowNumbers, T>(
           rows, rowNumbers, numRows, offset, resultOffset, flatResult);
     } else {
-      extractValuesWithNulls<useRowNumbers, T>(
-          rows,
-          rowNumbers,
-          numRows,
-          offset,
-          column.nullByte(),
-          nullMask,
-          resultOffset,
-          flatResult);
+      auto nullDist = nullByte - offset;
+      if (nullDist >= 0 && nullDist < kCacheLine) {
+        extractValuesWithNulls<useRowNumbers, T, kPrefetchByKey>(
+            rows,
+            rowNumbers,
+            numRows,
+            offset,
+            nullByte,
+            nullMask,
+            resultOffset,
+            flatResult);
+      } else if (nullDist > -kCacheLine) {
+        extractValuesWithNulls<useRowNumbers, T, kPrefetchByNull>(
+            rows,
+            rowNumbers,
+            numRows,
+            offset,
+            nullByte,
+            nullMask,
+            resultOffset,
+            flatResult);
+      } else {
+        extractValuesWithNulls<useRowNumbers, T, kPrefetchByBoth>(
+            rows,
+            rowNumbers,
+            numRows,
+            offset,
+            nullByte,
+            nullMask,
+            resultOffset,
+            flatResult);
+      }
     }
   }
 
@@ -1055,25 +1154,140 @@ class RowContainer {
       int32_t nullByte,
       uint8_t nullMask,
       int32_t columnIndex) {
+    storeWithNullsDispatch<DVecLayout::kUnknown>(
+        decoded,
+        rowIndex,
+        isKey,
+        row,
+        offset,
+        nullByte,
+        nullMask,
+        columnIndex,
+        std::integral_constant<TypeKind, Kind>{});
+  }
+
+  template <DVecLayout Layout, TypeKind Kind>
+  inline void storeWithNullsDispatch(
+      const DecodedVector& decoded,
+      vector_size_t index,
+      bool isKey,
+      char* row,
+      int32_t offset,
+      int32_t nullByte,
+      uint8_t nullMask,
+      int32_t columnIndex,
+      std::integral_constant<TypeKind, Kind>) {
     using T = typename TypeTraits<Kind>::NativeType;
-    if (decoded.isNullAt(rowIndex)) {
+    if (decoded.isNullAt<Layout>(index)) {
       row[nullByte] |= nullMask;
       // Record that this column has at least one null so columnHasNulls()
       // can answer in O(1) without a full stats recompute scan. Monotone set;
       // never cleared except by clear().
       columnHasNulls_[columnIndex] = true;
-      // Do not leave an uninitialized value in the case of a
-      // null. This is an error with valgrind/asan.
-      *reinterpret_cast<T*>(row + offset) = T();
+      if constexpr (std::is_arithmetic_v<T>) {
+        *reinterpret_cast<T*>(row + offset) = std::numeric_limits<T>::max();
+      } else if constexpr (std::is_same_v<T, StringView>) {
+        *reinterpret_cast<T*>(row + offset) = StringView();
+        reinterpret_cast<uint32_t*>(row + offset)[1] =
+            std::numeric_limits<uint32_t>::max();
+      } else {
+        *reinterpret_cast<T*>(row + offset) = T();
+      }
       return;
     }
     if constexpr (std::is_same_v<T, StringView>) {
       RowSizeTracker tracker(row[rowSizeOffset_], *stringAllocator_);
       stringAllocator_->copyMultipart(
-          decoded.valueAt<T>(rowIndex), row, offset);
+          decoded.valueAt<T, Layout>(index), row, offset);
     } else {
-      *reinterpret_cast<T*>(row + offset) = decoded.valueAt<T>(rowIndex);
+      *reinterpret_cast<T*>(row + offset) = decoded.valueAt<T, Layout>(index);
     }
+  }
+
+  template <DVecLayout Layout>
+  inline void storeWithNullsDispatch(
+      const DecodedVector& decoded,
+      vector_size_t index,
+      bool isKey,
+      char* row,
+      int32_t offset,
+      int32_t nullByte,
+      uint8_t nullMask,
+      int32_t columnIndex,
+      std::integral_constant<TypeKind, TypeKind::ROW>) {
+    storeComplexType<Layout>(
+        decoded, index, isKey, row, offset, nullByte, nullMask, columnIndex);
+  }
+
+  template <DVecLayout Layout>
+  inline void storeWithNullsDispatch(
+      const DecodedVector& decoded,
+      vector_size_t index,
+      bool isKey,
+      char* row,
+      int32_t offset,
+      int32_t nullByte,
+      uint8_t nullMask,
+      int32_t columnIndex,
+      std::integral_constant<TypeKind, TypeKind::ARRAY>) {
+    storeComplexType<Layout>(
+        decoded, index, isKey, row, offset, nullByte, nullMask, columnIndex);
+  }
+
+  template <DVecLayout Layout>
+  inline void storeWithNullsDispatch(
+      const DecodedVector& decoded,
+      vector_size_t index,
+      bool isKey,
+      char* row,
+      int32_t offset,
+      int32_t nullByte,
+      uint8_t nullMask,
+      int32_t columnIndex,
+      std::integral_constant<TypeKind, TypeKind::MAP>) {
+    storeComplexType<Layout>(
+        decoded, index, isKey, row, offset, nullByte, nullMask, columnIndex);
+  }
+
+  template <DVecLayout Layout>
+  inline void storeWithNullsDispatch(
+      const DecodedVector& decoded,
+      vector_size_t index,
+      bool isKey,
+      char* row,
+      int32_t offset,
+      int32_t nullByte,
+      uint8_t nullMask,
+      int32_t columnIndex,
+      std::integral_constant<TypeKind, TypeKind::HUGEINT>) {
+    if (decoded.isNullAt(index)) {
+      row[nullByte] |= nullMask;
+      memset(row + offset, 0, sizeof(int128_t));
+      columnHasNulls_[columnIndex] = true;
+      return;
+    }
+    HugeInt::serialize(decoded.valueAt<int128_t>(index), row + offset);
+  }
+
+  template <DVecLayout Layout, TypeKind Kind>
+  inline void storeWithNullsDispatch(
+      const DecodedVector& decoded,
+      vector_size_t index,
+      char* row,
+      int32_t offset,
+      int32_t nullByte,
+      uint8_t nullMask,
+      std::integral_constant<TypeKind, Kind>) {
+    storeWithNullsDispatch<Layout>(
+        decoded,
+        index,
+        true,
+        row,
+        offset,
+        nullByte,
+        nullMask,
+        0,
+        std::integral_constant<TypeKind, Kind>{});
   }
 
   template <TypeKind Kind>
@@ -1083,14 +1297,65 @@ class RowContainer {
       bool isKey,
       char* row,
       int32_t offset) {
+    storeNoNullsDispatch<DVecLayout::kUnknown>(
+        decoded, rowIndex, row, offset, std::integral_constant<TypeKind, Kind>{});
+  }
+
+  template <DVecLayout Layout, TypeKind Kind>
+  inline void storeNoNullsDispatch(
+      const DecodedVector& decoded,
+      vector_size_t index,
+      char* row,
+      int32_t offset,
+      std::integral_constant<TypeKind, Kind>) {
     using T = typename TypeTraits<Kind>::NativeType;
     if constexpr (std::is_same_v<T, StringView>) {
       RowSizeTracker tracker(row[rowSizeOffset_], *stringAllocator_);
       stringAllocator_->copyMultipart(
-          decoded.valueAt<T>(rowIndex), row, offset);
+          decoded.valueAt<T, Layout>(index), row, offset);
     } else {
-      *reinterpret_cast<T*>(row + offset) = decoded.valueAt<T>(rowIndex);
+      *reinterpret_cast<T*>(row + offset) = decoded.valueAt<T, Layout>(index);
     }
+  }
+
+  template <DVecLayout Layout>
+  inline void storeNoNullsDispatch(
+      const DecodedVector& decoded,
+      vector_size_t index,
+      char* row,
+      int32_t offset,
+      std::integral_constant<TypeKind, TypeKind::ROW>) {
+    storeComplexType(decoded, index, true, row, offset);
+  }
+
+  template <DVecLayout Layout>
+  inline void storeNoNullsDispatch(
+      const DecodedVector& decoded,
+      vector_size_t index,
+      char* row,
+      int32_t offset,
+      std::integral_constant<TypeKind, TypeKind::ARRAY>) {
+    storeComplexType(decoded, index, true, row, offset);
+  }
+
+  template <DVecLayout Layout>
+  inline void storeNoNullsDispatch(
+      const DecodedVector& decoded,
+      vector_size_t index,
+      char* row,
+      int32_t offset,
+      std::integral_constant<TypeKind, TypeKind::MAP>) {
+    storeComplexType(decoded, index, true, row, offset);
+  }
+
+  template <DVecLayout Layout>
+  inline void storeNoNullsDispatch(
+      const DecodedVector& decoded,
+      vector_size_t index,
+      char* row,
+      int32_t offset,
+      std::integral_constant<TypeKind, TypeKind::HUGEINT>) {
+    HugeInt::serialize(decoded.valueAt<int128_t>(index), row + offset);
   }
 
   template <TypeKind Kind>
@@ -1126,7 +1391,81 @@ class RowContainer {
     invalidateColumnStatsCache();
   }
 
-  template <bool useRowNumbers, typename T>
+  template <bool useRowNumbers>
+  static FOLLY_ALWAYS_INLINE const char* rowAt(
+      const char* const* rows,
+      folly::Range<const vector_size_t*> rowNumbers,
+      int32_t i) {
+    if constexpr (useRowNumbers) {
+      auto rowNumber = rowNumbers[i];
+      return rowNumber >= 0 ? rows[rowNumber] : nullptr;
+    } else {
+      return rows[i];
+    }
+  }
+
+  static constexpr int32_t kPrefetchDist = 32;
+  enum RowPrefetchType {
+    kPrefetchByKey = 0,
+    kPrefetchByNull = 1,
+    kPrefetchByBoth = 2,
+  };
+
+  template <bool useRowNumbers, typename T, RowPrefetchType PType>
+  static FOLLY_ALWAYS_INLINE void prefetchRowData(
+      const char* const* rows,
+      folly::Range<const vector_size_t*> rowNumbers,
+      int32_t numRows,
+      int32_t offset,
+      int32_t nullByte,
+      uint8_t nullMask,
+      int32_t i) {
+    if constexpr (std::is_same_v<T, StringView>) {
+      if (LIKELY(i + kPrefetchDist * 2 < numRows)) {
+        const char* row =
+            rowAt<useRowNumbers>(rows, rowNumbers, i + kPrefetchDist * 2);
+        if (LIKELY(row != nullptr)) {
+          if constexpr (PType == kPrefetchByKey || PType == kPrefetchByBoth) {
+            __builtin_prefetch(
+                reinterpret_cast<const void*>(row + offset), 0, 2);
+          }
+          if constexpr (PType == kPrefetchByNull || PType == kPrefetchByBoth) {
+            __builtin_prefetch(
+                reinterpret_cast<const void*>(row + nullByte), 0, 2);
+          }
+        }
+      }
+      if (LIKELY(i + kPrefetchDist < numRows)) {
+        const char* row =
+            rowAt<useRowNumbers>(rows, rowNumbers, i + kPrefetchDist);
+        if (LIKELY(row != nullptr)) {
+          const auto& value = valueAt<StringView>(row, offset);
+          if (!isNullAt(row, nullByte, nullMask) && !value.isInline()) {
+            __builtin_prefetch(value.data(), 0, 2);
+          }
+        }
+      }
+    } else {
+#ifdef ENABLE_BOLT_NUMERIC_PREFETCH
+      if (LIKELY(i + kPrefetchDist < numRows)) {
+        const char* row =
+            rowAt<useRowNumbers>(rows, rowNumbers, i + kPrefetchDist);
+        if (LIKELY(row != nullptr)) {
+          if constexpr (PType == kPrefetchByKey || PType == kPrefetchByBoth) {
+            __builtin_prefetch(
+                reinterpret_cast<const void*>(row + offset), 0, 2);
+          }
+          if constexpr (PType == kPrefetchByNull || PType == kPrefetchByBoth) {
+            __builtin_prefetch(
+                reinterpret_cast<const void*>(row + nullByte), 0, 2);
+          }
+        }
+      }
+#endif
+    }
+  }
+
+  template <bool useRowNumbers, typename T, RowPrefetchType PType>
   static void extractValuesWithNulls(
       const char* const* rows,
       folly::Range<const vector_size_t*> rowNumbers,
@@ -1151,13 +1490,9 @@ class RowContainer {
     BufferPtr valuesBuffer = result->mutableValues(maxRows);
     [[maybe_unused]] auto values = valuesBuffer->asMutableRange<T>();
     for (int32_t i = 0; i < numRows; ++i) {
-      const char* row;
-      if constexpr (useRowNumbers) {
-        auto rowNumber = rowNumbers[i];
-        row = rowNumber >= 0 ? rows[rowNumber] : nullptr;
-      } else {
-        row = rows[i];
-      }
+      prefetchRowData<useRowNumbers, T, PType>(
+          rows, rowNumbers, numRows, offset, nullByte, nullMask, i);
+      const char* row = rowAt<useRowNumbers>(rows, rowNumbers, i);
       auto resultIndex = resultOffset + i;
       if (row == nullptr || isNullAt(row, nullByte, nullMask)) {
         bits::setNull(nulls, resultIndex, true);
@@ -1188,13 +1523,9 @@ class RowContainer {
     BufferPtr valuesBuffer = result->mutableValues(maxRows);
     [[maybe_unused]] auto values = valuesBuffer->asMutableRange<T>();
     for (int32_t i = 0; i < numRows; ++i) {
-      const char* row;
-      if constexpr (useRowNumbers) {
-        auto rowNumber = rowNumbers[i];
-        row = rowNumber >= 0 ? rows[rowNumber] : nullptr;
-      } else {
-        row = rows[i];
-      }
+      prefetchRowData<useRowNumbers, T, kPrefetchByKey>(
+          rows, rowNumbers, numRows, offset, 0, 0, i);
+      const char* row = rowAt<useRowNumbers>(rows, rowNumbers, i);
       auto resultIndex = resultOffset + i;
       if (row == nullptr) {
         result->setNull(resultIndex, true);
@@ -1234,6 +1565,45 @@ class RowContainer {
 
     return equalsNoNulls<typeProvidesCustomComparison, Kind>(
         row, offset, decoded, index);
+  }
+
+  template <TypeKind Kind>
+  inline bool equalsWithNulls(
+      const char* left,
+      const char* right,
+      int32_t offset,
+      int32_t nullByte,
+      uint8_t nullMask,
+      const TypePtr& type,
+      std::string& eqHelperStr) {
+    bool leftIsNull = isNullAt(left, nullByte, nullMask);
+    bool rightIsNull = isNullAt(right, nullByte, nullMask);
+    if (leftIsNull || rightIsNull) {
+      return leftIsNull == rightIsNull;
+    }
+    return equalsNoNulls<Kind>(left, right, offset, type, eqHelperStr);
+  }
+
+  template <TypeKind Kind>
+  inline bool equalsNoNulls(
+      const char* left,
+      const char* right,
+      int32_t offset,
+      const TypePtr& type,
+      std::string& eqHelperStr) {
+    using T = typename KindToFlatVector<Kind>::HashRowType;
+    if constexpr (
+        Kind == TypeKind::ROW || Kind == TypeKind::ARRAY ||
+        Kind == TypeKind::MAP) {
+      return compareComplexType(left, right, type.get(), offset, offset) == 0;
+    }
+    auto leftValue = valueAt<T>(left, offset);
+    auto rightValue = valueAt<T>(right, offset);
+    if constexpr (Kind == TypeKind::VARCHAR || Kind == TypeKind::VARBINARY) {
+      return equalsStr(leftValue, rightValue, eqHelperStr);
+    } else {
+      return equalsPrimitive(leftValue, rightValue);
+    }
   }
 
   template <bool typeProvidesCustomComparison, TypeKind Kind>
@@ -1400,6 +1770,7 @@ class RowContainer {
         left, right, type, column, column, flags);
   }
 
+  template <DVecLayout Layout = DVecLayout::kUnknown>
   void storeComplexType(
       const DecodedVector& decoded,
       vector_size_t index,
@@ -1410,7 +1781,7 @@ class RowContainer {
       uint8_t nullMask = 0,
       int32_t column = 0);
 
-  template <bool useRowNumbers>
+  template <bool useRowNumbers, RowPrefetchType PType>
   static void extractComplexType(
       const char* const* rows,
       folly::Range<const vector_size_t*> rowNumbers,
@@ -1424,13 +1795,9 @@ class RowContainer {
 
     VELOX_DCHECK_LE(numRows + resultOffset, result->size());
     for (int i = 0; i < numRows; ++i) {
-      const char* row;
-      if constexpr (useRowNumbers) {
-        auto rowNumber = rowNumbers[i];
-        row = rowNumber >= 0 ? rows[rowNumber] : nullptr;
-      } else {
-        row = rows[i];
-      }
+      prefetchRowData<useRowNumbers, StringView, PType>(
+          rows, rowNumbers, numRows, offset, nullByte, nullMask, i);
+      const char* row = rowAt<useRowNumbers>(rows, rowNumbers, i);
       auto resultIndex = resultOffset + i;
       if (!row || isNullAt(row, nullByte, nullMask)) {
         result->setNull(resultIndex, true);
@@ -1487,6 +1854,27 @@ class RowContainer {
       int32_t leftOffset,
       int32_t rightOffset,
       CompareFlags flags = CompareFlags()) const;
+
+  template <typename T>
+  static bool equalsPrimitive(T l, T r) {
+    if constexpr (std::is_floating_point_v<T>) {
+      // Match the native row comparison: all NaNs compare equal and signed
+      // zeros belong to the same group, regardless of their bit patterns.
+      return SimpleVector<T>::comparePrimitiveAsc(l, r) == 0;
+    }
+    return l == r;
+  }
+
+  static bool equalsStr(StringView sRow, StringView str, std::string& helper) {
+    if (sRow.sizeAndPrefixAsInt64() != str.sizeAndPrefixAsInt64()) {
+      return false;
+    }
+    if (sRow.isInline()) {
+      return sRow.inlinedAsInt64() == str.inlinedAsInt64();
+    }
+    auto left = HashStringAllocator::contiguousString(sRow, helper);
+    return memcmp(left.data(), str.data(), str.size()) == 0;
+  }
 
   // Free variable-width fields at column `column_index` associated with the
   // 'rows'. `FieldType` is the type of data representation of the fields in
@@ -1645,20 +2033,6 @@ inline int128_t RowContainer::valueAt<int128_t>(
 }
 
 template <>
-inline void RowContainer::storeWithNulls<TypeKind::ROW>(
-    const DecodedVector& decoded,
-    vector_size_t rowIndex,
-    bool isKey,
-    char* row,
-    int32_t offset,
-    int32_t nullByte,
-    uint8_t nullMask,
-    int32_t columnIndex) {
-  storeComplexType(
-      decoded, rowIndex, isKey, row, offset, nullByte, nullMask, columnIndex);
-}
-
-template <>
 inline void RowContainer::storeNoNulls<TypeKind::ROW>(
     const DecodedVector& decoded,
     vector_size_t rowIndex,
@@ -1666,20 +2040,6 @@ inline void RowContainer::storeNoNulls<TypeKind::ROW>(
     char* row,
     int32_t offset) {
   storeComplexType(decoded, rowIndex, isKey, row, offset);
-}
-
-template <>
-inline void RowContainer::storeWithNulls<TypeKind::ARRAY>(
-    const DecodedVector& decoded,
-    vector_size_t rowIndex,
-    bool isKey,
-    char* row,
-    int32_t offset,
-    int32_t nullByte,
-    uint8_t nullMask,
-    int32_t columnIndex) {
-  storeComplexType(
-      decoded, rowIndex, isKey, row, offset, nullByte, nullMask, columnIndex);
 }
 
 template <>
@@ -1693,20 +2053,6 @@ inline void RowContainer::storeNoNulls<TypeKind::ARRAY>(
 }
 
 template <>
-inline void RowContainer::storeWithNulls<TypeKind::MAP>(
-    const DecodedVector& decoded,
-    vector_size_t rowIndex,
-    bool isKey,
-    char* row,
-    int32_t offset,
-    int32_t nullByte,
-    uint8_t nullMask,
-    int32_t columnIndex) {
-  storeComplexType(
-      decoded, rowIndex, isKey, row, offset, nullByte, nullMask, columnIndex);
-}
-
-template <>
 inline void RowContainer::storeNoNulls<TypeKind::MAP>(
     const DecodedVector& decoded,
     vector_size_t rowIndex,
@@ -1717,32 +2063,120 @@ inline void RowContainer::storeNoNulls<TypeKind::MAP>(
 }
 
 template <>
-inline void RowContainer::storeWithNulls<TypeKind::HUGEINT>(
-    const DecodedVector& decoded,
-    vector_size_t rowIndex,
-    bool /*isKey*/,
-    char* row,
-    int32_t offset,
-    int32_t nullByte,
-    uint8_t nullMask,
-    int32_t columnIndex) {
-  if (decoded.isNullAt(rowIndex)) {
-    row[nullByte] |= nullMask;
-    memset(row + offset, 0, sizeof(int128_t));
-    columnHasNulls_[columnIndex] = true;
-    return;
-  }
-  HugeInt::serialize(decoded.valueAt<int128_t>(rowIndex), row + offset);
-}
-
-template <>
 inline void RowContainer::storeNoNulls<TypeKind::HUGEINT>(
     const DecodedVector& decoded,
     vector_size_t rowIndex,
     bool /*isKey*/,
     char* row,
     int32_t offset) {
-  HugeInt::serialize(decoded.valueAt<int128_t>(rowIndex), row + offset);
+  storeNoNullsDispatch<DVecLayout::kUnknown>(
+      decoded,
+      rowIndex,
+      row,
+      offset,
+      std::integral_constant<TypeKind, TypeKind::HUGEINT>{});
+}
+
+template <TypeKind Kind, DVecLayout Layout>
+inline bool RowContainer::equalsWithNulls(
+    const DecodedVector& decoded,
+    vector_size_t index,
+    char* row,
+    int32_t offset,
+    int32_t nullByte,
+    uint8_t nullMask,
+    std::string& eqHelperStr) {
+  using T = typename KindToFlatVector<Kind>::HashRowType;
+  auto rightIsNull = isNullAt(row, nullByte, nullMask);
+  if constexpr (DecodedVector::withoutNull(Layout)) {
+    if (rightIsNull) {
+      return false;
+    }
+  }
+  auto leftIsNull = decoded.isNullAt<Layout>(index);
+  if (rightIsNull != leftIsNull) {
+    return false;
+  }
+  if (rightIsNull) {
+    return true;
+  }
+  if constexpr (
+      Kind == TypeKind::ROW || Kind == TypeKind::ARRAY ||
+      Kind == TypeKind::MAP) {
+    auto stream = prepareRead(row, offset);
+    return ContainerRowSerde::compare(*stream, decoded, index, CompareFlags{}) ==
+        0;
+  }
+  auto rowVal = valueAt<T>(row, offset);
+  auto decodedVal = decoded.valueAt<T, Layout>(index);
+  if constexpr (Kind == TypeKind::VARCHAR || Kind == TypeKind::VARBINARY) {
+    return equalsStr(rowVal, decodedVal, eqHelperStr);
+  } else {
+    return equalsPrimitive(rowVal, decodedVal);
+  }
+}
+
+template <TypeKind Kind, DVecLayout Layout>
+inline bool RowContainer::equalsNoNulls(
+    const DecodedVector& decoded,
+    vector_size_t index,
+    char* row,
+    int32_t offset,
+    std::string& eqHelperStr) {
+  using T = typename KindToFlatVector<Kind>::HashRowType;
+  auto leftIsNull = decoded.isNullAt<Layout>(index);
+  if (leftIsNull) {
+    return false;
+  }
+  if constexpr (
+      Kind == TypeKind::ROW || Kind == TypeKind::ARRAY ||
+      Kind == TypeKind::MAP) {
+    auto stream = prepareRead(row, offset);
+    return ContainerRowSerde::compare(*stream, decoded, index, CompareFlags{}) ==
+        0;
+  }
+  auto rowVal = valueAt<T>(row, offset);
+  auto decodedVal = decoded.valueAt<T, Layout>(index);
+  if constexpr (Kind == TypeKind::VARCHAR || Kind == TypeKind::VARBINARY) {
+    return equalsStr(rowVal, decodedVal, eqHelperStr);
+  } else {
+    return equalsPrimitive(rowVal, decodedVal);
+  }
+}
+
+template <bool mayHaveNulls>
+inline bool RowContainer::equals(
+    const char* left,
+    const char* right,
+    RowColumn column,
+    const TypePtr& type,
+    std::string& eqHelperStr) {
+  auto typeKind = type->kind();
+  if (UNLIKELY(typeKind == TypeKind::UNKNOWN)) {
+    return isNullAt(left, column.nullByte(), column.nullMask());
+  }
+
+  if constexpr (!mayHaveNulls) {
+    return VELOX_DYNAMIC_TYPE_DISPATCH(
+        equalsNoNulls,
+        typeKind,
+        left,
+        right,
+        column.offset(),
+        type,
+        eqHelperStr);
+  } else {
+    return VELOX_DYNAMIC_TYPE_DISPATCH(
+        equalsWithNulls,
+        typeKind,
+        left,
+        right,
+        column.offset(),
+        column.nullByte(),
+        column.nullMask(),
+        type,
+        eqHelperStr);
+  }
 }
 
 template <>

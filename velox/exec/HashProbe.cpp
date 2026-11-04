@@ -429,8 +429,9 @@ void HashProbe::asyncWaitForHashTable() {
       (isInnerJoin(joinType_) || isLeftSemiFilterJoin(joinType_) ||
        isRightSemiFilterJoin(joinType_) ||
        (isRightSemiProjectJoin(joinType_) && !nullAware_)) &&
-      table_->hashMode() != BaseHashTable::HashMode::kHash && !isSpillInput() &&
-      !hasMoreSpillData()) {
+      (table_->hashMode() != BaseHashTable::HashMode::kHash &&
+       table_->hashMode() != BaseHashTable::HashMode::kTaperHash) &&
+      !isSpillInput() && !hasMoreSpillData()) {
     // Find out whether there are any upstream operators that can accept dynamic
     // filters on all or a subset of the join keys. Create dynamic filters to
     // push down.
@@ -656,6 +657,8 @@ void HashProbe::decodeAndDetectNonNullKeys() {
 }
 
 void HashProbe::addInput(RowVectorPtr input) {
+  DEBUG_STAT_TLS_EXPOSE_SCOPE(&debugStat_);
+  DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::ProbeAddInputCalls);
   if (skipInput_) {
     VELOX_CHECK_NULL(input_);
     return;
@@ -979,6 +982,8 @@ void HashProbe::checkStateTransition(ProbeOperatorState state) {
 }
 
 RowVectorPtr HashProbe::getOutput() {
+  DEBUG_STAT_TLS_EXPOSE_SCOPE(&debugStat_);
+  DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::ProbeGetOutputCalls);
   // Release the extra unused memory reserved for output processing.
   SCOPE_EXIT {
     pool()->release();
@@ -1105,6 +1110,7 @@ RowVectorPtr HashProbe::getOutputInternal(bool toSpillOutput) {
         }
       }
     } else {
+      DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::ProbeListJoinResultsCalls);
       numOut = table_->listJoinResults(
           *resultIter_,
           joinIncludesMissesFromLeft(joinType_),
@@ -1122,7 +1128,10 @@ RowVectorPtr HashProbe::getOutputInternal(bool toSpillOutput) {
     }
     VELOX_CHECK_LE(numOut, outputBatchSize);
 
-    numOut = evalFilter(numOut);
+    {
+      DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::ProbeEvalFilterCalls);
+      numOut = evalFilter(numOut);
+    }
 
     if (numOut == 0) {
       continue;
@@ -1142,7 +1151,10 @@ RowVectorPtr HashProbe::getOutputInternal(bool toSpillOutput) {
       return nullptr;
     }
 
-    fillOutput(numOut);
+    {
+      DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::ProbeFillOutputCalls);
+      fillOutput(numOut);
+    }
 
     if (isLeftSemiOrAntiJoinNoFilter || emptyBuildSide) {
       input_ = nullptr;

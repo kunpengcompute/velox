@@ -177,7 +177,8 @@ void HashBuild::setupTable() {
           pool());
     }
   }
-  analyzeKeys_ = table_->hashMode() != BaseHashTable::HashMode::kHash;
+  analyzeKeys_ = table_->hashMode() != BaseHashTable::HashMode::kHash &&
+      table_->hashMode() != BaseHashTable::HashMode::kTaperHash;
 }
 
 void HashBuild::setupSpiller(SpillPartition* spillPartition) {
@@ -301,6 +302,8 @@ void HashBuild::removeInputRowsForAntiJoinFilter() {
 }
 
 void HashBuild::addInput(RowVectorPtr input) {
+  DEBUG_STAT_TLS_EXPOSE_SCOPE(&debugStat_);
+  DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::BuildAddInputCalls);
   checkRunning();
   ensureInputFits(input);
 
@@ -380,11 +383,14 @@ void HashBuild::addInput(RowVectorPtr input) {
   // false for the first time we stop. We do not retain the value ids
   // since the final ones will only be known after all data is
   // received.
-  for (auto& hasher : hashers) {
-    // TODO: Load only for active rows, except if right/full outer join.
-    if (analyzeKeys_) {
-      hasher->computeValueIds(activeRows_, hashes_);
-      analyzeKeys_ = hasher->mayUseValueIds();
+  {
+    DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::BuildComputeValueIdsCalls);
+    for (auto& hasher : hashers) {
+      // TODO: Load only for active rows, except if right/full outer join.
+      if (analyzeKeys_) {
+        hasher->computeValueIds(activeRows_, hashes_);
+        analyzeKeys_ = hasher->mayUseValueIds();
+      }
     }
   }
   auto rows = table_->rows();
@@ -429,24 +435,31 @@ void HashBuild::addInput(RowVectorPtr input) {
     return;
   }
 
-  activeRows_.applyToSelected([&](auto rowIndex) {
-    char* newRow = rows->newRow();
-    // Store the columns for each row in sequence. At probe time
-    // strings of the row will probably be in consecutive places, so
-    // reading one will prime the cache for the next.
-    for (auto i = 0; i < hashers.size(); ++i) {
-      rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
-    }
-    for (auto i = 0; i < dependentChannels_.size(); ++i) {
-      rows->store(*decoders_[i], rowIndex, newRow, i + hashers.size());
-    }
-    if (spillProbedFlagVector != nullptr) {
-      VELOX_CHECK(!spillProbedFlagVector->isNullAt(rowIndex));
-      if (spillProbedFlagVector->valueAt(rowIndex)) {
-        rows->setProbedFlag(&newRow, 1);
+  {
+    DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::BuildStoreCalls);
+    activeRows_.applyToSelected([&](auto rowIndex) {
+      char* newRow;
+      {
+        DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::NewRow);
+        newRow = rows->newRow();
       }
-    }
-  });
+      // Store the columns for each row in sequence. At probe time
+      // strings of the row will probably be in consecutive places, so
+      // reading one will prime the cache for the next.
+      for (auto i = 0; i < hashers.size(); ++i) {
+        rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
+      }
+      for (auto i = 0; i < dependentChannels_.size(); ++i) {
+        rows->store(*decoders_[i], rowIndex, newRow, i + hashers.size());
+      }
+      if (spillProbedFlagVector != nullptr) {
+        VELOX_CHECK(!spillProbedFlagVector->isNullAt(rowIndex));
+        if (spillProbedFlagVector->valueAt(rowIndex)) {
+          rows->setProbedFlag(&newRow, 1);
+        }
+      }
+    });
+  }
 }
 
 void HashBuild::ensureInputFits(RowVectorPtr& input) {
@@ -670,6 +683,8 @@ void HashBuild::noMoreInputInternal() {
 }
 
 bool HashBuild::finishHashBuild() {
+  DEBUG_STAT_TLS_EXPOSE_SCOPE(&debugStat_);
+  DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::BuildFinishCalls);
   checkRunning();
 
   // Release the unused memory reservation before building the merged join
@@ -774,6 +789,10 @@ bool HashBuild::finishHashBuild() {
     // finished the merged table build.
     pool()->release();
   };
+
+  if (operatorCtx_->task()->numTotalDrivers() > 2) {
+    table_->setTaperEnabled(false);
+  }
 
   // TODO: Re-enable parallel join build with spilling triggered after
   //  https://github.com/facebookincubator/velox/issues/3567 is fixed.

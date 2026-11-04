@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "velox/exec/DebugStat.h"
 #include "velox/exec/HashBuild.h"
 #include "velox/exec/HashPartitionFunction.h"
 #include "velox/exec/HashTable.h"
@@ -31,6 +32,12 @@ class HashProbe : public Operator {
       int32_t operatorId,
       DriverCtx* driverCtx,
       const std::shared_ptr<const core::HashJoinNode>& hashJoinNode);
+
+#ifdef DEBUG_STAT_ENABLED
+  ~HashProbe() override {
+    debugStat_.print();
+  }
+#endif
 
   void initialize() override;
 
@@ -690,6 +697,8 @@ class HashProbe : public Operator {
 
   // The spilled probe partitions remaining to restore.
   SpillPartitionSet inputSpillPartitionSet_;
+
+  DEBUG_STAT_DEFINE_MEMBER(debugStat_, HashProbe)
 };
 
 inline std::ostream& operator<<(std::ostream& os, ProbeOperatorState state) {

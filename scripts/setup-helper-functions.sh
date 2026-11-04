@@ -127,6 +127,15 @@ function get_cxx_flags {
       # https://developer.arm.com/documentation/100616/0301/register-descriptions/aarch64-system-registers/midr-el1--main-id-register--el1
       ARM_CPU_FILE="/sys/devices/system/cpu/cpu0/regs/identification/midr_el1"
 
+      # The Taper SVE path is guarded by __ARM_FEATURE_SVE. Generic ARM flags
+      # otherwise omit it on CPUs not listed below. Only detect native Linux
+      # capabilities; a cross build must provide its target flags explicitly.
+      local arm_sve_extension=""
+      if [[ "$OS" == "Linux" && "$MACHINE" == "aarch64" ]] &&
+          grep -qw sve /proc/cpuinfo; then
+        arm_sve_extension="+sve"
+      fi
+
       # https://gitlab.arm.com/telemetry-solution/telemetry-solution/-/blob/main/data/pmu/cpu/neoverse/neoverse-n1.json#L13
       # N1:d0c; N2:d49; V1:d40;
       Neoverse_N1="d0c"
@@ -144,8 +153,10 @@ function get_cxx_flags {
         elif [ "$ARM_CPU_PRODUCT" = "$Neoverse_V1" ]; then
           echo -n "-mcpu=neoverse-v1 "
         else
-          echo -n "-march=armv8-a+crc+crypto "
+          echo -n "-march=armv8-a+crc+crypto${arm_sve_extension} "
         fi
+      elif [[ -n "$arm_sve_extension" ]]; then
+        echo -n "-march=armv8-a${arm_sve_extension} "
       else
         echo -n ""
       fi

@@ -16,9 +16,18 @@
 #include "velox/exec/HashAggregation.h"
 
 #include <optional>
+
+#include "velox/exec/DebugStat.h"
+#include "velox/exec/GroupingSet.h"
 #include "velox/exec/PrefixSort.h"
 #include "velox/exec/Task.h"
 #include "velox/expression/Expr.h"
+
+#if defined(__aarch64__)
+#define VELOX_AGG_ENABLE_TAPER true
+#else
+#define VELOX_AGG_ENABLE_TAPER false
+#endif
 
 namespace facebook::velox::exec {
 
@@ -113,7 +122,8 @@ void HashAggregation::initialize() {
       spillConfig_.has_value() ? &spillConfig_.value() : nullptr,
       &nonReclaimableSection_,
       operatorCtx_.get(),
-      &spillStats_);
+      &spillStats_,
+      VELOX_AGG_ENABLE_TAPER);
 
   aggregationNode_.reset();
 }
@@ -173,6 +183,8 @@ bool HashAggregation::abandonPartialAggregationEarly(int64_t numOutput) const {
 }
 
 void HashAggregation::addInput(RowVectorPtr input) {
+  DEBUG_STAT_TLS_EXPOSE_SCOPE(&debugStat_)
+  DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::OperatorAddInputCalls)
   if (!pushdownChecked_) {
     mayPushdown_ = operatorCtx_->driver()->mayPushdownAggregation(this);
     pushdownChecked_ = true;
@@ -182,7 +194,11 @@ void HashAggregation::addInput(RowVectorPtr input) {
     numInputRows_ += input->size();
     return;
   }
+  groupingSet_->resetDistinctNewGroups();
   groupingSet_->addInput(input, mayPushdown_);
+  if (isDistinct_) {
+    groupingSet_->putDistinctNewGroupsIndices(0);
+  }
   numInputRows_ += input->size();
 
   updateRuntimeStats();
@@ -199,8 +215,7 @@ void HashAggregation::addInput(RowVectorPtr input) {
   }
 
   if (isDistinct_) {
-    newDistincts_ = !groupingSet_->hasSpilled() &&
-        !groupingSet_->hashLookup().newGroups.empty();
+    newDistincts_ = groupingSet_->distinctNewGroupsNum() > 0;
 
     if (newDistincts_) {
       // Save input to use for output in getOutput().
@@ -215,33 +230,8 @@ void HashAggregation::addInput(RowVectorPtr input) {
 }
 
 void HashAggregation::updateRuntimeStats() {
-  // Report range sizes and number of distinct values for the group-by keys.
-  const auto& hashers = groupingSet_->hashLookup().hashers;
-  uint64_t asRange{0};
-  uint64_t asDistinct{0};
-  const auto hashTableStats = groupingSet_->hashTableStats();
-
   auto lockedStats = stats_.wlock();
-  auto& runtimeStats = lockedStats->runtimeStats;
-
-  for (auto i = 0; i < hashers.size(); i++) {
-    hashers[i]->cardinality(0, asRange, asDistinct);
-    if (asRange != VectorHasher::kRangeTooLarge) {
-      runtimeStats[fmt::format("rangeKey{}", i)] = RuntimeMetric(asRange);
-    }
-    if (asDistinct != VectorHasher::kRangeTooLarge) {
-      runtimeStats[fmt::format("distinctKey{}", i)] = RuntimeMetric(asDistinct);
-    }
-  }
-
-  runtimeStats[BaseHashTable::kCapacity] =
-      RuntimeMetric(hashTableStats.capacity);
-  runtimeStats[BaseHashTable::kNumRehashes] =
-      RuntimeMetric(hashTableStats.numRehashes);
-  runtimeStats[BaseHashTable::kNumDistinct] =
-      RuntimeMetric(hashTableStats.numDistinct);
-  runtimeStats[BaseHashTable::kNumTombstones] =
-      RuntimeMetric(hashTableStats.numTombstones);
+  groupingSet_->updateRuntimeStats(lockedStats->runtimeStats);
 }
 
 void HashAggregation::prepareOutput(vector_size_t size) {
@@ -318,6 +308,8 @@ void HashAggregation::maybeIncreasePartialAggregationMemoryUsage(
 }
 
 RowVectorPtr HashAggregation::getOutput() {
+  DEBUG_STAT_TLS_EXPOSE_SCOPE(&debugStat_)
+  DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::OperatorGetOutputCalls)
   if (finished_) {
     input_ = nullptr;
     return nullptr;
@@ -381,11 +373,9 @@ RowVectorPtr HashAggregation::getDistinctOutput() {
   if (newDistincts_) {
     VELOX_CHECK_NOT_NULL(input_);
 
-    auto& lookup = groupingSet_->hashLookup();
-    const auto size = lookup.newGroups.size();
+    const auto size = groupingSet_->distinctNewGroupsNum();
     BufferPtr indices = allocateIndices(size, operatorCtx_->pool());
-    auto* indicesPtr = indices->asMutable<vector_size_t>();
-    std::copy(lookup.newGroups.begin(), lookup.newGroups.end(), indicesPtr);
+    groupingSet_->getNewGroupIndices(indices);
     newDistincts_ = false;
     auto output = fillOutput(size, indices);
     numOutputRows_ += size;
@@ -394,6 +384,7 @@ RowVectorPtr HashAggregation::getDistinctOutput() {
     // allow for memory reuse.
     input_ = nullptr;
 
+    groupingSet_->resetDistinctNewGroups();
     resetPartialOutputIfNeed();
     return output;
   }

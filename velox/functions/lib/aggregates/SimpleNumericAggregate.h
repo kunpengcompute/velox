@@ -34,6 +34,14 @@ class SimpleNumericAggregate : public exec::Aggregate {
     extractValues(groups, numGroups, result);
   }
 
+  DecodedVector::Layout registerSingleInput(
+       const std::vector<VectorPtr>& inputVecs,
+       const SelectivityVector& rows) {
+    VELOX_CHECK_EQ(inputVecs.size(), 1);
+    inputDecoded_.decode(*inputVecs.at(0), rows);
+    return DecodedVector::getLayout(inputDecoded_);
+  }
+
  protected:
   template <typename T>
   static constexpr bool kMayPushdown = !std::is_same_v<T, int128_t> &&
@@ -77,6 +85,39 @@ class SimpleNumericAggregate : public exec::Aggregate {
           clearNull(rawNulls, i);
           rawValues[i] = extractOneValue(group);
         }
+      }
+    }
+  }
+
+  template <typename TData = TResult, typename ExtractOneValue>
+  void doExtractValue(
+    char* group,
+    VectorPtr &result,
+    int32_t rowIndex,
+    ExtractOneValue extractOneValue) {
+    VELOX_CHECK_EQ((result)->encoding(), VectorEncoding::Simple::FLAT);
+    auto vector = (result)->as<FlatVector<TData>>();
+    VELOX_CHECK(
+        vector,
+        "Unexpected type of the result vector: {}",
+        (result)->type()->toString());
+    VELOX_CHECK_EQ(vector->elementSize(), sizeof(TData));
+    uint64_t* rawNulls = getRawNulls(vector);
+    if constexpr (std::is_same_v<TData, bool>) {
+      uint64_t* rawValues = vector->template mutableRawValues<uint64_t>();
+      if (isNull(group)) {
+        vector->setNull(rowIndex, true);
+      } else {
+        clearNull(rawNulls, rowIndex);
+        bits::setBit(rawValues, rowIndex, extractOneValue(group));
+      }
+    } else {
+      TData* rawValues = vector->mutableRawValues();
+      if (isNull(group)) {
+        vector->setNull(rowIndex, true);
+      } else {
+        clearNull(rawNulls, rowIndex);
+        rawValues[rowIndex] = extractOneValue(group);
       }
     }
   }
@@ -245,6 +286,9 @@ class SimpleNumericAggregate : public exec::Aggregate {
     }
     updateValue(*exec::Aggregate::value<TDataType>(group), value);
   }
+
+ protected:
+  DecodedVector inputDecoded_;
 };
 
 } // namespace facebook::velox::functions::aggregate

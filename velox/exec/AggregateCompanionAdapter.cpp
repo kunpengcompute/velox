@@ -18,6 +18,7 @@
 
 #include "velox/exec/AggregateCompanionSignatures.h"
 #include "velox/exec/AggregateFunctionRegistry.h"
+#include "velox/exec/AggregateInfo.h"
 #include "velox/exec/RowContainer.h"
 #include "velox/expression/SignatureBinder.h"
 
@@ -263,7 +264,8 @@ bool CompanionFunctionsRegistrar::registerPartialFunction(
                  core::AggregationNode::Step step,
                  const std::vector<TypePtr>& argTypes,
                  const TypePtr& resultType,
-                 const core::QueryConfig& config)
+                const core::QueryConfig& config,
+                RowBasedAggVarsWrapper& varOut)
                  -> std::unique_ptr<Aggregate> {
                if (auto func = getAggregateFunctionEntry(name)) {
                  core::AggregationNode::Step usedStep{
@@ -272,7 +274,8 @@ bool CompanionFunctionsRegistrar::registerPartialFunction(
                    usedStep = core::AggregationNode::Step::kIntermediate;
                  }
                  auto fn =
-                     func->factory(usedStep, argTypes, resultType, config);
+                     func->factory(
+                         usedStep, argTypes, resultType, config, varOut);
                  VELOX_CHECK_NOT_NULL(fn);
                  return std::make_unique<
                      AggregateCompanionAdapter::PartialFunction>(
@@ -308,11 +311,13 @@ bool CompanionFunctionsRegistrar::registerMergeFunction(
                  const core::QueryConfig& config)
                  -> std::unique_ptr<Aggregate> {
                if (auto func = getAggregateFunctionEntry(name)) {
-                 auto fn = func->factory(
+                RowBasedAggVarsWrapper wrapper;
+                auto fn = func->factory(
                      core::AggregationNode::Step::kIntermediate,
                      argTypes,
                      resultType,
-                     config);
+                    config,
+                    wrapper);
                  VELOX_CHECK_NOT_NULL(fn);
                  return std::make_unique<
                      AggregateCompanionAdapter::MergeFunction>(
@@ -353,11 +358,13 @@ bool registerAggregateFunction(
                }
 
                if (auto func = getAggregateFunctionEntry(name)) {
-                 auto fn = func->factory(
+                RowBasedAggVarsWrapper wrapper;
+                auto fn = func->factory(
                      core::AggregationNode::Step::kFinal,
                      argTypes,
                      originalResultType,
-                     config);
+                    config,
+                    wrapper);
                  VELOX_CHECK_NOT_NULL(fn);
                  return std::make_unique<
                      AggregateCompanionAdapter::MergeExtractFunction>(
@@ -426,13 +433,15 @@ bool CompanionFunctionsRegistrar::registerMergeExtractFunction(
               core::AggregationNode::Step /*step*/,
               const std::vector<TypePtr>& argTypes,
               const TypePtr& resultType,
-              const core::QueryConfig& config) -> std::unique_ptr<Aggregate> {
+              const core::QueryConfig& config,
+              RowBasedAggVarsWrapper& varOut) -> std::unique_ptr<Aggregate> {
             if (auto func = getAggregateFunctionEntry(name)) {
               auto fn = func->factory(
                   core::AggregationNode::Step::kFinal,
                   argTypes,
                   resultType,
-                  config);
+                  config,
+                  varOut);
               VELOX_CHECK_NOT_NULL(fn);
               return std::make_unique<
                   AggregateCompanionAdapter::MergeExtractFunction>(
@@ -472,8 +481,13 @@ VectorFunctionFactory getVectorFunctionFactory(
     }
 
     if (auto func = getAggregateFunctionEntry(originalName)) {
+      RowBasedAggVarsWrapper wrapper;
       auto fn = func->factory(
-          core::AggregationNode::Step::kFinal, argTypes, resultType, config);
+          core::AggregationNode::Step::kFinal,
+          argTypes,
+          resultType,
+          config,
+          wrapper);
       VELOX_CHECK_NOT_NULL(fn);
       return std::make_shared<AggregateCompanionAdapter::ExtractFunction>(
           std::move(fn));

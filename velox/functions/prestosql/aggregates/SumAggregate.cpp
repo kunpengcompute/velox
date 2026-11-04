@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/exec/AggregateInfo.h"
 #include "velox/functions/lib/aggregates/SumAggregateBase.h"
 #include "velox/functions/prestosql/aggregates/AggregateNames.h"
 
@@ -63,7 +64,8 @@ exec::AggregateRegistrationResult registerSum(
           core::AggregationNode::Step step,
           const std::vector<TypePtr>& argTypes,
           const TypePtr& resultType,
-          const core::QueryConfig& /*config*/)
+          const core::QueryConfig& /*config*/,
+          exec::RowBasedAggVarsWrapper& varOut)
           -> std::unique_ptr<exec::Aggregate> {
         VELOX_CHECK_EQ(argTypes.size(), 1, "{} takes only one argument", name);
         auto inputType = argTypes[0];
@@ -96,7 +98,8 @@ exec::AggregateRegistrationResult registerSum(
             if (resultType->kind() == TypeKind::REAL) {
               return std::make_unique<T<double, double, float>>(resultType);
             }
-            return std::make_unique<T<double, double, double>>(DOUBLE());
+            return varOut.set(
+                std::make_unique<T<double, double, double>>(DOUBLE()));
           case TypeKind::VARBINARY:
             // Always use int128_t template for Varbinary as the result
             // type is either int128_t or

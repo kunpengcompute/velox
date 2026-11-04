@@ -15,17 +15,48 @@
  */
 #pragma once
 
+#include <functional>
+#include <variant>
+
 #include "velox/core/PlanNode.h"
+#include "velox/functions/lib/aggregates/SumAggregateBase.h"
 #include "velox/vector/ComplexVector.h"
 
 namespace facebook::velox::exec {
 
 class Aggregate;
 
+template <
+    typename TInput,
+    typename TAccumulator,
+    typename ResultType,
+    bool Overflow>
+using SumAggregate =
+    functions::aggregate::
+        SumAggregateBase<TInput, TAccumulator, ResultType, Overflow>;
+
+using RowBasedAggVars = std::variant<
+    std::monostate,
+    std::reference_wrapper<SumAggregate<double, double, double, false>>,
+    std::reference_wrapper<SumAggregate<double, double, double, true>>>;
+
+struct RowBasedAggVarsWrapper {
+  RowBasedAggVars vars;
+
+  template<typename T>
+  std::unique_ptr<T> set(std::unique_ptr<T> p) {
+    vars = *p;
+    return p;
+  }
+};
+
 /// Information needed to evaluate an aggregate function.
 struct AggregateInfo {
   /// Instance of the Aggregate class.
   std::unique_ptr<Aggregate> function;
+
+  /// Concrete aggregate function, if it supports row granularity updates.
+  RowBasedAggVarsWrapper rowBasedAggVars;
 
   /// Indices of the input columns in the input RowVector.
   std::vector<column_index_t> inputs;
