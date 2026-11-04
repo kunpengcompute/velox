@@ -176,6 +176,20 @@ class DecodedVector {
     return indices_[idx];
   }
 
+  /// How to read values in a batch kernel (same branches as index / valueAt).
+  /// 1 = flat (value[row]); 2 = constant (value[0]); 3 = dictionary
+  /// (value[indices[row]]).
+  int getMode2() const {
+    if (isIdentityMapping_) {
+      return 1;
+    }
+    if (isConstantMapping_) {
+      return 2;
+    }
+    VELOX_DCHECK(indices_);
+    return 3;
+  }
+
   /// Returns a scalar value for the top-level row 'idx'.
   template <typename T>
   T valueAt(vector_size_t idx) const {
@@ -208,6 +222,25 @@ class DecodedVector {
 
     VELOX_DCHECK(indices_);
     return bits::isBitNull(nulls_, indices_[idx]);
+  }
+
+  /// How to read input null bits in a batch kernel (same branches as isNullAt).
+  /// 0 = no nulls; 1 = top-level row (identity or extra nulls);
+  /// 2 = constant (bit 0); 3 = dictionary (nulls_[indices[row]]).
+  int getMode1() const {
+    if (!nulls_) {
+      return 0;
+    }
+
+    if (isIdentityMapping_ || hasExtraNulls_) {
+      return 1;
+    }
+
+    if (isConstantMapping_) {
+      return 2;
+    }
+
+    return 3;
   }
 
   /// Returns the largest decoded row number + 1, i.e. rows.end().
