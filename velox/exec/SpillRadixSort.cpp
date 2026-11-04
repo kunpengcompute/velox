@@ -1,0 +1,457 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include "velox/exec/SpillRadixSort.h"
+
+#include <algorithm>
+#include <cstring>
+
+#include "velox/common/base/Exceptions.h"
+#include "velox/common/base/SimdUtil.h"
+#include "velox/common/testutil/TestValue.h"
+#include "velox/exec/Operator.h"
+#include "velox/exec/PrefixSort.h"
+#include "velox/external/timsort/TimSort.hpp"
+#include "velox/buffer/Buffer.h"
+
+using facebook::velox::common::testutil::TestValue;
+
+namespace facebook::velox::exec {
+namespace {
+
+// PrefixSortLayout pads the normalized buffer to 8 bytes for fast word
+// comparison. The spill radix path uses the same layout, but sorts the raw
+// bytes directly before PrefixSort's bitsSwapByWord transformation.
+constexpr int32_t kAlignment = 8;
+
+std::vector<CompareFlags> compareFlagsOrDefault(
+    const RowContainer* rowContainer,
+    const std::vector<CompareFlags>& compareFlags) {
+  if (!compareFlags.empty()) {
+    VELOX_CHECK_EQ(compareFlags.size(), rowContainer->keyTypes().size());
+    return compareFlags;
+  }
+  return std::vector<CompareFlags>(rowContainer->keyTypes().size());
+}
+
+PrefixSortLayout generateLayout(
+    const RowContainer* rowContainer,
+    const std::vector<CompareFlags>& compareFlags,
+    const SpillRadixSortConfig& config) {
+  const auto& keyTypes = rowContainer->keyTypes();
+  std::vector<std::optional<uint32_t>> maxStringLengths;
+  maxStringLengths.reserve(keyTypes.size());
+  std::vector<bool> columnHasNulls;
+  columnHasNulls.reserve(keyTypes.size());
+
+  for (int i = 0; i < keyTypes.size(); ++i) {
+    std::optional<uint32_t> maxStringLength = std::nullopt;
+    if (keyTypes[i]->kind() == TypeKind::VARBINARY ||
+        keyTypes[i]->kind() == TypeKind::VARCHAR) {
+      const auto stats = rowContainer->columnStats(i);
+      if (stats.has_value()) {
+        maxStringLength = stats.value().maxBytes();
+      }
+    }
+    maxStringLengths.emplace_back(maxStringLength);
+    columnHasNulls.emplace_back(rowContainer->columnHasNulls(i));
+  }
+
+  return PrefixSortLayout::generate(
+      keyTypes,
+      columnHasNulls,
+      compareFlags,
+      config.maxNormalizedKeyBytes,
+      config.maxStringPrefixLength,
+      maxStringLengths);
+}
+
+template <typename T>
+FOLLY_ALWAYS_INLINE void encodeRowColumn(
+    const PrefixSortLayout& layout,
+    column_index_t index,
+    const RowColumn& rowColumn,
+    char* row,
+    char* prefixBuffer) {
+  std::optional<T> value;
+  if (!layout.normalizedKeyHasNullByte[index] ||
+      !RowContainer::isNullAt(
+          row, rowColumn.nullByte(), rowColumn.nullMask())) {
+    value = *(reinterpret_cast<T*>(row + rowColumn.offset()));
+  } else {
+    value = std::nullopt;
+  }
+
+  layout.encoders[index].encode(
+      value,
+      prefixBuffer + layout.prefixOffsets[index],
+      layout.encodeSizes[index],
+      layout.normalizedKeyHasNullByte[index]);
+}
+
+FOLLY_ALWAYS_INLINE void extractRowColumnToPrefix(
+    TypeKind typeKind,
+    const PrefixSortLayout& layout,
+    uint32_t index,
+    const RowColumn& rowColumn,
+    char* row,
+    char* prefixBuffer) {
+  switch (typeKind) {
+    case TypeKind::SMALLINT:
+      encodeRowColumn<int16_t>(layout, index, rowColumn, row, prefixBuffer);
+      return;
+    case TypeKind::INTEGER:
+      encodeRowColumn<int32_t>(layout, index, rowColumn, row, prefixBuffer);
+      return;
+    case TypeKind::BIGINT:
+      encodeRowColumn<int64_t>(layout, index, rowColumn, row, prefixBuffer);
+      return;
+    case TypeKind::REAL:
+      encodeRowColumn<float>(layout, index, rowColumn, row, prefixBuffer);
+      return;
+    case TypeKind::DOUBLE:
+      encodeRowColumn<double>(layout, index, rowColumn, row, prefixBuffer);
+      return;
+    case TypeKind::TIMESTAMP:
+      encodeRowColumn<Timestamp>(layout, index, rowColumn, row, prefixBuffer);
+      return;
+    case TypeKind::HUGEINT:
+      encodeRowColumn<int128_t>(layout, index, rowColumn, row, prefixBuffer);
+      return;
+    case TypeKind::VARCHAR:
+      [[fallthrough]];
+    case TypeKind::VARBINARY:
+      encodeRowColumn<StringView>(layout, index, rowColumn, row, prefixBuffer);
+      return;
+    default:
+      VELOX_UNSUPPORTED(
+          "spill radix sort does not support type kind: {}",
+          mapTypeKindToName(typeKind));
+  }
+}
+
+void extractRowAndEncodePrefixKeys(
+    const RowContainer* rowContainer,
+    const PrefixSortLayout& layout,
+    char* row,
+    char* prefixBuffer) {
+  for (auto i = 0; i < layout.numNormalizedKeys; ++i) {
+    extractRowColumnToPrefix(
+        rowContainer->keyTypes()[i]->kind(),
+        layout,
+        i,
+        rowContainer->columnAt(i),
+        row,
+        prefixBuffer);
+  }
+
+  if (layout.numPaddingBytes > 0) {
+    simd::memset(
+        prefixBuffer + layout.normalizedBufferSize - layout.numPaddingBytes,
+        0,
+        layout.numPaddingBytes);
+  }
+
+  *reinterpret_cast<char**>(prefixBuffer + layout.normalizedBufferSize) = row;
+}
+
+FOLLY_ALWAYS_INLINE char*& rowFromPrefix(
+    char* prefixBuffer,
+    const PrefixSortLayout& layout) {
+  return *reinterpret_cast<char**>(prefixBuffer + layout.normalizedBufferSize);
+}
+
+int compareNonPrefixKeys(
+    const RowContainer* rowContainer,
+    const PrefixSortLayout& layout,
+    char* leftRow,
+    char* rightRow) {
+  for (auto i = layout.nonPrefixSortStartIndex; i < layout.numKeys; ++i) {
+    const auto result =
+        rowContainer->compare(leftRow, rightRow, i, layout.compareFlags[i]);
+    if (result != 0) {
+      return result;
+    }
+  }
+  return 0;
+}
+
+// The histogram is split into kNumWays independent 257-entry counters
+// (rows routed by index % kNumWays) to break the store->load dependency
+// chain of the scalar counts[..]++ loop, and a software prefetch hides the
+// latency of the scattered row-byte loads. The sub-histograms are merged
+// before the prefix-sum pass. Note: an SVE svld1_gather_u64base_offset_u64
+// variant was tried first but regressed on Kunpeng 920 — the gather
+// instruction stalls on the slowest of 4 scattered cache lines while
+// over-fetching 8 bytes per lane (only the low byte is used), so the scalar
+// load + prefetch path wins.
+constexpr int32_t kNumWays = 4;
+constexpr int32_t kPrefetchDistance = 64;
+
+void countingPass(
+    char** in,
+    char** out,
+    size_t numRows,
+    uint32_t byteOffset) {
+  uint32_t counts[kNumWays][257];
+  std::memset(counts, 0, sizeof(counts));
+
+  // Histogram: 4 independent counter arrays remove the store->load
+  // dependency of counts[..]++; prefetch the scattered row bytes.
+  size_t i = 0;
+  for (; i + kPrefetchDistance < numRows; ++i) {
+    __builtin_prefetch(in[i + kPrefetchDistance] + byteOffset);
+    ++counts[i & (kNumWays - 1)][1 + static_cast<uint8_t>(*(in[i] + byteOffset))];
+  }
+  for (; i < numRows; ++i) {
+    ++counts[i & (kNumWays - 1)][1 + static_cast<uint8_t>(*(in[i] + byteOffset))];
+  }
+
+  // Merge sub-histograms into counts[0].
+  for (int32_t b = 1; b <= 256; ++b) {
+    for (int32_t way = 1; way < kNumWays; ++way) {
+      counts[0][b] += counts[way][b];
+    }
+  }
+
+  // Prefix sums (exclusive).
+  for (int32_t b = 1; b < 256; ++b) {
+    counts[0][b] += counts[0][b - 1];
+  }
+
+  // Scatter pass: prefetch the sort bytes ahead of the dependent stores.
+  i = 0;
+  for (; i + kPrefetchDistance < numRows; ++i) {
+    __builtin_prefetch(in[i + kPrefetchDistance] + byteOffset);
+    const auto key = static_cast<uint8_t>(*(in[i] + byteOffset));
+    out[counts[0][key]++] = in[i];
+  }
+  for (; i < numRows; ++i) {
+    const auto key = static_cast<uint8_t>(*(in[i] + byteOffset));
+    out[counts[0][key]++] = in[i];
+  }
+}
+
+char** radixSort(
+    char** src,
+    char** scratch,
+    size_t numRows,
+    uint32_t normalizedBytes) {
+  if (numRows <= 1) {
+    return src;
+  }
+
+  char** in = src;
+  char** out = scratch;
+  for (int32_t byte = static_cast<int32_t>(normalizedBytes) - 1; byte >= 0;
+       --byte) {
+    countingPass(in, out, numRows, byte);
+    std::swap(in, out);
+  }
+  return in;
+}
+
+bool validForRadix(
+    const PrefixSortLayout& layout,
+    size_t numRows,
+    const SpillRadixSortConfig& config) {
+  if (!config.enabled || numRows < config.minRows) {
+    return false;
+  }
+  if (!layout.hasNormalizedKeys || layout.normalizedBufferSize == 0) {
+    return false;
+  }
+  // Should be guaranteed by PrefixSortLayout::generate. Keep this as a cheap
+  // guard because radix iterates over every byte including padding.
+  return layout.normalizedBufferSize % kAlignment == 0;
+}
+
+} // namespace
+
+// static
+bool SpillRadixSort::canSort(
+    const RowContainer* rowContainer,
+    const std::vector<CompareFlags>& compareFlags,
+    size_t numRows,
+    const SpillRadixSortConfig& config) {
+  if (rowContainer == nullptr) {
+    return false;
+  }
+  const auto normalizedFlags = compareFlagsOrDefault(rowContainer, compareFlags);
+  const auto layout = generateLayout(rowContainer, normalizedFlags, config);
+  return validForRadix(layout, numRows, config);
+}
+
+// static
+void SpillRadixSort::sort(
+    const RowContainer* rowContainer,
+    const std::vector<CompareFlags>& compareFlags,
+    const SpillRadixSortConfig& config,
+    memory::MemoryPool* pool,
+    SpillRows& rows) {
+  const auto numRows = rows.size();
+  const auto normalizedFlags = compareFlagsOrDefault(rowContainer, compareFlags);
+  const auto layout = generateLayout(rowContainer, normalizedFlags, config);
+  VELOX_CHECK(
+      validForRadix(layout, numRows, config),
+      "SpillRadixSort::sort called for unsupported input");
+
+  const auto entrySize = layout.entrySize;
+
+  // Allocate the prefix buffer as a set of bounded chunks instead of a single
+  // numRows * entrySize contiguous block. A spill run can contain millions of
+  // rows (e.g. q67 OrderBy spills ~200-400M rows * ~64B entry = 120MB+), and a
+  // single huge contiguous request can fail in a memory-constrained
+  // allocator (MEM_ALLOC_ERROR on q67). Chunking bounds each allocation to
+  // 'maxPrefixBufferChunkPages' 4KB pages; row i lives in
+  // chunk[i / rowsPerChunk] at offset (i % rowsPerChunk) * entrySize.
+  const auto bytesPerChunk =
+      static_cast<uint64_t>(config.maxPrefixBufferChunkPages) *
+      memory::AllocationTraits::kPageSize;
+  const auto rowsPerChunk =
+      std::max<uint64_t>(1, bytesPerChunk / entrySize);
+  const auto numChunks =
+      (numRows + rowsPerChunk - 1) / rowsPerChunk;
+  std::vector<memory::ContiguousAllocation> chunkAllocs(numChunks);
+  std::vector<char*> chunks(numChunks);
+  BufferPtr srcBuffer;
+  BufferPtr scratchBuffer;
+  try {
+    // Test injection point: allow tests to force the allocation failure and
+    // verify the comparator-sort fallback below.
+    TestValue::adjust("SpillRadixSort::sort::allocateChunks", nullptr);
+    for (auto c = 0; c < numChunks; ++c) {
+      const auto chunkRows =
+          std::min<uint64_t>(rowsPerChunk, numRows - c * rowsPerChunk);
+      const auto numPages =
+          memory::AllocationTraits::numPages(chunkRows * entrySize);
+      pool->allocateContiguous(numPages, chunkAllocs[c]);
+      chunks[c] = chunkAllocs[c].data<char>();
+    }
+
+    // Encode keys into the chunks. Walk chunk-by-chunk with a running row
+    // index so the hot loop has no per-row division/modulo (chunk lookup)
+    // and writes are sequential within each chunk for prefetch-friendliness.
+    {
+      size_t i = 0;
+      for (auto c = 0; c < numChunks; ++c) {
+        const auto chunkRows =
+            std::min<uint64_t>(rowsPerChunk, numRows - c * rowsPerChunk);
+        char* chunkBase = chunks[c];
+        for (uint64_t r = 0; r < chunkRows; ++r, ++i) {
+          extractRowAndEncodePrefixKeys(
+              rowContainer, layout, rows[i], chunkBase + r * entrySize);
+        }
+      }
+    }
+
+    // The radix pointer arrays also allocate from the spill pool; they must
+    // be covered by the same fallback below.
+    srcBuffer = AlignedBuffer::allocate<char*>(numRows, pool);
+    scratchBuffer = AlignedBuffer::allocate<char*>(numRows, pool);
+    {
+      auto* src = srcBuffer->asMutable<char*>();
+      size_t i = 0;
+      for (auto c = 0; c < numChunks; ++c) {
+        const auto chunkRows =
+            std::min<uint64_t>(rowsPerChunk, numRows - c * rowsPerChunk);
+        char* chunkBase = chunks[c];
+        for (uint64_t r = 0; r < chunkRows; ++r, ++i) {
+          src[i] = chunkBase + r * entrySize;
+        }
+      }
+    }
+  } catch (const VeloxRuntimeError& e) {
+    // The prefix buffer or the pointer arrays could not be allocated (e.g.
+    // the spill memory allocator is exhausted). Fall back to the comparator
+    // sort which requires no additional memory, matching the behavior of the
+    // non-radix spill path.
+    if (e.errorCode() != error_code::kMemAllocError) {
+      throw;
+    }
+    VELOX_MEM_LOG(WARNING)
+        << "SpillRadixSort::sort falling back to comparator sort after "
+        << "allocation failure: " << e.what();
+    gfx::timsort(
+        rows.begin(),
+        rows.end(),
+        [&](const char* left, const char* right) {
+          return rowContainer->compareRows(
+                     left, right, normalizedFlags) < 0;
+        });
+    return;
+  }
+  char** src = srcBuffer->asMutable<char*>();
+  char** scratch = scratchBuffer->asMutable<char*>();
+
+  char** sorted = radixSort(src, scratch, numRows, layout.normalizedBufferSize);
+
+  addThreadLocalRuntimeStat(
+      SpillRadixSort::kSpillRadixSortRows,
+      RuntimeCounter(numRows, RuntimeCounter::Unit::kNone));
+
+  const bool needsResidualCompare = layout.hasNonNormalizedKey ||
+      layout.nonPrefixSortStartIndex < layout.numNormalizedKeys;
+  int64_t residualGroups = 0;
+  if (needsResidualCompare && numRows > 1) {
+    size_t begin = 0;
+    while (begin < numRows) {
+      size_t end = begin + 1;
+      while (end < numRows &&
+             std::memcmp(
+                 sorted[begin], sorted[end], layout.normalizedBufferSize) ==
+                 0) {
+        ++end;
+      }
+
+      if (end - begin > 1) {
+        ++residualGroups;
+        gfx::timsort(
+            sorted + begin, sorted + end, [&](char* left, char* right) {
+              return compareNonPrefixKeys(
+                         rowContainer,
+                         layout,
+                         rowFromPrefix(left, layout),
+                         rowFromPrefix(right, layout)) < 0;
+            });
+      }
+      begin = end;
+    }
+  }
+
+  if (residualGroups > 0) {
+    addThreadLocalRuntimeStat(
+        SpillRadixSort::kSpillRadixSortResidualGroups,
+        RuntimeCounter(residualGroups, RuntimeCounter::Unit::kNone));
+  }
+
+  for (size_t i = 0; i < numRows; ++i) {
+    rows[i] = rowFromPrefix(sorted[i], layout);
+  }
+}
+
+namespace detail {
+
+void spillRadixSortCountingPass(
+    char** in,
+    char** out,
+    size_t numRows,
+    uint32_t byteOffset) {
+  countingPass(in, out, numRows, byteOffset);
+}
+
+} // namespace detail
+
+} // namespace facebook::velox::exec
