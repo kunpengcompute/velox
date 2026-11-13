@@ -1,0 +1,65 @@
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: velox Version BuildFlow
+
+on:
+  workflow_dispatch:
+    inputs:
+      velox_branch:
+        description: 检出构建脚本所在的 velox分支，默认 master
+        required: false
+        default: master
+        type: string
+      Product_Version:
+        description: 产品版本号
+        required: true
+        default: 26.3.RC1
+        type: string
+env:
+  docker_img_openeuler2203: swr.cn-north-4.myhuaweicloud.com/cloud_boostkit/openeuler_22.03_lts_sp3:velox_arm_01
+  docker_img_openeuler2403: swr.cn-north-4.myhuaweicloud.com/cloud_boostkit/openeuler_24.03_lts_sp3:velox_arm_01
+
+# 被调用工作流需要 id-token 签发 OBS OIDC 凭证，调用方必须授予
+permissions:
+  repository: read
+  id-token: write
+
+stages: # 阶段，不超过16个阶段，不超过256个job
+  stage1: # stage identifier 仅支持大小写英文字母、数字、“-”或“_”
+    name: 全量编译
+    select: selected_by_default
+    jobs: # 任务，单 stage 下最多100个；不写 needs 即同阶段并行
+      velox_openEuler2203:
+        name: velox openEuler22.03
+        uses: .gitcode/workflows/version_build_velox.yml
+        with:
+          docker_img: ${{ env.docker_img_openeuler2203 }}
+          module: openEuler22.03
+          velox_branch: ${{ inputs.velox_branch }}
+          Product_Version: ${{ inputs.Product_Version }}
+        secrets:
+          BOOSTKIT_OBS_OIDC_TRUST_Nightly: ${{ secrets.BOOSTKIT_OBS_OIDC_TRUST_Nightly }}
+          BOOSTKIT_OBS_IAM_ACCOUNT_Nightly: ${{ secrets.BOOSTKIT_OBS_IAM_ACCOUNT_Nightly }}
+      velox_openEuler2403:
+        name: velox openEuler24.03
+        uses: .gitcode/workflows/version_build_velox.yml
+        with:
+          docker_img: ${{ env.docker_img_openeuler2403 }}
+          module: openEuler24.03
+          velox_branch: ${{ inputs.velox_branch }}
+          Product_Version: ${{ inputs.Product_Version }}
+        secrets:
+          BOOSTKIT_OBS_OIDC_TRUST_Nightly: ${{ secrets.BOOSTKIT_OBS_OIDC_TRUST_Nightly }}
+          BOOSTKIT_OBS_IAM_ACCOUNT_Nightly: ${{ secrets.BOOSTKIT_OBS_IAM_ACCOUNT_Nightly }}
