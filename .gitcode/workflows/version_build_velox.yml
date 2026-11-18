@@ -1,0 +1,79 @@
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: velox Version Build
+
+on:
+  workflow_call:
+    inputs:
+      docker_img:
+        required: true
+        type: string
+      module:
+        required: true
+        type: string
+      velox_branch:
+        required: true
+        type: string
+      Product_Version:
+        required: true
+        type: string
+    secrets:
+      BOOSTKIT_OBS_OIDC_TRUST_Nightly:
+        required: true
+      BOOSTKIT_OBS_IAM_ACCOUNT_Nightly:
+        required: true
+
+# oidc-auth 需要平台为本次运行签发 ID Token，必须显式申请该权限
+permissions:
+  repository: read
+  id-token: write
+
+jobs:
+  JOB_Compile:
+    name: velox Build
+    select: selected_by_default
+    # CodeArts 侧 velox 组合独占 pool_arm_16u_01，这里按本体编译的量申请 cpu=32
+    runs-on: [self-hosted, os=euler, arch=arm64, type=pr, flavor=large]
+    container:
+      image: ${{ inputs.docker_img }}
+    env:
+      BUILD_SCENARIO: version
+      module: ${{ inputs.module }}
+      velox_branch: ${{ inputs.velox_branch }}
+      Product_Version: ${{ inputs.Product_Version }}
+    steps:
+      - name: checkout_build_scripts
+        uses: checkout
+        with:
+          ref: ${{ inputs.velox_branch }}
+          path: velox # 脚本以 ${WORKSPACE}/velox 引用源码，目录名需固定
+      - name: build
+        run: |-
+          bash velox/.gitcode/scripts/build.sh package
+      - name: oidc-auth
+        uses: huaweicloud-oidc-auth
+        with:
+          audience: ${{ secrets.BOOSTKIT_OBS_OIDC_TRUST_Nightly }}
+          region: cn-north-4
+          agency_urn: iam::${{ secrets.BOOSTKIT_OBS_IAM_ACCOUNT_Nightly }}:agency:${{ secrets.BOOSTKIT_OBS_OIDC_TRUST_Nightly }}
+          provider_urn: iam::${{ secrets.BOOSTKIT_OBS_IAM_ACCOUNT_Nightly }}:oidcProvider:${{ secrets.BOOSTKIT_OBS_OIDC_TRUST_Nightly }}
+      - name: upload velox artifact
+        id: upload_obs
+        uses: obs-upload
+        with:
+          endpoint: obs.cn-north-4.myhuaweicloud.com
+          bucket: boostkit-bigdata-public
+          artifact-path: output/${{ inputs.module }}/*.zip*
+          object-prefix: buildcache/velox/${{ inputs.velox_branch }}/${{ inputs.Product_Version }}/release/

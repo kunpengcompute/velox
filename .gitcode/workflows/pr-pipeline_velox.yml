@@ -1,0 +1,212 @@
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: pr-pipeline_velox
+
+on:
+  pull_request_target:
+    types: [open, reopen, update]
+    branches: ["**"]
+  pull_request_comment:
+    types: [created]
+    branches: ['**']
+    comments:
+      - ^(?:\/)?compile*
+
+env:
+  pr_id: ${{ atomgit.event.pull_request.number }}
+  target_branch: ${{ atomgit.event.pull_request.base.ref }}
+  docker_img_openeuler2203: swr.cn-north-4.myhuaweicloud.com/cloud_boostkit/openeuler_22.03_lts_sp3:velox_arm_01
+  docker_img_openeuler2403: swr.cn-north-4.myhuaweicloud.com/cloud_boostkit/openeuler_24.03_lts_sp3:velox_arm_01
+
+defaults:
+  run:
+    shell: bash
+
+concurrency: # 并发控制
+  enable: true # 启用并发控制
+  max: 3 # 最大并发运行数（范围1-5）：同一工作流最多3个运行同时执行
+  exceed-action: QUEUE # 超出并发上限的策略：QUEUE排队等待（另一选项IGNORE=直接忽略新触发）
+  preemption: # 抢占策略：新事件到来时取消同组正在运行的旧运行
+    enable: true # 启用抢占（默认true）
+    events: [mr_id] # 抢占粒度=按MR隔离：同一MR的新推送取消该MR的旧运行，不同MR互不影响
+
+permissions:
+  repository: read
+  pr: read
+
+stages: #阶段，不超过16个阶段，不超过256个job
+  stage0: # 流水线状态管理（非项目逻辑）—— 待下方 job 放开后再取消注释启用
+    name: 初始化阶段
+    select: selected_by_default
+    jobs:
+      associate_pr_comment:    # 阶段一暂注释，验证通过后放开
+        name: associate_pr_comment
+        runs-on: [ self-hosted, os=euler, arch=arm64, type=pr, flavor=small ]
+        steps:
+          - name: associate_pr_comment
+            uses: associate-pr-comment
+      init_pipeline_status:
+        name: init_pipeline_status
+        runs-on: [ self-hosted, os=euler, arch=arm64, type=pr, flavor=small ]
+        steps:
+          - name: Set running label
+            uses: openlibing/pr-label-action@v1.0.0
+            with:
+              add_labels: ci-pipeline-running
+              remove_labels: ci-pipeline-passed,ci-pipeline-failed
+              token: ${{secrets.PR_LABEL_TOKEN}}
+  stage1: # 校验阶段
+    name: 校验阶段
+    select: selected_by_default
+    jobs:
+      Detect_file_changes:
+        name: Detect_file_changes
+        runs-on: [ubuntu-latest, x64, slim]
+        outputs:
+          need_build: ${{ steps.set-skip.outputs.need_build }}
+        steps:
+          - name: checkout
+            uses: checkout
+            with:
+              allow-unsafe-pr-checkout: true
+              ref: refs/merge-requests/${{ env.pr_id }}/merge
+              fetch-depth: 0
+          - name: Only_doc_commit
+            id: filter
+            uses: paths-changes-filter
+            with:
+              event-name: pull_request
+              base: ${{ env.target_branch }}
+              repo: ${{ atomgit.repository }}
+              number: ${{ env.pr_id }}
+              list-files: json
+              predicate-quantifier: every
+              filters: |
+                changed:
+                  - '**'
+                doc-only:
+                  - docs/**
+                  - '**/*.md'
+                  - '**/*.rst'
+                  - '**/*.log'
+                  - '**/*.png'
+                  - '**/*.jpg'
+                  - '**/*.doc'
+                  - '**/*.eddx'
+                  - '**/*.svg'
+                  - '**/*.ini'
+          - name: set build skip flag
+            id: set-skip
+            run: |
+              echo "changed: ${{ steps.filter.outputs.changed_files }}"
+              echo "doc-only: ${{ steps.filter.outputs.doc-only }}"
+              if [ "${{ steps.filter.outputs.doc-only }}" = "true" ]; then
+                echo "need_build=no" >> "$ATOMGIT_OUTPUT"
+              else
+                echo "need_build=yes" >> "$ATOMGIT_OUTPUT"
+              fi
+      sca-pr:
+        name: sca-pr
+        runs-on: [ubuntu-latest, x64, slim]
+        permissions:
+          id-token: write
+        steps:
+          - name: sca-pr
+            uses: openlibing/sca-action/sca-pr-action@v1.0.0
+            with:
+              project-name: boostkit
+      AntiPoison-scan:
+        name: AntiPoison-scan
+        runs-on: [ubuntu-latest, x64, slim]
+        permissions:
+          id-token: write
+        steps:
+          - name: malicious-scan
+            uses: openlibing/malicious-code-scan-action/malicious-code-pr-scan-action@v1.0.0
+            with:
+              project-name: boostkit
+      pre-commit:
+        runs-on: [self-hosted, os=euler, arch=arm64, type=pr, flavor=small]
+        container:
+          image: swr.cn-north-4.myhuaweicloud.com/cloud_boostkit/openeuler_24.03_lts_sp3:pre-commit_arm_01
+        steps:
+          - name: Checkout
+            uses: checkout
+            with:
+              allow-unsafe-pr-checkout: true
+              ref: refs/merge-requests/${{ env.pr_id }}/merge
+          - name: install gitleaks
+            run: |
+              cd ${ATOMGIT_WORKSPACE}
+              wget -q https://pytorch-package.obs.cn-north-4.myhuaweicloud.com/pta-codecheck/gitleaks
+              chmod +x gitleaks
+              cd -
+              ln -sf /usr/bin/python3 /usr/local/bin/python
+          - name: Configure GitHub proxy
+            run: git config --global url."http://git-cdn-service.git-cdn.svc.cluster.local:8000/".insteadOf "https://github.com/"
+          - name: Run pre-commit
+            uses: openlibing/pre-commit-action@v1.0.0
+      build_openeuler2203:
+        name: build_openeuler2203
+        if: ${{ jobs.Detect_file_changes.outputs.need_build == 'yes' }}
+        needs: [Detect_file_changes] # 门控 outputs 引用必须保留（附录二第10条）
+        uses: .gitcode/workflows/pr_build.yml
+        with:
+          docker_img: "${{ env.docker_img_openeuler2203 }}"
+          module: openEuler22.03
+          pr_id: "${{ env.pr_id }}"
+          target_branch: "${{ env.target_branch }}"
+      build_openeuler2403:
+        name: build_openeuler2403
+        if: ${{ jobs.Detect_file_changes.outputs.need_build == 'yes' }}
+        needs: [Detect_file_changes] # 门控 outputs 引用必须保留（附录二第10条）
+        uses: .gitcode/workflows/pr_build.yml
+        with:
+          docker_img: "${{ env.docker_img_openeuler2403 }}"
+          module: openEuler24.03
+          pr_id: "${{ env.pr_id }}"
+          target_branch: "${{ env.target_branch }}"
+      ut_openeuler2203:
+        name: ut_openeuler2203
+        if: ${{ jobs.Detect_file_changes.outputs.need_build == 'yes' }}
+        needs: [Detect_file_changes] # 门控 outputs 引用必须保留（附录二第10条）
+        uses: .gitcode/workflows/pr_ut.yml
+        with:
+          docker_img: "${{ env.docker_img_openeuler2203 }}"
+          module: openEuler22.03
+          pr_id: "${{ env.pr_id }}"
+          target_branch: "${{ env.target_branch }}"
+      ut_openeuler2403:
+        name: ut_openeuler2403
+        if: ${{ jobs.Detect_file_changes.outputs.need_build == 'yes' }}
+        needs: [Detect_file_changes] # 门控 outputs 引用必须保留（附录二第10条）
+        uses: .gitcode/workflows/pr_ut.yml
+        with:
+          docker_img: "${{ env.docker_img_openeuler2403 }}"
+          module: openEuler24.03
+          pr_id: "${{ env.pr_id }}"
+          target_branch: "${{ env.target_branch }}"
+post:
+  jobs:
+    update_pipeline_status:
+      name: update_pipeline_status
+      runs-on: [ self-hosted, os=euler, arch=arm64, type=pr, flavor=small ]
+      steps:
+        - name: Set result label
+          uses: openlibing/pr-label-action@v1.0.0
+          with:
+            add_labels: ${{ pipeline.upstream_status == 'COMPLETED' && 'ci-pipeline-passed' || 'ci-pipeline-failed' }}
+            remove_labels: ci-pipeline-running,${{ pipeline.upstream_status == 'COMPLETED' && 'ci-pipeline-failed' || 'ci-pipeline-passed' }}
+            token: ${{secrets.PR_LABEL_TOKEN}}

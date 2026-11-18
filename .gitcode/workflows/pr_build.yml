@@ -1,0 +1,70 @@
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Build Job
+
+on:
+  workflow_call:
+    inputs:
+      docker_img:
+        required: true
+        type: string
+      module:
+        required: true
+        type: string
+      pr_id:
+        required: true
+        type: string
+      target_branch:
+        required: false
+        type: string
+jobs:
+  JOB_Compile:
+    name: Compile
+    select: selected_by_default
+    runs-on: [self-hosted, os=euler, arch=arm64, type=pr, flavor=large]
+    container:
+      image: ${{ inputs.docker_img }}
+    steps:
+      # save 端 key 每次运行唯一且不给 restore-keys，靠"全部未命中即落盘"写新缓存；restore 端精确 key 故意永不等于 save 端，只靠前缀取最近一份
+      - name: ccache_tag
+        id: cct
+        run: |-
+          printf 'tag=%s\n' "${ATOMGIT_RUN_ID:-$(date +%s)}" >> "$ATOMGIT_OUTPUT"
+      - name: restore_ccache
+        uses: cache
+        with:
+          path: /home/jenkins/agent/build_cache/.ccache
+          key: ccache-${{ inputs.module }}-compile-hit-${{ steps.cct.outputs.tag }}
+          restore-keys: |
+            ccache-${{ inputs.module }}-compile-
+      - name: fast_checkout
+        identifier: fast_checkout
+        uses: checkout
+        with:
+          allow-unsafe-pr-checkout: true
+          ref: refs/merge-requests/${{ inputs.pr_id }}/merge
+          path: velox # 脚本以 ${WORKSPACE}/velox引用源码，目录名需固定
+      - name: build
+        run: |-
+          if [ -f velox/.gitcode/scripts/build.sh ]; then
+            bash velox/.gitcode/scripts/build.sh compile
+          else
+            echo "ERROR: build.sh 在预合入代码和基分支中均不存在"; exit 1
+          fi
+      - name: save_ccache
+        uses: cache
+        with:
+          path: /home/jenkins/agent/build_cache/.ccache
+          key: ccache-${{ inputs.module }}-compile-${{ steps.cct.outputs.tag }}
