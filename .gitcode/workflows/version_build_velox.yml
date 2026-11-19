@@ -45,7 +45,7 @@ jobs:
     name: velox Build
     select: selected_by_default
     # CodeArts 侧 velox 组合独占 pool_arm_16u_01，这里按本体编译的量申请 cpu=32
-    runs-on: [self-hosted, os=euler, arch=arm64, type=pr, flavor=large]
+    runs-on: [self-hosted, os=euler, arch=arm64, type=pr, flavor=2xlarge]
     container:
       image: ${{ inputs.docker_img }}
     env:
