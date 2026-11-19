@@ -51,15 +51,15 @@ stages: #阶段，不超过16个阶段，不超过256个job
     name: 初始化阶段
     select: selected_by_default
     jobs:
-      associate_pr_comment:    # 阶段一暂注释，验证通过后放开
+      associate_pr_comment: # 阶段一暂注释，验证通过后放开
         name: associate_pr_comment
-        runs-on: [ self-hosted, os=euler, arch=arm64, type=pr, flavor=small ]
+        runs-on: [self-hosted, os=euler, arch=arm64, type=pr, flavor=small]
         steps:
           - name: associate_pr_comment
             uses: associate-pr-comment
       init_pipeline_status:
         name: init_pipeline_status
-        runs-on: [ self-hosted, os=euler, arch=arm64, type=pr, flavor=small ]
+        runs-on: [self-hosted, os=euler, arch=arm64, type=pr, flavor=small]
         steps:
           - name: Set running label
             uses: openlibing/pr-label-action@v1.0.0
@@ -141,6 +141,8 @@ stages: #阶段，不超过16个阶段，不超过256个job
         runs-on: [self-hosted, os=euler, arch=arm64, type=pr, flavor=small]
         container:
           image: swr.cn-north-4.myhuaweicloud.com/cloud_boostkit/openeuler_24.03_lts_sp3:pre-commit_arm_01
+        env:
+          PRE_COMMIT_HOME: /root/.cache/pre-commit
         steps:
           - name: Checkout
             uses: checkout
@@ -156,8 +158,26 @@ stages: #阶段，不超过16个阶段，不超过256个job
               ln -sf /usr/bin/python3 /usr/local/bin/python
           - name: Configure GitHub proxy
             run: git config --global url."http://git-cdn-service.git-cdn.svc.cluster.local:8000/".insteadOf "https://github.com/"
+          - name: pre_commit_tag
+            id: pct
+            run: |-
+              printf 'tag=%s\n' "${ATOMGIT_RUN_ID:-$(date +%s)}" >> "$ATOMGIT_OUTPUT"
+          - name: restore_pre_commit_env
+            uses: cache
+            with:
+              path: /root/.cache/pre-commit
+              # restore 端 key 每次运行唯一，避免命中它自己落盘的空缓存
+              key: pchit-${{ hashFiles('.pre-commit-config.yaml') }}-${{ steps.pct.outputs.tag }}
+              restore-keys: |
+                pre-commit-2403-${{ hashFiles('.pre-commit-config.yaml') }}
           - name: Run pre-commit
             uses: openlibing/pre-commit-action@v1.0.0
+          - name: save_pre_commit_env
+            if: ${{ always() }}
+            uses: cache
+            with:
+              path: /root/.cache/pre-commit
+              key: pre-commit-2403-${{ hashFiles('.pre-commit-config.yaml') }}
       build_openeuler2203:
         name: build_openeuler2203
         if: ${{ jobs.Detect_file_changes.outputs.need_build == 'yes' }}
@@ -202,7 +222,7 @@ post:
   jobs:
     update_pipeline_status:
       name: update_pipeline_status
-      runs-on: [ self-hosted, os=euler, arch=arm64, type=pr, flavor=small ]
+      runs-on: [self-hosted, os=euler, arch=arm64, type=pr, flavor=small]
       steps:
         - name: Set result label
           uses: openlibing/pr-label-action@v1.0.0

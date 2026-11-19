@@ -33,7 +33,7 @@ jobs:
   JOB_Compile:
     name: Compile
     select: selected_by_default
-    runs-on: [self-hosted, os=euler, arch=arm64, type=pr, flavor=large]
+    runs-on: [self-hosted, os=euler, arch=arm64, type=pr, flavor=2xlarge]
     container:
       image: ${{ inputs.docker_img }}
     steps:
