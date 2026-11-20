@@ -57,6 +57,7 @@ velox_add_library(
   SelectiveStructColumnReader.cpp
   SortingWriter.cpp
   SortingWriter.h
+  SparkDateTimeRebase.cpp
   Throttler.cpp
   TypeUtils.cpp
   TypeWithId.cpp

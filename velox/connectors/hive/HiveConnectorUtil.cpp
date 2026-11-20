@@ -637,6 +637,29 @@ void configureRowReaderOptions(
   rowReaderOptions.setMetadataFilter(std::move(metadataFilter));
   rowReaderOptions.setRequestedType(rowType);
   rowReaderOptions.range(hiveSplit->start, hiveSplit->length);
+  const auto tableFormat = hiveSplit->customSplitInfo.find("table_format");
+  const bool iceberg = tableFormat != hiveSplit->customSplitInfo.end() &&
+      tableFormat->second == "hive-iceberg";
+  // Iceberg datetime values are proleptic by the table format specification.
+  if (sessionProperties &&
+      sessionProperties->get<bool>(
+          dwio::common::kSparkDateTimeRebaseEnabled, false) &&
+      !iceberg &&
+      (hiveSplit->fileFormat == dwio::common::FileFormat::PARQUET ||
+       hiveSplit->fileFormat == dwio::common::FileFormat::ORC)) {
+    const auto rebaseMode = [&](const char* key) {
+      const auto mode = hiveSplit->customSplitInfo.find(key);
+      return dwio::common::sparkRebaseMode(
+          mode == hiveSplit->customSplitInfo.end()
+              ? sessionProperties->get<std::string>(key, "EXCEPTION")
+              : mode->second);
+    };
+    rowReaderOptions.setSparkRebaseOptions(dwio::common::SparkRebaseOptions{
+        rebaseMode(dwio::common::kSparkDateTimeRebaseMode),
+        rebaseMode(dwio::common::kSparkInt96RebaseMode)});
+  } else {
+    rowReaderOptions.setSparkRebaseOptions(std::nullopt);
+  }
   if (hiveConfig && sessionProperties) {
     rowReaderOptions.setTimestampPrecision(static_cast<TimestampPrecision>(
         hiveConfig->readTimestampUnit(sessionProperties)));
@@ -847,12 +870,23 @@ double getPrestoSampleRate(
 
 } // namespace
 
+bool hasSparkRebaseType(const core::ITypedExpr& expr) {
+  if (dwio::common::isSparkRebaseType(*expr.type())) {
+    return true;
+  }
+  return std::any_of(
+      expr.inputs().begin(), expr.inputs().end(), [](const auto& input) {
+        return hasSparkRebaseType(*input);
+      });
+}
+
 core::TypedExprPtr extractFiltersFromRemainingFilter(
     const core::TypedExprPtr& expr,
     core::ExpressionEvaluator* evaluator,
     bool negated,
     SubfieldFilters& filters,
-    double& sampleRate) {
+    double& sampleRate,
+    bool keepSparkDatetimeFilters) {
   auto* call = dynamic_cast<const core::CallTypedExpr*>(expr.get());
   if (call == nullptr) {
     return expr;
@@ -860,9 +894,11 @@ core::TypedExprPtr extractFiltersFromRemainingFilter(
   common::Filter* oldFilter = nullptr;
   try {
     common::Subfield subfield;
-    if (auto filter = exec::ExprToSubfieldFilterParser::getInstance()
-                          ->leafCallToSubfieldFilter(
-                              *call, subfield, evaluator, negated)) {
+    auto filter = keepSparkDatetimeFilters && hasSparkRebaseType(*call)
+        ? nullptr
+        : exec::ExprToSubfieldFilterParser::getInstance()
+              ->leafCallToSubfieldFilter(*call, subfield, evaluator, negated);
+    if (filter) {
       if (auto it = filters.find(subfield); it != filters.end()) {
         oldFilter = it->second.get();
         filter = filter->mergeWith(oldFilter);
@@ -880,16 +916,31 @@ core::TypedExprPtr extractFiltersFromRemainingFilter(
 
   if (isNotExpr(expr, call, evaluator)) {
     auto inner = extractFiltersFromRemainingFilter(
-        call->inputs()[0], evaluator, !negated, filters, sampleRate);
+        call->inputs()[0],
+        evaluator,
+        !negated,
+        filters,
+        sampleRate,
+        keepSparkDatetimeFilters);
     return inner ? replaceInputs(call, {inner}) : nullptr;
   }
 
   if ((call->name() == "and" && !negated) ||
       (call->name() == "or" && negated)) {
     auto lhs = extractFiltersFromRemainingFilter(
-        call->inputs()[0], evaluator, negated, filters, sampleRate);
+        call->inputs()[0],
+        evaluator,
+        negated,
+        filters,
+        sampleRate,
+        keepSparkDatetimeFilters);
     auto rhs = extractFiltersFromRemainingFilter(
-        call->inputs()[1], evaluator, negated, filters, sampleRate);
+        call->inputs()[1],
+        evaluator,
+        negated,
+        filters,
+        sampleRate,
+        keepSparkDatetimeFilters);
     if (!lhs) {
       return rhs;
     }

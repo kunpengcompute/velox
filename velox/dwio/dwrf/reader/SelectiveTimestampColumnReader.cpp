@@ -28,7 +28,14 @@ SelectiveTimestampColumnReader::SelectiveTimestampColumnReader(
     common::ScanSpec& scanSpec)
     : SelectiveColumnReader(fileType->type(), fileType, params, scanSpec),
       precision_(
-          params.stripeStreams().rowReaderOptions().timestampPrecision()) {
+          params.stripeStreams().rowReaderOptions().timestampPrecision()),
+      timestampRebase_(params.sparkDateTimeRebase()) {
+  if (timestampRebase_.enabled()) {
+    timestampRebase_.timeZone = params.stripeStreams().orcWriterTimezone();
+    const auto options = sparkOrcTimestampOptions(timestampRebase_.timeZone);
+    baseSeconds_ = options.baseSeconds;
+    timestampRebase_.adjustOrcTimezone = options.adjustTimezone;
+  }
   EncodingKey encodingKey{fileType_->id(), params.flatMapContext().sequence};
   auto& stripe = params.stripeStreams();
   version_ = convertRleVersion(stripe.getEncoding(encodingKey).kind());
@@ -146,8 +153,10 @@ void SelectiveTimestampColumnReader::readHelper(
           nanos *= 10;
         }
       }
-      auto seconds = secondsData[i] + EPOCH_OFFSET;
-      if (seconds < 0 && nanos != 0) {
+      auto seconds = secondsData[i] + baseSeconds_;
+      // ORC Java corrects negative timestamps after converting nanos to millis.
+      if (seconds < 0 &&
+          nanos >= (timestampRebase_.enabled() ? 1'000'000 : 1)) {
         seconds -= 1;
       }
       switch (precision_) {
@@ -261,6 +270,9 @@ void SelectiveTimestampColumnReader::getValues(
     const RowSet& rows,
     VectorPtr* result) {
   getFlatValues<Timestamp, Timestamp>(rows, result, fileType_->type(), true);
+  if (timestampRebase_.enabled()) {
+    timestampRebase_.rebaseTimestamps(*result);
+  }
 }
 
 } // namespace facebook::velox::dwrf

@@ -132,12 +132,16 @@ HiveDataSource::HiveDataSource(
     filters_.emplace(k.clone(), v->clone());
   }
   double sampleRate = 1;
+  const auto* session = connectorQueryCtx_->sessionProperties();
+  const bool keepSparkDatetimeFilters = session &&
+      session->get<bool>(dwio::common::kSparkDateTimeRebaseEnabled, false);
   auto remainingFilter = extractFiltersFromRemainingFilter(
       hiveTableHandle_->remainingFilter(),
       expressionEvaluator_,
       false,
       filters_,
-      sampleRate);
+      sampleRate,
+      keepSparkDatetimeFilters);
   if (sampleRate != 1) {
     randomSkip_ = std::make_shared<random::RandomSkipTracker>(sampleRate);
   }
@@ -198,7 +202,9 @@ HiveDataSource::HiveDataSource(
       hiveConfig_->readStatsBasedFilterReorderDisabled(
           connectorQueryCtx_->sessionProperties()),
       pool_);
-  if (remainingFilter) {
+  // File statistics are stored in the writer's calendar.
+  if (remainingFilter &&
+      !(keepSparkDatetimeFilters && hasSparkRebaseType(*remainingFilter))) {
     metadataFilter_ = std::make_shared<common::MetadataFilter>(
         *scanSpec_, *remainingFilter, expressionEvaluator_);
   }

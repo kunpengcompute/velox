@@ -179,6 +179,10 @@ class SelectiveColumnReader {
   /// last 'read().
   virtual void getValues(const RowSet& rows, VectorPtr* result) = 0;
 
+  virtual bool needsSparkDateRebase() const {
+    return false;
+  }
+
   // Returns the rows that were selected/visited by the last
   // read(). If 'this' has no filter, returns 'rows' passed to last
   // read().

@@ -657,6 +657,37 @@ TEST_P(HashTableTest, clearBeforeInsert) {
   }
 }
 
+TEST_P(HashTableTest, taperHashUnknownKey) {
+  std::vector<std::unique_ptr<VectorHasher>> hashers;
+  hashers.push_back(std::make_unique<VectorHasher>(UNKNOWN(), 0));
+  hashers.push_back(std::make_unique<VectorHasher>(BIGINT(), 1));
+  auto table = HashTable<false>::createForAggregation(
+      std::move(hashers), {}, pool(), /*enableTaper=*/true);
+  ASSERT_EQ(table->hashMode(), BaseHashTable::HashMode::kTaperHash);
+
+  auto input = makeRowVector({
+      BaseVector::createNullConstant(UNKNOWN(), 4, pool()),
+      makeFlatVector<int64_t>({11, 22, 11, 22}),
+  });
+  SelectivityVector rows(input->size());
+  HashLookup lookup(table->hashers());
+  constexpr auto kNoSpill = BaseHashTable::kNoSpillInputStartPartitionBit;
+  for (int batch = 0; batch < 2; ++batch) {
+    table->prepareForGroupProbe(lookup, input, rows, kNoSpill);
+    // Force both distinct BIGINT keys to reach candidate key comparison.
+    for (auto row : lookup.rows) {
+      lookup.hashes[row] = 0;
+    }
+    table->groupProbe(lookup, kNoSpill);
+
+    ASSERT_EQ(table->numDistinct(), 2);
+    ASSERT_EQ(lookup.newGroups.size(), batch == 0 ? 2 : 0);
+    ASSERT_EQ(lookup.hits[0], lookup.hits[2]);
+    ASSERT_EQ(lookup.hits[1], lookup.hits[3]);
+    ASSERT_NE(lookup.hits[0], lookup.hits[1]);
+  }
+}
+
 TEST_P(HashTableTest, clearAfterInsert) {
   const auto rowType =
       ROW({"a", "b", "c", "d"}, {BIGINT(), BIGINT(), BIGINT(), BIGINT()});

@@ -104,12 +104,15 @@ std::unique_ptr<dwio::common::BufferedInput> createBufferedInput(
     std::shared_ptr<io::IoStatistics> ioStats,
     folly::Executor* executor);
 
+bool hasSparkRebaseType(const core::ITypedExpr& expr);
+
 core::TypedExprPtr extractFiltersFromRemainingFilter(
     const core::TypedExprPtr& expr,
     core::ExpressionEvaluator* evaluator,
     bool negated,
     SubfieldFilters& filters,
-    double& sampleRate);
+    double& sampleRate,
+    bool keepSparkDatetimeFilters = false);
 
 /// Updates the file format's WriteOptions based on the HiveConfig.
 void updateWriterOptionsFromHiveConfig(

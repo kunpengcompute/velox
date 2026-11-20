@@ -110,6 +110,14 @@ class StripeStreams {
   /// Get row reader options
   virtual const dwio::common::RowReaderOptions& rowReaderOptions() const = 0;
 
+  virtual bool orcUsesProlepticGregorian() const {
+    return false;
+  }
+
+  virtual std::string orcWriterTimezone() const {
+    return {};
+  }
+
   /// Get the encoding for the given column for this stripe.
   virtual const proto::ColumnEncoding& getEncoding(
       const EncodingKey&) const = 0;
@@ -251,6 +259,21 @@ class StripeStreamsImpl : public StripeStreamsBase {
 
   const dwio::common::RowReaderOptions& rowReaderOptions() const override {
     return opts_;
+  }
+
+  bool orcUsesProlepticGregorian() const override {
+    return format() == DwrfFormat::kOrc &&
+        readState_->readerBase->footer().getOrcPtr()->calendar() ==
+        proto::orc::PROLEPTIC_GREGORIAN;
+  }
+
+  std::string orcWriterTimezone() const override {
+    // The ORC writerTimezone and DWRF encryptionGroups fields share the
+    // same wire number. This reader decodes both into the DWRF StripeFooter.
+    const auto& footer = *readState_->stripeMetadata->footer;
+    return format() == DwrfFormat::kOrc && footer.encryptiongroups_size() > 0
+        ? footer.encryptiongroups(0)
+        : std::string{};
   }
 
   const proto::ColumnEncoding& getEncoding(

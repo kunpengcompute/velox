@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/dwio/common/IntCodecCommon.h"
 #include "velox/dwio/common/SelectiveColumnReaderInternal.h"
 #include "velox/dwio/dwrf/common/DecoderUtil.h"
 #include "velox/dwio/dwrf/reader/DwrfData.h"
@@ -52,6 +53,8 @@ class SelectiveTimestampColumnReader
       const uint64_t* rawNulls);
 
   const TimestampPrecision precision_;
+  dwio::common::SparkDateTimeRebase timestampRebase_;
+  int64_t baseSeconds_{dwio::common::EPOCH_OFFSET};
 
   std::unique_ptr<dwio::common::IntDecoder</*isSigned*/ true>> seconds_;
   std::unique_ptr<dwio::common::IntDecoder</*isSigned*/ false>> nano_;

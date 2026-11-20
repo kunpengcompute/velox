@@ -154,6 +154,22 @@ void ColumnLoader::loadInternal(
        },
        structReader_});
   raw_vector<vector_size_t> selectedRows;
+  if (hook && fieldReader_->needsSparkDateRebase()) {
+    // Aggregate hooks otherwise consume decoder values before getValues.
+    auto effectiveRows =
+        read(structReader_, fieldReader_, version_, rows, selectedRows, nullptr);
+    VectorPtr dates;
+    fieldReader_->getValues(effectiveRows, &dates);
+    auto* values = dates->asUnchecked<SimpleVector<int32_t>>();
+    for (vector_size_t i = 0; i < dates->size(); ++i) {
+      if (!dates->isNullAt(i)) {
+        hook->addValueTyped(i, values->valueAt(i));
+      } else if (hook->acceptsNulls()) {
+        hook->addNull(i);
+      }
+    }
+    return;
+  }
   auto effectiveRows =
       read(structReader_, fieldReader_, version_, rows, selectedRows, hook);
   if (!hook) {

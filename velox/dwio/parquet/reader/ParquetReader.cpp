@@ -26,6 +26,37 @@ namespace facebook::velox::parquet {
 
 namespace {
 
+dwio::common::SparkDateTimeRebase sparkFileRebase(
+    const thrift::FileMetaData& metadata,
+    const std::optional<dwio::common::SparkRebaseOptions>& options,
+    bool isInt96) {
+  using dwio::common::SparkRebaseMode;
+  if (!options) {
+    return {};
+  }
+  auto lookup = [&](std::string_view key) -> const std::string* {
+    for (const auto& entry : metadata.key_value_metadata) {
+      if (entry.key == key && entry.__isset.value) {
+        return &entry.value;
+      }
+    }
+    return nullptr;
+  };
+  auto mode = isInt96 ? options->int96 : options->dateTime;
+  if (const auto* version = lookup("org.apache.spark.version")) {
+    const auto* legacy = lookup(
+        isInt96 ? "org.apache.spark.legacyINT96"
+                : "org.apache.spark.legacyDateTime");
+    mode = *version < (isInt96 ? "3.1.0" : "3.0.0") || legacy
+        ? SparkRebaseMode::kLegacy
+        : SparkRebaseMode::kCorrected;
+  }
+  const auto* zone = mode == SparkRebaseMode::kLegacy
+      ? lookup("org.apache.spark.timeZone")
+      : nullptr;
+  return {mode, zone ? *zone : std::string{}};
+}
+
 bool isParquetReservedKeyword(
     std::string name,
     uint32_t parentSchemaIdx,
@@ -980,7 +1011,15 @@ class ParquetRowReader::Impl {
         columnReaderStats_,
         readerBase_->fileMetaData(),
         readerBase->sessionTimezone(),
-        options_.timestampPrecision());
+        options_.timestampPrecision(),
+        sparkFileRebase(
+            readerBase_->thriftFileMetaData(),
+            options_.sparkRebaseOptions(),
+            false),
+        sparkFileRebase(
+            readerBase_->thriftFileMetaData(),
+            options_.sparkRebaseOptions(),
+            true));
     requestedType_ = options_.requestedType() ? options_.requestedType()
                                               : readerBase_->schema();
     columnReader_ = ParquetColumnReader::build(

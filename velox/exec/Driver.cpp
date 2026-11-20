@@ -285,7 +285,7 @@ void Driver::pushdownFilters(int operatorIndex) {
       if (i == 0) {
         // Source operator.
         VELOX_CHECK(
-            prevOp->canAddDynamicFilter(),
+            prevOp->canAddDynamicFilterOnChannel(channel),
             "Cannot push down dynamic filters produced by {}",
             op->toString());
         prevOp->addDynamicFilter(planNodeId, channel, entry.second);
@@ -299,7 +299,7 @@ void Driver::pushdownFilters(int operatorIndex) {
       if (!inputChannel.has_value()) {
         // Filter channel is not an identity projection.
         VELOX_CHECK(
-            prevOp->canAddDynamicFilter(),
+            prevOp->canAddDynamicFilterOnChannel(channel),
             "Cannot push down dynamic filters produced by {}",
             op->toString());
         prevOp->addDynamicFilter(planNodeId, channel, entry.second);
@@ -908,7 +908,7 @@ std::unordered_set<column_index_t> Driver::canPushdownFilters(
 
       if (j == 0) {
         // Source operator.
-        if (prevOp->canAddDynamicFilter()) {
+        if (prevOp->canAddDynamicFilterOnChannel(channel)) {
           supportedChannels.emplace(channels[i]);
         }
         break;
@@ -919,7 +919,7 @@ std::unordered_set<column_index_t> Driver::canPushdownFilters(
           getIdentityProjection(identityProjections, channel);
       if (!inputChannel.has_value()) {
         // Filter channel is not an identity projection.
-        if (prevOp->canAddDynamicFilter()) {
+        if (prevOp->canAddDynamicFilterOnChannel(channel)) {
           supportedChannels.emplace(channels[i]);
         }
         break;
