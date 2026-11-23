@@ -52,13 +52,15 @@ struct SparkRebaseFunctions {
   std::function<void(bool, int32_t*, size_t)> dates;
   std::function<void(const std::string&, bool, bool, bool, int64_t*, size_t)>
       timestamps;
-  std::function<SparkOrcTimestampOptions(const std::string&)> orcTimestampOptions;
+  std::function<SparkOrcTimestampOptions(const std::string&)>
+      orcTimestampOptions;
 };
 
 void registerSparkRebaseFunctions(SparkRebaseFunctions functions);
 void unregisterSparkRebaseFunctions();
 bool hasSparkRebaseFunctions();
-SparkOrcTimestampOptions sparkOrcTimestampOptions(const std::string& writerZone);
+SparkOrcTimestampOptions sparkOrcTimestampOptions(
+    const std::string& writerZone);
 
 struct SparkDateTimeRebase {
   SparkRebaseMode mode{SparkRebaseMode::kCorrected};

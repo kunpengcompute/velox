@@ -34,8 +34,9 @@ class SelectiveIntegerColumnReader : public SelectiveColumnReader {
             std::move(fileType),
             params,
             scanSpec),
-        dateRebase_(requestedType->isDate() ? params.sparkDateTimeRebase()
-                                            : SparkDateTimeRebase{}) {}
+        dateRebase_(
+            requestedType->isDate() ? params.sparkDateTimeRebase()
+                                    : SparkDateTimeRebase{}) {}
 
   void getValues(const RowSet& rows, VectorPtr* result) override {
     getIntValues(rows, requestedType_, result);
