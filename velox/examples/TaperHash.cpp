@@ -181,7 +181,7 @@ int main(int argc, char** argv) {
     iterationNum = std::stoi(argv[2]);
   }
 
-  memory::MemoryManager::Options options;
+  memory::MemoryManagerOptions options;
   options.alignment = 64;
   options.allocatorCapacity = 8 * kGB;
   memory::MemoryManager manager{options};
