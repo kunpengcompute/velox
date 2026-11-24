@@ -1489,6 +1489,88 @@ std::shared_ptr<const OpaqueType> OPAQUE() {
   return OpaqueType::create<Class>();
 }
 
+#define VELOX_DYNAMIC_NUMERIC_TYPE_DISPATCH(TEMPLATE_FUNC, typeKind, ...)     \
+  [&]() {                                                                     \
+    switch (typeKind) {                                                       \
+      case ::facebook::velox::TypeKind::BOOLEAN: {                            \
+        return TEMPLATE_FUNC<::facebook::velox::TypeKind::BOOLEAN>(           \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::INTEGER: {                            \
+        return TEMPLATE_FUNC<::facebook::velox::TypeKind::INTEGER>(           \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::TINYINT: {                            \
+        return TEMPLATE_FUNC<::facebook::velox::TypeKind::TINYINT>(           \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::SMALLINT: {                           \
+        return TEMPLATE_FUNC<::facebook::velox::TypeKind::SMALLINT>(          \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::BIGINT: {                             \
+        return TEMPLATE_FUNC<::facebook::velox::TypeKind::BIGINT>(            \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::HUGEINT: {                            \
+        return TEMPLATE_FUNC<::facebook::velox::TypeKind::HUGEINT>(           \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::REAL: {                               \
+        return TEMPLATE_FUNC<::facebook::velox::TypeKind::REAL>(__VA_ARGS__); \
+      }                                                                       \
+      case ::facebook::velox::TypeKind::DOUBLE: {                             \
+        return TEMPLATE_FUNC<::facebook::velox::TypeKind::DOUBLE>(            \
+            __VA_ARGS__);                                                     \
+      }                                                                       \
+      default:                                                                \
+        VELOX_FAIL(                                                           \
+            "not a numeric type! kind: {}", mapTypeKindToName(typeKind));     \
+    }                                                                         \
+  }()
+
+#define VELOX_DYNAMIC_NUMERIC_TYPE_DISPATCH_ALL(                          \
+    TEMPLATE_FUNC, T, typeKind, ...)                                      \
+  [&]() {                                                                 \
+    switch (typeKind) {                                                   \
+      case ::facebook::velox::TypeKind::BOOLEAN: {                        \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::BOOLEAN>(    \
+            __VA_ARGS__);                                                 \
+      }                                                                   \
+      case ::facebook::velox::TypeKind::INTEGER: {                        \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::INTEGER>(    \
+            __VA_ARGS__);                                                 \
+      }                                                                   \
+      case ::facebook::velox::TypeKind::TINYINT: {                        \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::TINYINT>(    \
+            __VA_ARGS__);                                                 \
+      }                                                                   \
+      case ::facebook::velox::TypeKind::SMALLINT: {                       \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::SMALLINT>(   \
+            __VA_ARGS__);                                                 \
+      }                                                                   \
+      case ::facebook::velox::TypeKind::BIGINT: {                         \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::BIGINT>(     \
+            __VA_ARGS__);                                                 \
+      }                                                                   \
+      case ::facebook::velox::TypeKind::HUGEINT: {                        \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::HUGEINT>(    \
+            __VA_ARGS__);                                                 \
+      }                                                                   \
+      case ::facebook::velox::TypeKind::REAL: {                           \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::REAL>(       \
+            __VA_ARGS__);                                                 \
+      }                                                                   \
+      case ::facebook::velox::TypeKind::DOUBLE: {                         \
+        return TEMPLATE_FUNC<T, ::facebook::velox::TypeKind::DOUBLE>(     \
+            __VA_ARGS__);                                                 \
+      }                                                                   \
+      default:                                                            \
+        VELOX_FAIL(                                                       \
+            "not a numeric type! kind: {}", mapTypeKindToName(typeKind)); \
+    }                                                                     \
+  }()
+
 #define VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(TEMPLATE_FUNC, typeKind, ...)      \
   [&]() {                                                                     \
     switch (typeKind) {                                                       \

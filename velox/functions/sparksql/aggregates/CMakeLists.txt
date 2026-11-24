@@ -19,13 +19,15 @@ velox_add_library(
   CentralMomentsAggregate.cpp
   CollectListAggregate.cpp
   CollectSetAggregate.cpp
+  CountAggregate.cpp
   FirstLastAggregate.cpp
   MinMaxAggregate.cpp
   MinMaxByAggregate.cpp
   ModeAggregate.cpp
   Register.cpp
   RegrReplacementAggregate.cpp
-  SumAggregate.cpp)
+  SumAggregate.cpp
+)
 
 velox_link_libraries(
   velox_functions_spark_aggregates
@@ -33,8 +35,9 @@ velox_link_libraries(
   velox_exec
   velox_expression_functions
   velox_aggregates
-  velox_vector)
+  velox_vector
+)
 
 if(${VELOX_BUILD_TESTING})
-  add_subdirectory(tests)
+    add_subdirectory(tests)
 endif()

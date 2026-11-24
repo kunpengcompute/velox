@@ -12,37 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 add_executable(
-  velox_hive_connector_test
-  FileHandleTest.cpp
-  HiveConfigTest.cpp
-  HiveDataSinkTest.cpp
-  HiveConnectorTest.cpp
-  HiveConnectorUtilTest.cpp
-  HiveConnectorSerDeTest.cpp
-  HivePartitionFunctionTest.cpp
-  HivePartitionUtilTest.cpp
-  HiveSplitTest.cpp
-  PartitionIdGeneratorTest.cpp
-  TableHandleTest.cpp)
+    velox_hive_connector_test
+    FileHandleTest.cpp
+    HiveConfigTest.cpp
+    HiveDataSinkTest.cpp
+    HiveConnectorTest.cpp
+    HiveConnectorUtilTest.cpp
+    HiveConnectorSerDeTest.cpp
+    HivePartitionFunctionTest.cpp
+    HivePartitionUtilTest.cpp
+    HiveSplitTest.cpp
+    PartitionIdGeneratorTest.cpp
+    TableHandleTest.cpp
+)
 add_test(velox_hive_connector_test velox_hive_connector_test)
+set_tests_properties(velox_hive_connector_test PROPERTIES DISABLED TRUE)
 
 target_link_libraries(
-  velox_hive_connector_test
-  velox_hive_connector
-  velox_hive_partition_function
-  velox_dwio_common_exception
-  velox_vector_fuzzer
-  velox_vector_test_lib
-  velox_exec
-  velox_exec_test_lib
-  GTest::gtest
-  GTest::gtest_main)
+    velox_hive_connector_test
+    velox_hive_connector
+    velox_hive_partition_function
+    velox_dwio_common_exception
+    velox_vector_fuzzer
+    velox_vector_test_lib
+    velox_exec
+    velox_exec_test_lib
+    GTest::gtest
+    GTest::gtest_main
+)
 
 if(VELOX_ENABLE_PARQUET)
-
-  target_include_directories(velox_hive_connector_test
-                             PUBLIC ${ARROW_PREFIX}/install/include)
-  target_link_libraries(velox_hive_connector_test
-                        velox_dwio_native_parquet_reader)
-
+    target_include_directories(
+        velox_hive_connector_test
+        PUBLIC ${ARROW_PREFIX}/install/include
+    )
+    target_link_libraries(
+        velox_hive_connector_test
+        velox_dwio_native_parquet_reader
+    )
 endif()

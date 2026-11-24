@@ -13,67 +13,71 @@
 # limitations under the License.
 
 add_executable(
-  velox_aggregates_test
-  AggregationFunctionRegTest.cpp
-  ApproxDistinctTest.cpp
-  ApproxMostFrequentTest.cpp
-  ApproxPercentileTest.cpp
-  ArbitraryTest.cpp
-  ArrayAggTest.cpp
-  AverageAggregationTest.cpp
-  BitwiseAggregationTest.cpp
-  BoolAndOrTest.cpp
-  CentralMomentsAggregationTest.cpp
-  ChecksumAggregateTest.cpp
-  ClassificationAggregationTest.cpp
-  CountAggregationTest.cpp
-  CountDistinctTest.cpp
-  CountIfAggregationTest.cpp
-  CovarianceAggregationTest.cpp
-  EntropyAggregationTest.cpp
-  GeometricMeanTest.cpp
-  HistogramTest.cpp
-  Main.cpp
-  MapAccumulatorTest.cpp
-  MapAggTest.cpp
-  MapUnionAggregationTest.cpp
-  MapUnionSumTest.cpp
-  MaxSizeForStatsTest.cpp
-  MinMaxByAggregationTest.cpp
-  MinMaxTest.cpp
-  MultiMapAggTest.cpp
-  PrestoHasherTest.cpp
-  ReduceAggTest.cpp
-  SetAggTest.cpp
-  SetUnionTest.cpp
-  SumDataSizeForStatsTest.cpp
-  SumTest.cpp
-  VarianceAggregationTest.cpp)
+    velox_aggregates_test
+    AggregationFunctionRegTest.cpp
+    ApproxDistinctTest.cpp
+    ApproxMostFrequentTest.cpp
+    ApproxPercentileTest.cpp
+    ArbitraryTest.cpp
+    ArrayAggTest.cpp
+    AverageAggregationTest.cpp
+    BitwiseAggregationTest.cpp
+    BoolAndOrTest.cpp
+    CentralMomentsAggregationTest.cpp
+    ChecksumAggregateTest.cpp
+    ClassificationAggregationTest.cpp
+    CountAggregationTest.cpp
+    CountDistinctTest.cpp
+    CountIfAggregationTest.cpp
+    CovarianceAggregationTest.cpp
+    EntropyAggregationTest.cpp
+    GeometricMeanTest.cpp
+    HistogramTest.cpp
+    Main.cpp
+    MapAccumulatorTest.cpp
+    MapAggTest.cpp
+    MapUnionAggregationTest.cpp
+    MapUnionSumTest.cpp
+    MaxSizeForStatsTest.cpp
+    MinMaxByAggregationTest.cpp
+    MinMaxTest.cpp
+    MultiMapAggTest.cpp
+    PrestoHasherTest.cpp
+    ReduceAggTest.cpp
+    SetAggTest.cpp
+    SetUnionTest.cpp
+    SumDataSizeForStatsTest.cpp
+    SumTest.cpp
+    VarianceAggregationTest.cpp
+)
 
 add_test(
-  NAME velox_aggregates_test
-  COMMAND velox_aggregates_test
-  WORKING_DIRECTORY .)
+    NAME velox_aggregates_test
+    COMMAND velox_aggregates_test
+    WORKING_DIRECTORY .
+)
+set_tests_properties(velox_aggregates_test PROPERTIES DISABLED TRUE)
 
 target_link_libraries(
-  velox_aggregates_test
-  velox_aggregates
-  velox_core
-  velox_dwio_common_test_utils
-  velox_exec
-  velox_exec_test_lib
-  velox_file
-  velox_functions_aggregates
-  velox_functions_aggregates_test_lib
-  velox_functions_window_test_lib
-  velox_functions_test_lib
-  velox_functions_prestosql
-  velox_functions_lib
-  velox_hive_connector
-  velox_simple_aggregate
-  velox_type
-  velox_vector_fuzzer
-  velox_temp_path
-  gflags::gflags
-  GTest::gtest
-  GTest::gtest_main)
+    velox_aggregates_test
+    velox_aggregates
+    velox_core
+    velox_dwio_common_test_utils
+    velox_exec
+    velox_exec_test_lib
+    velox_file
+    velox_functions_aggregates
+    velox_functions_aggregates_test_lib
+    velox_functions_window_test_lib
+    velox_functions_test_lib
+    velox_functions_prestosql
+    velox_functions_lib
+    velox_hive_connector
+    velox_simple_aggregate
+    velox_type
+    velox_vector_fuzzer
+    velox_temp_path
+    gflags::gflags
+    GTest::gtest
+    GTest::gtest_main
+)

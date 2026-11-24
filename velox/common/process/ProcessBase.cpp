@@ -124,6 +124,20 @@ bool hasBmi2() {
 #endif
 }
 
+bool hasSimd() {
+  // aarch64: NEON is the baseline SIMD ISA and is always available on the
+  // target. xsimd maps to NEON, so the bulk decode fast paths are reachable
+  // without a runtime probe or flag. This mirrors the arch-branching
+  // convention in velox/common/base/SimdUtil.h (aarch64 is the named branch).
+#if defined(__aarch64__)
+  return true;
+#else
+  // x86: delegate to hasAvx2() so existing compile-time/runtime/flag semantics
+  // are preserved bit-for-bit. x86 behavior is unchanged by this function.
+  return hasAvx2();
+#endif
+}
+
 } // namespace process
 } // namespace velox
 } // namespace facebook

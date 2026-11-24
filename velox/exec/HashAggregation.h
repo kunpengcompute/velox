@@ -15,8 +15,11 @@
  */
 #pragma once
 
+#include "velox/exec/DebugStat.h"
+#include "velox/exec/GroupAggregation.h"
 #include "velox/exec/GroupingSet.h"
 #include "velox/exec/Operator.h"
+#include "velox/expression/Expr.h"
 
 namespace facebook::velox::exec {
 
@@ -26,6 +29,12 @@ class HashAggregation : public Operator {
       int32_t operatorId,
       DriverCtx* driverCtx,
       const std::shared_ptr<const core::AggregationNode>& aggregationNode);
+
+#ifdef DEBUG_STAT_ENABLED
+  ~HashAggregation() override {
+    debugStat_.print();
+  }
+#endif
 
   void initialize() override;
 
@@ -98,7 +107,7 @@ class HashAggregation : public Operator {
   const int32_t abandonPartialAggregationMinPct_;
 
   int64_t maxPartialAggregationMemoryUsage_;
-  std::unique_ptr<GroupingSet> groupingSet_;
+  std::unique_ptr<GroupAggregation> groupingSet_;
 
   // Size of a single output row estimated using
   // 'groupingSet_->estimateRowSize()'. If spilling, this value is set to max
@@ -124,6 +133,7 @@ class HashAggregation : public Operator {
 
   // Possibly reusable output vector.
   RowVectorPtr output_;
+  DEBUG_STAT_DEFINE_MEMBER(debugStat_, HashAggregation)
 };
 
 } // namespace facebook::velox::exec

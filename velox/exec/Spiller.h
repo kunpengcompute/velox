@@ -65,6 +65,23 @@ class SpillerBase {
   // from row container starting at the offset pointed by 'startRowIter'.
   void spill(const RowContainerIterator* startRowIter);
 
+  template <typename GenericRowContainer>
+  void spill(GenericRowContainer* container) {
+    spill(nullptr, container);
+  }
+
+  template <typename GenericRowContainer>
+  void spill(
+      const RowContainerIterator& startRowIter,
+      GenericRowContainer* container) {
+    spill(&startRowIter, container);
+  }
+
+  template <typename GenericRowContainer>
+  void spill(
+      const RowContainerIterator* startRowIter,
+      GenericRowContainer* container);
+
   // Writes out all the rows collected in spillRuns_.
   virtual void runSpill(bool lastRun);
 
@@ -163,7 +180,10 @@ class SpillerBase {
   // If 'startRowIter' is not null, we prepare runs starting from the offset
   // pointed by 'startRowIter'.
   // The function returns true if it is the last spill run.
-  bool fillSpillRuns(RowContainerIterator* startRowIter = nullptr);
+  template <typename GenericRowContainer>
+  bool fillSpillRuns(
+      RowContainerIterator* startRowIter,
+      GenericRowContainer* container);
 
   void updateSpillExtractVectorTime(uint64_t timeNs);
 

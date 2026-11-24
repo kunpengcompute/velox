@@ -403,6 +403,20 @@ bool nonNullRowsFromSparse(
       nulls, rows, innerRows, outerRows, resultNullBytes, tailSkip);
 }
 
+// See SelectiveColumnReader::useArmBulkPath.
+template <typename Visitor, bool hasNulls>
+bool useArmFastPath(Visitor& visitor) {
+  constexpr bool isInteger = std::is_integral_v<typename Visitor::DataType> ||
+      std::is_same_v<typename Visitor::DataType, int128_t>;
+  return !isInteger && Visitor::FilterType::deterministic &&
+      Visitor::kHasBulkPath &&
+      (std::
+           is_same_v<typename Visitor::FilterType, velox::common::AlwaysTrue> ||
+       !hasNulls || !visitor.allowNulls()) &&
+      (std::is_same_v<typename Visitor::HookType, NoHook> || !hasNulls ||
+       Visitor::HookType::kSkipNulls);
+}
+
 // See SelectiveColumnReader::useBulkPath.
 template <typename Visitor, bool hasNulls>
 bool useFastPath(Visitor& visitor) {
@@ -420,6 +434,24 @@ template <typename Visitor>
 bool useFastPath(Visitor& visitor, bool hasNulls) {
   return hasNulls ? useFastPath<Visitor, true>(visitor)
                   : useFastPath<Visitor, false>(visitor);
+}
+
+// Gate for decoder-side bulk reads that decode whole runs into the visitor's
+// output buffer and then filter/extract them with processFixedWidthRun (see
+// RleDecoderV2::bulkReadDense). Unlike useArmFastPath this does not exclude
+// integer types: the values are decoded by the decoder itself and the SIMD
+// work is the shared fixed-width filter path, so there is no integer-specific
+// decoding involved.
+template <typename Visitor, bool hasNulls>
+bool useDecoderBulkPath(Visitor& visitor) {
+  return (!std::is_same_v<typename Visitor::DataType, int128_t>) &&
+      process::hasSimd() && Visitor::FilterType::deterministic &&
+      Visitor::kHasBulkPath &&
+      (std::
+           is_same_v<typename Visitor::FilterType, velox::common::AlwaysTrue> ||
+       !hasNulls || !visitor.allowNulls()) &&
+      (std::is_same_v<typename Visitor::HookType, NoHook> || !hasNulls ||
+       Visitor::HookType::kSkipNulls);
 }
 
 // Scatters 'numValues' elements of 'data' starting at data[sourceBegin] to

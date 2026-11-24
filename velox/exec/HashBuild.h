@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "velox/exec/DebugStat.h"
 #include "velox/exec/HashJoinBridge.h"
 #include "velox/exec/HashTable.h"
 #include "velox/exec/Operator.h"
@@ -55,6 +56,12 @@ class HashBuild final : public Operator {
     kFinish = 5,
   };
   static std::string stateName(State state);
+
+#ifdef DEBUG_STAT_ENABLED
+  ~HashBuild() override {
+    debugStat_.print();
+  }
+#endif
 
   HashBuild(
       int32_t operatorId,
@@ -258,6 +265,12 @@ class HashBuild final : public Operator {
   // Temporary space for hash numbers.
   raw_vector<uint64_t> hashes_;
 
+  // Reusable scratch buffer holding row pointers returned by
+  // 'RowContainer::newRows()' on the bulk-store fast path (dense input, both
+  // for regular build input and spill restore). Sized to the current input
+  // batch and reused across batches.
+  std::vector<char*> bulkStoreRows_;
+
   // Set of active rows during addInput().
   SelectivityVector activeRows_;
 
@@ -303,6 +316,8 @@ class HashBuild final : public Operator {
 
   // Maps key channel in 'input_' to channel in key.
   folly::F14FastMap<column_index_t, column_index_t> keyChannelMap_;
+
+  DEBUG_STAT_DEFINE_MEMBER(debugStat_, HashBuild)
 };
 
 inline std::ostream& operator<<(std::ostream& os, HashBuild::State state) {

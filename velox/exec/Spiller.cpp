@@ -22,6 +22,8 @@
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/HashJoinBridge.h"
 #include "velox/exec/PrefixSort.h"
+#include "velox/exec/SpillRadixSort.h"
+#include "velox/exec/TaperHashTableWrapper.h"
 #include "velox/external/timsort/TimSort.hpp"
 
 using facebook::velox::common::testutil::TestValue;
@@ -83,7 +85,15 @@ NoRowContainerSpiller::NoRowContainerSpiller(
           spillStats) {}
 
 void SpillerBase::spill(const RowContainerIterator* startRowIter) {
+  spill(startRowIter, container_);
+}
+
+template <typename GenericRowContainer>
+void SpillerBase::spill(
+    const RowContainerIterator* startRowIter,
+    GenericRowContainer* container) {
   VELOX_CHECK(!finalized_);
+  VELOX_CHECK_NOT_NULL(container);
 
   markAllPartitionsSpilled();
 
@@ -94,15 +104,19 @@ void SpillerBase::spill(const RowContainerIterator* startRowIter) {
 
   bool lastRun{false};
   do {
-    lastRun = fillSpillRuns(&rowIter);
+    lastRun = fillSpillRuns(&rowIter, container);
     runSpill(lastRun);
   } while (!lastRun);
 
   checkEmptySpillRuns();
 }
 
-bool SpillerBase::fillSpillRuns(RowContainerIterator* iterator) {
+template <typename GenericRowContainer>
+bool SpillerBase::fillSpillRuns(
+    RowContainerIterator* iterator,
+    GenericRowContainer* container) {
   checkEmptySpillRuns();
+  VELOX_CHECK_NOT_NULL(container);
 
   bool lastRun{false};
   uint64_t execTimeNs{0};
@@ -117,7 +131,7 @@ bool SpillerBase::fillSpillRuns(RowContainerIterator* iterator) {
 
     uint64_t totalRows{0};
     for (;;) {
-      const auto numRows = container_->listRows(
+      const auto numRows = container->listRows(
           iterator, rows.size(), RowContainer::kUnlimited, rows.data());
       if (numRows == 0) {
         lastRun = true;
@@ -168,8 +182,9 @@ void SpillerBase::runSpill(bool lastRun) {
     if (spillRuns_[partition].rows.empty()) {
       continue;
     }
-    writes.push_back(memory::createAsyncMemoryReclaimTask<SpillStatus>(
-        [partition, this]() { return writeSpill(partition); }));
+    writes.push_back(
+        memory::createAsyncMemoryReclaimTask<SpillStatus>(
+            [partition, this]() { return writeSpill(partition); }));
     if ((writes.size() > 1) && executor_ != nullptr) {
       executor_->add([source = writes.back()]() { source->prepare(); });
     }
@@ -249,7 +264,15 @@ void SpillerBase::ensureSorted(SpillRun& run) {
   {
     NanosecondTimer timer(&sortTimeNs);
 
-    if (!state_.prefixSortConfig().has_value()) {
+    if (SpillRadixSort::canSort(
+            container_, state_.sortCompareFlags(), run.rows.size())) {
+      SpillRadixSort::sort(
+          container_,
+          state_.sortCompareFlags(),
+          SpillRadixSortConfig{},
+          memory::spillMemoryPool(),
+          run.rows);
+    } else if (!state_.prefixSortConfig().has_value()) {
       gfx::timsort(
           run.rows.begin(),
           run.rows.end(),
@@ -459,4 +482,10 @@ void SortOutputSpiller::runSpill(bool lastRun) {
     }
   }
 }
+
+template void SpillerBase::spill(const RowContainerIterator*, RowContainer*);
+template void SpillerBase::spill(
+    const RowContainerIterator*,
+    TaperFlatHashTableWrapper::FlatRowContainer*);
+
 } // namespace facebook::velox::exec

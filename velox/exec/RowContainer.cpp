@@ -16,7 +16,12 @@
 
 #include "velox/exec/RowContainer.h"
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include "velox/common/base/RawVector.h"
+#include "velox/common/base/SimdUtil.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/ContainerRowSerde.h"
 #include "velox/exec/Operator.h"
@@ -44,8 +49,7 @@ static int32_t typeKindSize(TypeKind kind) {
 __attribute__((__no_sanitize__("thread")))
 #endif
 #endif
-inline void
-setBit(char* bits, uint32_t idx) {
+inline void setBit(char* bits, uint32_t idx) {
   auto bitsAs8Bit = reinterpret_cast<uint8_t*>(bits);
   bitsAs8Bit[idx / 8] |= (1 << (idx % 8));
 }
@@ -191,7 +195,9 @@ RowContainer::RowContainer(
   }
   // Make offset at least sizeof pointer so that there is space for a
   // free list next pointer below the bit at 'freeFlagOffset_'.
-  offset = std::max<int32_t>(offset, sizeof(void*));
+  if (offset) {
+    offset = std::max<int32_t>(offset, sizeof(void*));
+  }
   const int32_t firstAggregateOffset = offset;
   if (!accumulators.empty()) {
     // This moves nullOffset to the start of the next byte.
@@ -282,6 +288,7 @@ RowContainer::RowContainer(
     }
   }
   rowColumnsStats_.resize(types_.size());
+  columnHasNulls_.resize(types_.size(), false);
 }
 
 RowContainer::~RowContainer() {
@@ -305,6 +312,88 @@ char* RowContainer::newRow() {
     }
   }
   return initializeRow(row, false /* reuse */);
+}
+
+void RowContainer::newRows(int32_t numRows, char** newRows) {
+  VELOX_DCHECK(mutable_, "Can't add row into an immutable row container");
+  if (numRows <= 0) {
+    return;
+  }
+
+  const int64_t stride =
+      static_cast<int64_t>(fixedRowSize_) + normalizedKeySize_;
+  // 'AllocationPool::allocateFixed' may not be able to satisfy the whole
+  // request from the current run; allocate in as few chunks as possible by
+  // querying the available bytes in the current run before each call. The
+  // pool itself takes care of starting a new run when needed, but we want to
+  // minimize the number of '::memset' / '::memcpy' calls and avoid splitting
+  // an individual row across two runs.
+  int32_t produced = 0;
+  while (produced < numRows) {
+    const int64_t remainingRows = numRows - produced;
+
+    // Figure out how many rows fit contiguously in the current run. If the
+    // current run cannot fit a row, fall back to a single-row request and
+    // let 'allocateFixed' start a new run for us. Even if the requested
+    // chunk does not fit, 'allocateFixed' will start a new run and serve the
+    // entire chunk from there, so the bulk 'memset' below still covers a
+    // contiguous range; we just waste the tail of the previous run, exactly
+    // matching the existing single-row 'newRow()' behavior.
+    int64_t chunk = remainingRows;
+    const int64_t freeBytes = rows_.testingFreeAddressableBytes();
+    if (freeBytes >= stride) {
+      const int64_t fitInCurrent = freeBytes / stride;
+      chunk = std::min<int64_t>(remainingRows, fitInCurrent);
+    } else {
+      chunk = 1;
+    }
+
+    char* base = rows_.allocateFixed(chunk * stride, alignment_);
+
+    // Initialize the entire chunk in two contiguous memory operations rather
+    // than per-row 'initializeRow' calls. This is correct because:
+    //   * memset(0) clears the nullByte region, the free flag, the row-size
+    //     field, the next-row pointer, and the per-row payload area.
+    //   * The default 'initialNulls_' content is all-zero (see ctor), so the
+    //     per-row 'memcpy(initialNulls_)' performed by 'initializeRow' is
+    //     already covered by the bulk memset for hash-join use cases.
+    //   * If a future caller configures 'initialNulls_' with non-zero bits
+    //     (e.g. for aggregation rows where some null flags default to 1) we
+    //     still need to overlay them on every row; that is handled by the
+    //     'initialNullsAllZero' branch below.
+    ::memset(base, 0, chunk * stride);
+
+    const bool hasInitialNulls = !nullOffsets_.empty();
+    bool initialNullsAllZero = true;
+    if (hasInitialNulls) {
+      for (auto b : initialNulls_) {
+        if (b != 0) {
+          initialNullsAllZero = false;
+          break;
+        }
+      }
+    }
+
+    for (int64_t i = 0; i < chunk; ++i) {
+      char* row = base + i * stride + normalizedKeySize_;
+      if (hasInitialNulls && !initialNullsAllZero) {
+        ::memcpy(
+            row + nullByte(nullOffsets_[0]),
+            initialNulls_.data(),
+            initialNulls_.size());
+      }
+      // 'memset' has already cleared 'rowSizeOffset_', 'nextOffset_' and the
+      // free flag bit, so we don't need the explicit assignments performed by
+      // 'initializeRow'.
+      newRows[produced + i] = row;
+    }
+
+    if (normalizedKeySize_) {
+      numRowsWithNormalizedKey_ += chunk;
+    }
+    numRows_ += chunk;
+    produced += chunk;
+  }
 }
 
 char* RowContainer::initializeRow(char* row, bool reuse) {
@@ -334,35 +423,53 @@ char* RowContainer::initializeRow(char* row, bool reuse) {
   return row;
 }
 
-void RowContainer::removeOrUpdateRowColumnStats(
-    const char* row,
-    bool setToNull) {
-  // Update row column stats accordingly
-  for (auto i = 0; i < types_.size(); i++) {
-    if (isNullAt(row, columnAt(i))) {
-      rowColumnsStats_[i].removeOrUpdateCellStats(0, true, setToNull);
-    } else if (types_[i]->isFixedWidth()) {
-      rowColumnsStats_[i].removeOrUpdateCellStats(
-          fixedSizeAt(i), false, setToNull);
-    } else {
-      rowColumnsStats_[i].removeOrUpdateCellStats(
-          variableSizeAt(row, i), false, setToNull);
-    }
-  }
-  invalidateMinMaxColumnStats();
-}
-
 void RowContainer::eraseRows(folly::Range<char**> rows) {
   freeRowsExtraMemory(rows, /*freeNextRowVector=*/true);
   for (auto* row : rows) {
     VELOX_CHECK(!bits::isBitSet(row, freeFlagOffset_), "Double free of row");
-    removeOrUpdateRowColumnStats(row, /*setToNull=*/false);
 
     bits::setBit(row, freeFlagOffset_);
     nextFree(row) = firstFreeRow_;
     firstFreeRow_ = row;
   }
   numFreeRows_ += rows.size();
+  // Stats are lazily materialized; an erase is a write, so invalidate the cache
+  // for the next consumer. The per-row incremental update
+  // (removeOrUpdateRowColumnStats) is no longer needed: a fresh full scan on
+  // next read will reflect the erased rows (free rows are skipped).
+  invalidateColumnStatsCache();
+}
+
+void RowContainer::eraseRowsSkippingKeys(folly::Range<char**> rows) {
+  for (auto i = keyTypes_.size(); i < types_.size(); ++i) {
+    switch (typeKinds_[i]) {
+      case TypeKind::VARCHAR:
+      case TypeKind::VARBINARY: {
+        freeVariableWidthFieldsAtColumn<StringView>(i, rows);
+        break;
+      }
+      case TypeKind::ROW:
+      case TypeKind::ARRAY:
+      case TypeKind::MAP: {
+        freeVariableWidthFieldsAtColumn<std::string_view>(i, rows);
+        break;
+      }
+      default:;
+    }
+  }
+
+  freeAggregates(rows);
+  numRows_ -= rows.size();
+  for (auto* row : rows) {
+    VELOX_CHECK(!bits::isBitSet(row, freeFlagOffset_), "Double free of row");
+
+    bits::setBit(row, freeFlagOffset_);
+    nextFree(row) = firstFreeRow_;
+    firstFreeRow_ = row;
+  }
+  numFreeRows_ += rows.size();
+  // Same lazy-stats contract as eraseRows: the per-row updater is gone.
+  invalidateColumnStatsCache();
 }
 
 int32_t RowContainer::findRows(folly::Range<char**> rows, char** result) const {
@@ -527,42 +634,66 @@ RowColumn::Stats RowColumn::Stats::merge(
 std::optional<RowColumn::Stats> RowContainer::columnStats(
     int32_t columnIndex) const {
   if (rowColumnsStats_.empty()) {
+    // Column stats have been invalidated.
     return std::nullopt;
+  }
+  if (!statsMaterialized_) {
+    recomputeColumnStats();
   }
   return rowColumnsStats_[columnIndex];
 }
 
-void RowContainer::updateColumnStats(
-    const DecodedVector& decoded,
-    vector_size_t rowIndex,
-    char* row,
-    int32_t columnIndex) {
-  if (rowColumnsStats_.empty()) {
-    // Column stats have been invalidated.
-    return;
+void RowContainer::recomputeColumnStats() const {
+  // Reset stats to a clean slate, then do a one-shot scan of all live rows.
+  // Free rows (erased but not yet reused) are skipped via the free flag.
+  for (auto& stats : rowColumnsStats_) {
+    stats = RowColumn::Stats{};
   }
 
-  auto& columnStats = rowColumnsStats_[columnIndex];
-  if (decoded.isNullAt(rowIndex)) {
-    columnStats.addNullCell();
-  } else if (types_[columnIndex]->isFixedWidth()) {
-    columnStats.addCellSize(fixedSizeAt(columnIndex));
-  } else {
-    columnStats.addCellSize(variableSizeAt(row, columnIndex));
+  const auto numAllocations = rows_.numRanges();
+  // Row stride spans allocations: normalized keys are laid out once at the
+  // front of the first numRowsWithNormalizedKey_ rows, so the stride shrinks
+  // by originalNormalizedKeySize_ after those rows are passed. 'curRowSize'
+  // must persist across allocations (mirrors listRows), not reset per range.
+  // Use originalNormalizedKeySize_ (not normalizedKeySize_, which may be 0
+  // after disableNormalizedKeys()): the already-allocated early rows were
+  // sized with the original value.
+  int32_t curRowSize = fixedRowSize_ +
+      (numRowsWithNormalizedKey_ > 0 ? originalNormalizedKeySize_ : 0);
+  int64_t normalizedKeysLeft = numRowsWithNormalizedKey_;
+  for (auto i = 0; i < numAllocations; ++i) {
+    auto range = rows_.rangeAt(i);
+    auto* data =
+        range.data() + memory::alignmentPadding(range.data(), alignment_);
+    auto limit = range.size() -
+        (reinterpret_cast<uintptr_t>(data) -
+         reinterpret_cast<uintptr_t>(range.data()));
+    int64_t row = 0;
+    while (row + curRowSize <= limit) {
+      char* rowPtr = data + row +
+          (normalizedKeysLeft > 0 ? originalNormalizedKeySize_ : 0);
+      row += curRowSize;
+      // Shrink the stride for subsequent rows once normalized keys are used up.
+      if (--normalizedKeysLeft == 0) {
+        curRowSize -= originalNormalizedKeySize_;
+      }
+      // Skip freed rows: their cell values are stale and must not be counted.
+      if (bits::isBitSet(rowPtr, freeFlagOffset_)) {
+        continue;
+      }
+      for (auto c = 0; c < types_.size(); ++c) {
+        const auto& column = rowColumns_[c];
+        if (isNullAt(rowPtr, column)) {
+          rowColumnsStats_[c].addNullCell();
+        } else if (types_[c]->isFixedWidth()) {
+          rowColumnsStats_[c].addCellSize(fixedSizeAt(c));
+        } else {
+          rowColumnsStats_[c].addCellSize(variableSizeAt(rowPtr, c));
+        }
+      }
+    }
   }
-}
-
-void RowContainer::updateColumnStats(char* row, int32_t columnIndex) {
-  const bool nullColumn = isNullAt(row, rowColumns_[columnIndex]);
-
-  auto& columnStats = rowColumnsStats_[columnIndex];
-  if (nullColumn) {
-    columnStats.addNullCell();
-  } else if (types_[columnIndex]->isFixedWidth()) {
-    columnStats.addCellSize(fixedSizeAt(columnIndex));
-  } else {
-    columnStats.addCellSize(variableSizeAt(row, columnIndex));
-  }
+  statsMaterialized_ = true;
 }
 
 void RowContainer::store(
@@ -596,7 +727,9 @@ void RowContainer::store(
         rowColumn.nullMask(),
         columnIndex);
   }
-  updateColumnStats(decoded, rowIndex, row, columnIndex);
+  // Stats are lazily materialized on first read; invalidate the cache so the
+  // next consumer sees fresh data instead of maintaining stats per-row here.
+  invalidateColumnStatsCache();
 }
 
 void RowContainer::store(
@@ -828,7 +961,16 @@ void RowContainer::storeSerializedRow(
       const auto size = storeVariableSizeAt(serialized.data() + offset, row, i);
       offset += size;
     }
-    updateColumnStats(row, i);
+  }
+  // Stats are lazily materialized on first read; a serialized row store is a
+  // write, so invalidate the cache for the next consumer.
+  invalidateColumnStatsCache();
+  // A deserialized row may carry per-column null bits in its flag bytes; record
+  // any null columns so columnHasNulls() stays correct without a full scan.
+  for (auto i = 0; i < types_.size(); ++i) {
+    if (isNullAt(row, rowColumns_[i])) {
+      columnHasNulls_[i] = true;
+    }
   }
 }
 
@@ -850,6 +992,264 @@ void RowContainer::extractString(
   values->setNoCopy(index, StringView(rawBuffer, value.size()));
 }
 
+void RowContainer::extractStringsBatch(
+    const char* const* rows,
+    folly::Range<const vector_size_t*> rowNumbers,
+    int32_t numRows,
+    int32_t offset,
+    int32_t nullByte,
+    uint8_t nullMask,
+    int32_t resultOffset,
+    FlatVector<StringView>* result,
+    bool hasNulls) {
+  auto* rawValues = result->mutableRawValues();
+  auto maxRows = numRows + resultOffset;
+  auto& nullBuffer = result->mutableNulls(maxRows);
+  auto* rawNulls = nullBuffer->asMutable<uint64_t>();
+
+  struct RowMeta {
+    const char* data;
+    uint32_t size;
+    uint8_t isMultiPiece;
+  };
+
+  static constexpr int32_t kStackLimit = 128;
+  RowMeta stackMeta[kStackLimit];
+  raw_vector<RowMeta> heapMetaVec;
+  RowMeta* meta;
+  if (numRows <= kStackLimit) {
+    meta = stackMeta;
+  } else {
+    heapMetaVec.resize(numRows);
+    meta = heapMetaVec.data();
+  }
+
+  size_t totalBytes = 0;
+  bool useRowNumbers = !rowNumbers.empty();
+
+  // Pre-set all result null bits to not-null (bit set). The null buffer from
+  // mutableNulls(setNotNull=false) is not initialized, so every index would
+  // otherwise need an explicit setNull(false). With this single word-at-a-time
+  // fill, only null rows need a setNull(true) call inside the loop.
+  bits::fillBits(
+      rawNulls, resultOffset, resultOffset + numRows, bits::kNotNull);
+
+#if defined(__ARM_NEON)
+  // ---- NEON fast path: batch 4 rows at a time ----
+  const uint32_t kInlineThreshold = StringView::kInlineSize;
+  const int32_t kNeonStride = 4;
+
+  int32_t neonStart = 0;
+  int32_t neonEnd = numRows - (numRows % kNeonStride);
+
+  // Phase 1a: batched pre-scan (4 rows per iteration)
+  for (int32_t i = neonStart; i < neonEnd; i += kNeonStride) {
+    const char *row0, *row1, *row2, *row3;
+    if (useRowNumbers) {
+      row0 = rowNumbers[i + 0] >= 0 ? rows[rowNumbers[i + 0]] : nullptr;
+      row1 = rowNumbers[i + 1] >= 0 ? rows[rowNumbers[i + 1]] : nullptr;
+      row2 = rowNumbers[i + 2] >= 0 ? rows[rowNumbers[i + 2]] : nullptr;
+      row3 = rowNumbers[i + 3] >= 0 ? rows[rowNumbers[i + 3]] : nullptr;
+    } else {
+      row0 = rows[i + 0];
+      row1 = rows[i + 1];
+      row2 = rows[i + 2];
+      row3 = rows[i + 3];
+    }
+
+    uint8_t nullBits = 0;
+    if (hasNulls) {
+      nullBits = ((row0 ? (row0[nullByte] & nullMask) : nullMask) ? 1 : 0) |
+          ((row1 ? (row1[nullByte] & nullMask) : nullMask) ? 2 : 0) |
+          ((row2 ? (row2[nullByte] & nullMask) : nullMask) ? 4 : 0) |
+          ((row3 ? (row3[nullByte] & nullMask) : nullMask) ? 8 : 0);
+    }
+    uint8_t ptrNullBits = ((row0 == nullptr) ? 1 : 0) |
+        ((row1 == nullptr) ? 2 : 0) | ((row2 == nullptr) ? 4 : 0) |
+        ((row3 == nullptr) ? 8 : 0);
+    uint8_t combinedNull = ptrNullBits | (hasNulls ? nullBits : 0);
+
+    uint32_t sizes[4];
+    for (int k = 0; k < kNeonStride; ++k) {
+      auto ri = resultOffset + i + k;
+      if (combinedNull & (1 << k)) {
+        bits::setNull(rawNulls, ri, true);
+        sizes[k] = 0;
+        meta[i + k] = {nullptr, 0, false};
+      } else {
+        const char* r = (k == 0) ? row0
+            : (k == 1)           ? row1
+            : (k == 2)           ? row2
+                                 : row3;
+        auto value = valueAt<StringView>(r, offset);
+        if (value.isInline()) {
+          rawValues[ri] = value;
+          meta[i + k] = {nullptr, 0, false};
+          sizes[k] = 0;
+        } else {
+          sizes[k] = static_cast<uint32_t>(value.size());
+          auto* header = reinterpret_cast<const HashStringAllocator::Header*>(
+                             value.data()) -
+              1;
+          bool isMultiPiece =
+              header->isContinued() || header->size() < value.size();
+          if (FOLLY_UNLIKELY(isMultiPiece)) {
+            meta[i + k] = {
+                value.data(), static_cast<uint32_t>(value.size()), true};
+          } else {
+            meta[i + k] = {
+                value.data(), static_cast<uint32_t>(value.size()), false};
+          }
+          __builtin_prefetch(value.data());
+        }
+      }
+    }
+
+    totalBytes += sizes[0] + sizes[1] + sizes[2] + sizes[3];
+  }
+
+  // Phase 1b: scalar tail
+  for (int32_t i = neonEnd; i < numRows; ++i) {
+    const char* row;
+    if (useRowNumbers) {
+      auto rowNumber = rowNumbers[i];
+      row = rowNumber >= 0 ? rows[rowNumber] : nullptr;
+    } else {
+      row = rows[i];
+    }
+    auto resultIndex = resultOffset + i;
+
+    if (row == nullptr || (hasNulls && isNullAt(row, nullByte, nullMask))) {
+      bits::setNull(rawNulls, resultIndex, true);
+      meta[i] = {nullptr, 0, false};
+    } else {
+      auto value = valueAt<StringView>(row, offset);
+
+      if (value.isInline()) {
+        rawValues[resultIndex] = value;
+        meta[i] = {nullptr, 0, false};
+      } else {
+        auto* header =
+            reinterpret_cast<const HashStringAllocator::Header*>(value.data()) -
+            1;
+        bool isMultiPiece =
+            header->isContinued() || header->size() < value.size();
+        if (FOLLY_UNLIKELY(isMultiPiece)) {
+          meta[i] = {value.data(), static_cast<uint32_t>(value.size()), true};
+        } else {
+          meta[i] = {value.data(), static_cast<uint32_t>(value.size()), false};
+        }
+        totalBytes += value.size();
+        __builtin_prefetch(value.data());
+      }
+    }
+  }
+
+#else
+  // ---- Scalar fallback (non-ARM platforms) ----
+  for (int32_t i = 0; i < numRows; ++i) {
+    const char* row;
+    if (useRowNumbers) {
+      auto rowNumber = rowNumbers[i];
+      row = rowNumber >= 0 ? rows[rowNumber] : nullptr;
+    } else {
+      row = rows[i];
+    }
+    auto resultIndex = resultOffset + i;
+
+    if (row == nullptr || (hasNulls && isNullAt(row, nullByte, nullMask))) {
+      bits::setNull(rawNulls, resultIndex, true);
+      meta[i] = {nullptr, 0, false};
+    } else {
+      auto value = valueAt<StringView>(row, offset);
+
+      if (value.isInline()) {
+        rawValues[resultIndex] = value;
+        meta[i] = {nullptr, 0, false};
+      } else {
+        auto* header =
+            reinterpret_cast<const HashStringAllocator::Header*>(value.data()) -
+            1;
+        bool isMultiPiece =
+            header->isContinued() || header->size() < value.size();
+        if (FOLLY_UNLIKELY(isMultiPiece)) {
+          meta[i] = {value.data(), static_cast<uint32_t>(value.size()), true};
+        } else {
+          meta[i] = {value.data(), static_cast<uint32_t>(value.size()), false};
+        }
+        totalBytes += value.size();
+        __builtin_prefetch(value.data());
+      }
+    }
+  }
+#endif
+
+  // Phase 2: Single allocation + batch write for all out-of-line strings.
+  if (totalBytes > 0) {
+    auto* rawBuffer = result->getRawStringBufferWithSpace(totalBytes, true);
+    size_t bufferOffset = 0;
+
+#if defined(__ARM_NEON)
+    // NEON-accelerated copy for short strings (≤32 bytes) using fixed-width
+    // load/store pairs with zero branch overhead. Multi-piece strings still
+    // require HashStringAllocator::prepareRead.
+    for (int32_t i = 0; i < numRows; ++i) {
+      if (meta[i].data == nullptr) {
+        continue;
+      }
+      auto resultIndex = resultOffset + i;
+      auto size = meta[i].size;
+      auto* dst = rawBuffer + bufferOffset;
+
+      if (FOLLY_UNLIKELY(meta[i].isMultiPiece)) {
+        auto stream = HashStringAllocator::prepareRead(
+            HashStringAllocator::headerOf(meta[i].data));
+        stream->readBytes(dst, size);
+      } else if (size <= 16 && bufferOffset + 16 <= totalBytes) {
+        // Single 128-bit load/store covers up to 16 bytes.
+        uint8x16_t chunk =
+            vld1q_u8(reinterpret_cast<const uint8_t*>(meta[i].data));
+        vst1q_u8(reinterpret_cast<uint8_t*>(dst), chunk);
+      } else if (size <= 32 && bufferOffset + 32 <= totalBytes) {
+        // Two 128-bit load/stores cover 17-32 bytes.
+        uint8x16_t lo =
+            vld1q_u8(reinterpret_cast<const uint8_t*>(meta[i].data));
+        uint8x16_t hi =
+            vld1q_u8(reinterpret_cast<const uint8_t*>(meta[i].data + 16));
+        vst1q_u8(reinterpret_cast<uint8_t*>(dst), lo);
+        vst1q_u8(reinterpret_cast<uint8_t*>(dst + 16), hi);
+      } else {
+        memcpy(dst, meta[i].data, size);
+      }
+
+      rawValues[resultIndex] = StringView(dst, size);
+      bufferOffset += size;
+    }
+#else
+    for (int32_t i = 0; i < numRows; ++i) {
+      if (meta[i].data == nullptr) {
+        continue;
+      }
+      auto resultIndex = resultOffset + i;
+      auto size = meta[i].size;
+      auto* dst = rawBuffer + bufferOffset;
+
+      if (FOLLY_UNLIKELY(meta[i].isMultiPiece)) {
+        auto stream = HashStringAllocator::prepareRead(
+            HashStringAllocator::headerOf(meta[i].data));
+        stream->readBytes(dst, size);
+      } else {
+        memcpy(dst, meta[i].data, size);
+      }
+
+      rawValues[resultIndex] = StringView(dst, size);
+      bufferOffset += size;
+    }
+#endif
+  }
+}
+
+template <DVecLayout Layout>
 void RowContainer::storeComplexType(
     const DecodedVector& decoded,
     vector_size_t index,
@@ -859,9 +1259,10 @@ void RowContainer::storeComplexType(
     int32_t nullByte,
     uint8_t nullMask,
     int32_t column) {
-  if (decoded.isNullAt(index)) {
+  if (decoded.isNullAt<Layout>(index)) {
     VELOX_DCHECK(nullMask);
     row[nullByte] |= nullMask;
+    columnHasNulls_[column] = true;
     return;
   }
   RowSizeTracker tracker(row[rowSizeOffset_], *stringAllocator_);
@@ -869,7 +1270,7 @@ void RowContainer::storeComplexType(
   auto position = stringAllocator_->newWrite(stream);
   ContainerRowSerdeOptions options{.isKey = isKey};
   ContainerRowSerde::serialize(
-      *decoded.base(), decoded.index(index), stream, options);
+      *decoded.base(), decoded.index<Layout>(index), stream, options);
   stringAllocator_->finishWrite(stream, 0);
 
   valueAt<std::string_view>(row, offset) = std::string_view(
@@ -1037,6 +1438,10 @@ void RowContainer::clear() {
 
   rowColumnsStats_.clear();
   rowColumnsStats_.resize(types_.size());
+  // After clear, stats are empty and not yet materialized; the next consumer
+  // will recompute (yielding an all-zero result over zero rows).
+  statsMaterialized_ = false;
+  std::fill(columnHasNulls_.begin(), columnHasNulls_.end(), false);
 }
 
 void RowContainer::setProbedFlag(char** rows, int32_t numRows) {
@@ -1358,4 +1763,29 @@ bool RowComparator::operator()(
   }
   return false;
 }
+
+#define INSTANTIATE_STORE_COMPLEX(LAYOUT)               \
+  template void RowContainer::storeComplexType<LAYOUT>( \
+      const DecodedVector&,                             \
+      vector_size_t,                                    \
+      bool,                                             \
+      char*,                                            \
+      int32_t,                                          \
+      int32_t,                                          \
+      uint8_t,                                          \
+      int32_t);
+
+FOREACH_VALID_LAYOUT(INSTANTIATE_STORE_COMPLEX)
+#undef INSTANTIATE_STORE_COMPLEX
+
+template void RowContainer::storeComplexType<DVecLayout::kUnknown>(
+    const DecodedVector&,
+    vector_size_t,
+    bool,
+    char*,
+    int32_t,
+    int32_t,
+    uint8_t,
+    int32_t);
+
 } // namespace facebook::velox::exec

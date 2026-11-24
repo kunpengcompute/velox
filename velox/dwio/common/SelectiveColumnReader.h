@@ -404,11 +404,28 @@ class SelectiveColumnReader {
   }
 
   /// Returns true if no filters or deterministic filters/hooks that discard
-  /// nulls. This is used at read prepare time. useFastPath() in DecoderUtil.h
-  /// is used at read time and is expected to produce the same result.
+  /// nulls. This is used at read prepare time. useFastPath() or
+  /// useArmFastPath() in DecoderUtil.h is used at read time and is expected to
+  /// produce the same result.
   bool useBulkPath() const {
     auto* filter = scanSpec_->filter();
     return hasBulkPath() && process::hasAvx2() &&
+        (!filter ||
+         (filter->isDeterministic() &&
+          (!nullsInReadRange_ || !filter->testNull()))) &&
+        (!scanSpec_->valueHook() || !nullsInReadRange_ ||
+         !scanSpec_->valueHook()->acceptsNulls());
+  }
+
+  bool useArmBulkPath() const {
+    auto* filter = scanSpec_->filter();
+    const auto typeKind = requestedType_->kind();
+    const bool shouldDisableArmBulk = requestedType_->isDecimal() ||
+        typeKind == TypeKind::BOOLEAN || typeKind == TypeKind::TINYINT ||
+        typeKind == TypeKind::SMALLINT || typeKind == TypeKind::INTEGER ||
+        typeKind == TypeKind::BIGINT || typeKind == TypeKind::HUGEINT ||
+        typeKind == TypeKind::VARCHAR || typeKind == TypeKind::VARBINARY;
+    return hasBulkPath() && !shouldDisableArmBulk &&
         (!filter ||
          (filter->isDeterministic() &&
           (!nullsInReadRange_ || !filter->testNull()))) &&

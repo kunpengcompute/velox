@@ -177,7 +177,8 @@ void HashBuild::setupTable() {
           pool());
     }
   }
-  analyzeKeys_ = table_->hashMode() != BaseHashTable::HashMode::kHash;
+  analyzeKeys_ = table_->hashMode() != BaseHashTable::HashMode::kHash &&
+      table_->hashMode() != BaseHashTable::HashMode::kTaperHash;
 }
 
 void HashBuild::setupSpiller(SpillPartition* spillPartition) {
@@ -301,6 +302,8 @@ void HashBuild::removeInputRowsForAntiJoinFilter() {
 }
 
 void HashBuild::addInput(RowVectorPtr input) {
+  DEBUG_STAT_TLS_EXPOSE_SCOPE(&debugStat_);
+  DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::BuildAddInputCalls);
   checkRunning();
   ensureInputFits(input);
 
@@ -380,11 +383,14 @@ void HashBuild::addInput(RowVectorPtr input) {
   // false for the first time we stop. We do not retain the value ids
   // since the final ones will only be known after all data is
   // received.
-  for (auto& hasher : hashers) {
-    // TODO: Load only for active rows, except if right/full outer join.
-    if (analyzeKeys_) {
-      hasher->computeValueIds(activeRows_, hashes_);
-      analyzeKeys_ = hasher->mayUseValueIds();
+  {
+    DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::BuildComputeValueIdsCalls);
+    for (auto& hasher : hashers) {
+      // TODO: Load only for active rows, except if right/full outer join.
+      if (analyzeKeys_) {
+        hasher->computeValueIds(activeRows_, hashes_);
+        analyzeKeys_ = hasher->mayUseValueIds();
+      }
     }
   }
   auto rows = table_->rows();
@@ -394,24 +400,66 @@ void HashBuild::addInput(RowVectorPtr input) {
         input->childAt(spillProbedFlagChannel_)->asFlatVector<bool>();
   }
 
-  activeRows_.applyToSelected([&](auto rowIndex) {
-    char* newRow = rows->newRow();
-    // Store the columns for each row in sequence. At probe time
-    // strings of the row will probably be in consecutive places, so
-    // reading one will prime the cache for the next.
+  // Bulk-store fast path: when the input batch is dense, i.e. no rows were
+  // deselected by null/anti-join filtering, 'activeRows_' covers the whole
+  // batch and the i-th active row maps to the i-th element of every decoded
+  // vector. In that situation we can replace the per-row 'newRow + store'
+  // driven by 'applyToSelected' with a single bulk allocation and per-column
+  // batch stores, which lets the typed 'storeNoNullsBatch /
+  // storeWithNullsBatch' template fold its dispatch out of the inner loop and
+  // process all rows in tight memcpy / assignment loops. This was originally
+  // the O1 optimization from the spill performance analysis and is now also
+  // applied to the regular (non-spill) build input. The slow path below
+  // remains the source of truth for the sparse case (some rows deselected).
+  const bool bulkStoreEligible = activeRows_.isAllSelected() &&
+      activeRows_.size() == static_cast<vector_size_t>(input->size());
+  if (bulkStoreEligible) {
+    const int32_t numRows = input->size();
+    bulkStoreRows_.resize(numRows);
+    rows->newRows(numRows, bulkStoreRows_.data());
+    auto rowsRange = folly::Range<char**>(bulkStoreRows_.data(), numRows);
     for (auto i = 0; i < hashers.size(); ++i) {
-      rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
+      rows->store(hashers[i]->decodedVector(), rowsRange, i);
     }
     for (auto i = 0; i < dependentChannels_.size(); ++i) {
-      rows->store(*decoders_[i], rowIndex, newRow, i + hashers.size());
+      rows->store(*decoders_[i], rowsRange, i + hashers.size());
     }
     if (spillProbedFlagVector != nullptr) {
-      VELOX_CHECK(!spillProbedFlagVector->isNullAt(rowIndex));
-      if (spillProbedFlagVector->valueAt(rowIndex)) {
-        rows->setProbedFlag(&newRow, 1);
+      for (vector_size_t r = 0; r < numRows; ++r) {
+        VELOX_CHECK(!spillProbedFlagVector->isNullAt(r));
+        if (spillProbedFlagVector->valueAt(r)) {
+          rows->setProbedFlag(&bulkStoreRows_[r], 1);
+        }
       }
     }
-  });
+    return;
+  }
+
+  {
+    DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::BuildStoreCalls);
+    activeRows_.applyToSelected([&](auto rowIndex) {
+      char* newRow;
+      {
+        DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::NewRow);
+        newRow = rows->newRow();
+      }
+      // Store the columns for each row in sequence. At probe time
+      // strings of the row will probably be in consecutive places, so
+      // reading one will prime the cache for the next.
+      for (auto i = 0; i < hashers.size(); ++i) {
+        rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
+      }
+      for (auto i = 0; i < dependentChannels_.size(); ++i) {
+        rows->store(*decoders_[i], rowIndex, newRow, i + hashers.size());
+      }
+      if (spillProbedFlagVector != nullptr) {
+        VELOX_CHECK(!spillProbedFlagVector->isNullAt(rowIndex));
+        if (spillProbedFlagVector->valueAt(rowIndex)) {
+          rows->setProbedFlag(&newRow, 1);
+        }
+      }
+    });
+  }
 }
 
 void HashBuild::ensureInputFits(RowVectorPtr& input) {
@@ -635,6 +683,8 @@ void HashBuild::noMoreInputInternal() {
 }
 
 bool HashBuild::finishHashBuild() {
+  DEBUG_STAT_TLS_EXPOSE_SCOPE(&debugStat_);
+  DEBUG_STAT_TLS_RECORD_SCOPE(debug::DebugStat::BuildFinishCalls);
   checkRunning();
 
   // Release the unused memory reservation before building the merged join
@@ -739,6 +789,10 @@ bool HashBuild::finishHashBuild() {
     // finished the merged table build.
     pool()->release();
   };
+
+  if (operatorCtx_->task()->numTotalDrivers() > 2) {
+    table_->setTaperEnabled(false);
+  }
 
   // TODO: Re-enable parallel join build with spilling triggered after
   //  https://github.com/facebookincubator/velox/issues/3567 is fixed.

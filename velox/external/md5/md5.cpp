@@ -152,6 +152,16 @@ namespace facebook::velox::crypto {
         bits[1] = 0;
     }
 
+    void MD5Context::reset() {
+        buf[0] = 0x67452301;
+        buf[1] = 0xefcdab89;
+        buf[2] = 0x98badcfe;
+        buf[3] = 0x10325476;
+        bits[0] = 0;
+        bits[1] = 0;
+        // in[64] is not zeroed — Add()/MD5Update() overwrites it as needed.
+    }
+
 /*
  * Update context to reflect the concatenation of another buffer full
  * of bytes.

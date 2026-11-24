@@ -20,8 +20,11 @@ DEPENDENCY_DIR=${DEPENDENCY_DIR:-$(pwd)/deps-download}
 OS_CXXFLAGS=""
 
 function run_and_time {
-  time "$@" || (echo "Failed to run $* ." ; exit 1 )
-  { echo "+ Finished running $*"; } 2> /dev/null
+  time "$@" || (
+    echo "Failed to run $* ."
+    exit 1
+  )
+  { echo "+ Finished running $*"; } 2>/dev/null
 }
 
 function prompt {
@@ -29,14 +32,14 @@ function prompt {
     while true; do
       local input="${PROMPT_ALWAYS_RESPOND:-}"
       echo -n "$(tput bold)$* [Y, n]$(tput sgr0) "
-      [[ -z "${input}" ]] && read input
-      if [[ "${input}" == "Y" || "${input}" == "y" || "${input}" == "" ]]; then
+      [[ -z ${input} ]] && read input
+      if [[ ${input} == "Y" || ${input} == "y" || ${input} == "" ]]; then
         return 0
-      elif [[ "${input}" == "N" || "${input}" == "n" ]]; then
+      elif [[ ${input} == "N" || ${input} == "n" ]]; then
         return 1
       fi
     done
-  ) 2> /dev/null
+  ) 2>/dev/null
 }
 
 function github_checkout {
@@ -44,10 +47,10 @@ function github_checkout {
   shift
   local VERSION=$1
   shift
-  local GIT_CLONE_PARAMS=$@
-  local DIRNAME=$(basename $REPO)
+  local DIRNAME
+  DIRNAME=$(basename "$REPO")
   SUDO="${SUDO:-""}"
-  cd "${DEPENDENCY_DIR}"
+  cd "${DEPENDENCY_DIR}" || return
   if [ -z "${DIRNAME}" ]; then
     echo "Failed to get repo name from ${REPO}"
     exit 1
@@ -56,9 +59,9 @@ function github_checkout {
     ${SUDO} rm -rf "${DIRNAME}"
   fi
   if [ ! -d "${DIRNAME}" ]; then
-    git clone -q -b $VERSION $GIT_CLONE_PARAMS "https://github.com/${REPO}.git"
+    git clone -q -b "$VERSION" "$@" "https://github.com/${REPO}.git"
   fi
-  cd "${DIRNAME}"
+  cd "${DIRNAME}" || return
 }
 
 # get_cxx_flags [$CPU_ARCH]
@@ -78,80 +81,94 @@ function github_checkout {
 
 function get_cxx_flags {
   local CPU_ARCH=${1:-""}
-  local OS=$(uname)
-  local MACHINE=$(uname -m)
+  local OS MACHINE CPU_CAPABILITIES
+  OS=$(uname)
+  MACHINE=$(uname -m)
 
-  if [[ -z "$CPU_ARCH" ]]; then
-   if [ "$OS" = "Darwin" ]; then
-     if [ "$MACHINE" = "arm64" ]; then
-       CPU_ARCH="arm64"
-     else # x86_64
-       local CPU_CAPABILITIES=$(sysctl -a | grep machdep.cpu.features | awk '{print tolower($0)}')
-       if [[ $CPU_CAPABILITIES =~ "avx" ]]; then
-         CPU_ARCH="avx"
-       else
-         CPU_ARCH="sse"
-       fi
-     fi
-   elif [ "$OS" = "Linux" ]; then
-     if [ "$MACHINE" = "aarch64" ]; then
-       CPU_ARCH="aarch64"
-     else # x86_64
-       local CPU_CAPABILITIES=$(cat /proc/cpuinfo | grep flags | head -n 1| awk '{print tolower($0)}')
-       if [[ $CPU_CAPABILITIES =~ "avx" ]]; then
-           CPU_ARCH="avx"
-       elif [[ $CPU_CAPABILITIES =~ "sse" ]]; then
-           CPU_ARCH="sse"
-       fi
-     fi
-   else
-     echo "Unsupported platform $OS"; exit 1;
-   fi
+  if [[ -z $CPU_ARCH ]]; then
+    if [ "$OS" = "Darwin" ]; then
+      if [ "$MACHINE" = "arm64" ]; then
+        CPU_ARCH="arm64"
+      else # x86_64
+        CPU_CAPABILITIES=$(sysctl -n machdep.cpu.features | awk '{print tolower($0)}')
+        if [[ $CPU_CAPABILITIES =~ "avx" ]]; then
+          CPU_ARCH="avx"
+        else
+          CPU_ARCH="sse"
+        fi
+      fi
+    elif [ "$OS" = "Linux" ]; then
+      if [ "$MACHINE" = "aarch64" ]; then
+        CPU_ARCH="aarch64"
+      else # x86_64
+        CPU_CAPABILITIES=$(awk '/^flags[[:space:]]*:/ {print tolower($0); exit}' /proc/cpuinfo)
+        if [[ $CPU_CAPABILITIES =~ "avx" ]]; then
+          CPU_ARCH="avx"
+        elif [[ $CPU_CAPABILITIES =~ "sse" ]]; then
+          CPU_ARCH="sse"
+        fi
+      fi
+    else
+      echo "Unsupported platform $OS"
+      exit 1
+    fi
   fi
   case $CPU_ARCH in
 
-    "arm64")
-      echo -n "-mcpu=apple-m1+crc"
+  "arm64")
+    echo -n "-mcpu=apple-m1+crc"
     ;;
 
-    "avx")
-      echo -n "-mavx2 -mfma -mavx -mf16c -mlzcnt  -mbmi2"
+  "avx")
+    echo -n "-mavx2 -mfma -mavx -mf16c -mlzcnt  -mbmi2"
     ;;
 
-    "sse")
-      echo -n "-msse4.2 "
+  "sse")
+    echo -n "-msse4.2 "
     ;;
 
-    "aarch64")
-      # Read Arm MIDR_EL1 register to detect Arm cpu.
-      # https://developer.arm.com/documentation/100616/0301/register-descriptions/aarch64-system-registers/midr-el1--main-id-register--el1
-      ARM_CPU_FILE="/sys/devices/system/cpu/cpu0/regs/identification/midr_el1"
+  "aarch64")
+    # Read Arm MIDR_EL1 register to detect Arm cpu.
+    # https://developer.arm.com/documentation/100616/0301/register-descriptions/aarch64-system-registers/midr-el1--main-id-register--el1
+    ARM_CPU_FILE="/sys/devices/system/cpu/cpu0/regs/identification/midr_el1"
 
-      # https://gitlab.arm.com/telemetry-solution/telemetry-solution/-/blob/main/data/pmu/cpu/neoverse/neoverse-n1.json#L13
-      # N1:d0c; N2:d49; V1:d40;
-      Neoverse_N1="d0c"
-      Neoverse_N2="d49"
-      Neoverse_V1="d40"
-      if [ -f "$ARM_CPU_FILE" ]; then
-        hex_ARM_CPU_DETECT=`cat $ARM_CPU_FILE`
-        # PartNum, [15:4]: The primary part number such as Neoverse N1/N2 core.
-        ARM_CPU_PRODUCT=${hex_ARM_CPU_DETECT: -4:3}
+    # The Taper SVE path is guarded by __ARM_FEATURE_SVE. Generic ARM flags
+    # otherwise omit it on CPUs not listed below. Only detect native Linux
+    # capabilities; a cross build must provide its target flags explicitly.
+    local arm_sve_extension=""
+    if [[ $OS == "Linux" && $MACHINE == "aarch64" ]] &&
+      grep -qw sve /proc/cpuinfo; then
+      arm_sve_extension="+sve"
+    fi
 
-        if [ "$ARM_CPU_PRODUCT" = "$Neoverse_N1" ]; then
-          echo -n "-mcpu=neoverse-n1 "
-        elif [ "$ARM_CPU_PRODUCT" = "$Neoverse_N2" ]; then
-          echo -n "-mcpu=neoverse-n2 "
-        elif [ "$ARM_CPU_PRODUCT" = "$Neoverse_V1" ]; then
-          echo -n "-mcpu=neoverse-v1 "
-        else
-          echo -n "-march=armv8-a+crc+crypto "
-        fi
+    # https://gitlab.arm.com/telemetry-solution/telemetry-solution/-/blob/main/data/pmu/cpu/neoverse/neoverse-n1.json#L13
+    # N1:d0c; N2:d49; V1:d40;
+    Neoverse_N1="d0c"
+    Neoverse_N2="d49"
+    Neoverse_V1="d40"
+    if [ -f "$ARM_CPU_FILE" ]; then
+      hex_ARM_CPU_DETECT=$(cat $ARM_CPU_FILE)
+      # PartNum, [15:4]: The primary part number such as Neoverse N1/N2 core.
+      ARM_CPU_PRODUCT=${hex_ARM_CPU_DETECT: -4:3}
+
+      if [ "$ARM_CPU_PRODUCT" = "$Neoverse_N1" ]; then
+        echo -n "-mcpu=neoverse-n1 "
+      elif [ "$ARM_CPU_PRODUCT" = "$Neoverse_N2" ]; then
+        echo -n "-mcpu=neoverse-n2 "
+      elif [ "$ARM_CPU_PRODUCT" = "$Neoverse_V1" ]; then
+        echo -n "-mcpu=neoverse-v1 "
       else
-        echo -n ""
+        echo -n "-march=armv8.2-a+sve+crc+crypto+nolse -mno-outline-atomics -msve-vector-bits=256 -DSVE_BITS=256"
       fi
+    elif [[ -n $arm_sve_extension ]]; then
+      echo -n "-march=armv8-a${arm_sve_extension} "
+    else
+      echo -n ""
+    fi
     ;;
   *)
     echo -n "Architecture not supported!"
+    ;;
   esac
 
 }
@@ -160,34 +177,35 @@ function wget_and_untar {
   local URL=$1
   local DIR=$2
   mkdir -p "${DEPENDENCY_DIR}"
-  pushd "${DEPENDENCY_DIR}"
+  pushd "${DEPENDENCY_DIR}" || return
   SUDO="${SUDO:-""}"
   if [ -d "${DIR}" ]; then
     if prompt "${DIR} already exists. Delete?"; then
       ${SUDO} rm -rf "${DIR}"
     else
-      popd
+      popd || return
       return
     fi
   fi
   mkdir -p "${DIR}"
-  pushd "${DIR}"
-  curl -L "${URL}" > $2.tar.gz
+  pushd "${DIR}" || return
+  curl -L "${URL}" >$2.tar.gz
   tar -xz --strip-components=1 -f $2.tar.gz
-  popd
-  popd
+  popd || return
+  popd || return
 }
 
 function cmake_install_dir {
-  pushd "${DEPENDENCY_DIR}/$1"
+  pushd "${DEPENDENCY_DIR}/$1" || return
   # remove the directory argument
   shift
-  cmake_install $@
-  popd
+  cmake_install "$@"
+  popd || return
 }
 
 function cmake_install {
-  local NAME=$(basename "$(pwd)")
+  local NAME
+  NAME=$(basename "$(pwd)")
   local BINARY_DIR=_build
   SUDO="${SUDO:-""}"
   if [ -d "${BINARY_DIR}" ]; then
@@ -199,7 +217,7 @@ function cmake_install {
   fi
 
   mkdir -p "${BINARY_DIR}"
-  COMPILER_FLAGS=$(get_cxx_flags)
+  COMPILER_FLAGS=$(get_cxx_flags "")
   # Add platform specific CXX flags if any
   COMPILER_FLAGS+=${OS_CXXFLAGS}
 
@@ -207,14 +225,16 @@ function cmake_install {
   cmake -Wno-dev -B"${BINARY_DIR}" \
     -GNinja \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-    -DCMAKE_CXX_STANDARD=17 \
+    -DCMAKE_CXX_STANDARD=20 \
     "${INSTALL_PREFIX+-DCMAKE_PREFIX_PATH=}${INSTALL_PREFIX-}" \
     "${INSTALL_PREFIX+-DCMAKE_INSTALL_PREFIX=}${INSTALL_PREFIX-}" \
     -DCMAKE_CXX_FLAGS="$COMPILER_FLAGS" \
     -DBUILD_TESTING=OFF \
     "$@"
   # Exit if the build fails.
-  cmake --build "${BINARY_DIR}" || { echo 'build failed' ; exit 1; }
+  cmake --build "${BINARY_DIR}" || {
+    echo 'build failed'
+    exit 1
+  }
   ${SUDO} cmake --install "${BINARY_DIR}"
 }
-

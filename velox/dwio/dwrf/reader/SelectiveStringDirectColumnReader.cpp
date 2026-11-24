@@ -424,8 +424,13 @@ void SelectiveStringDirectColumnReader::readWithVisitor(
       std::is_same_v<typename TVisitor::FilterType, common::AlwaysTrue> &&
       std::is_same_v<typename TVisitor::Extract, dwio::common::ExtractToReader>;
   auto nulls = nullsInReadRange_ ? nullsInReadRange_->as<uint64_t>() : nullptr;
+#if defined(__aarch64__)
+  const bool useExtractBulkPath = isExtract && useArmBulkPath();
+#else
+  const bool useExtractBulkPath = process::hasAvx2() && isExtract;
+#endif
 
-  if (process::hasAvx2() && isExtract) {
+  if (useExtractBulkPath) {
     if (nullsInReadRange_) {
       if (TVisitor::dense) {
         returnReaderNulls_ = true;

@@ -24,6 +24,7 @@ velox_add_library(
   ArrowStream.cpp
   AssignUniqueId.cpp
   ContainerRowSerde.cpp
+  DebugStat.cpp
   DistinctAggregations.cpp
   Driver.cpp
   EnforceSingleRow.cpp
@@ -80,6 +81,7 @@ velox_add_library(
   SortWindowBuild.cpp
   Spill.cpp
   SpillFile.cpp
+  SpillRadixSort.cpp
   Spiller.cpp
   StreamingAggregation.cpp
   Strings.cpp
@@ -95,7 +97,8 @@ velox_add_library(
   Window.cpp
   WindowBuild.cpp
   WindowFunction.cpp
-  WindowPartition.cpp)
+  WindowPartition.cpp
+)
 
 velox_link_libraries(
   velox_exec
@@ -108,7 +111,8 @@ velox_link_libraries(
   velox_common_base
   velox_test_util
   velox_arrow_bridge
-  velox_common_compression)
+  velox_common_compression
+)
 
 velox_add_library(velox_cursor Cursor.cpp)
 velox_link_libraries(
@@ -124,17 +128,18 @@ velox_link_libraries(
   velox_tpch_connector
   velox_presto_serializer
   velox_functions_prestosql
-  velox_aggregates)
+  velox_aggregates
+)
 
 if(${VELOX_BUILD_TESTING})
-  add_subdirectory(fuzzer)
-  add_subdirectory(tests)
+    add_subdirectory(fuzzer)
+    add_subdirectory(tests)
 elseif(${VELOX_BUILD_TEST_UTILS})
-  add_subdirectory(tests/utils)
+    add_subdirectory(tests/utils)
 endif()
 
 if(${VELOX_ENABLE_BENCHMARKS})
-  add_subdirectory(benchmarks)
+    add_subdirectory(benchmarks)
 endif()
 
 add_subdirectory(prefixsort)

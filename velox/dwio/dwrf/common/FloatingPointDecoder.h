@@ -64,7 +64,11 @@ class FloatingPointDecoder {
   template <bool hasNulls, typename Visitor>
   void readWithVisitor(const uint64_t* nulls, Visitor visitor) {
     if (std::is_same_v<TFile, TRequested> &&
+#if defined(__aarch64__)
+        dwio::common::useArmFastPath<Visitor, hasNulls>(visitor)) {
+#else
         dwio::common::useFastPath<Visitor, hasNulls>(visitor)) {
+#endif
       fastPath<hasNulls>(nulls, visitor);
       return;
     }

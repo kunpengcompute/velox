@@ -50,4 +50,11 @@ bool hasAvx2();
 /// by flag.
 bool hasBmi2();
 
+/// True if SIMD acceleration suitable for the bulk decode fast paths is
+/// available. This is the architecture-neutral counterpart to hasAvx2():
+/// on aarch64 NEON is the baseline and always available; on x86 it delegates
+/// to hasAvx2(). Use this (rather than hasAvx2()) to gate xsimd-based paths
+/// that have no raw x86 intrinsics, so the same fast paths are reached on ARM.
+bool hasSimd();
+
 } // namespace facebook::velox::process

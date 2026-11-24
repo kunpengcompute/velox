@@ -40,7 +40,18 @@ class DirectDecoder : public IntDecoder<isSigned> {
   void skipPending() final {
     const auto toSkip = this->pendingSkip_;
     this->pendingSkip_ = 0;
-    this->skipLongs(toSkip);
+    if (LIKELY(!this->useVInts_)) {
+      // Fixed-width values are the common case for ORC decimal/int streams.
+      // Skip in place without the out-of-line skipLongs call; sparse reads
+      // issue one skip per gap, so the call overhead is measurable.
+      skipBytes(
+          toSkip * this->numBytes_,
+          this->inputStream_.get(),
+          this->bufferStart_,
+          this->bufferEnd_);
+    } else {
+      this->skipLongs(toSkip);
+    }
   }
 
   template <typename T>
@@ -57,8 +68,13 @@ class DirectDecoder : public IntDecoder<isSigned> {
       bool useFastPath = true) {
     skipPending();
     if constexpr (!std::is_same_v<typename Visitor::DataType, int128_t>) {
+#if defined(__aarch64__)
+      if (useFastPath &&
+          dwio::common::useArmFastPath<Visitor, hasNulls>(visitor)) {
+#else
       if (useFastPath &&
           dwio::common::useFastPath<Visitor, hasNulls>(visitor)) {
+#endif
         fastPath<hasNulls>(nulls, visitor);
         return;
       }

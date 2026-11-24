@@ -843,8 +843,9 @@ class LikeWithRe2 final : public exec::VectorFunction {
     VELOX_CHECK(args.size() == 2 || args.size() == 3);
 
     if (!validPattern_) {
-      auto error = std::make_exception_ptr(std::invalid_argument(
-          "Escape character must be followed by '%', '_' or the escape character itself"));
+      auto error = std::make_exception_ptr(
+          std::invalid_argument(
+              "Escape character must be followed by '%', '_' or the escape character itself"));
       context.setErrors(rows, error);
       return;
     }
@@ -1803,8 +1804,8 @@ std::vector<std::string> PatternMetadata::parseSubstrings(
   std::vector<std::string> substrings;
   if (RE2::FullMatch(full, fullPattern)) {
     while (RE2::PartialMatch(full, subPattern, &cur)) {
-      substrings.push_back(cur.as_string());
-      full.set(cur.end(), full.end() - cur.end());
+      substrings.push_back(std::string(cur));
+      full = re2::StringPiece(cur.end(), full.end() - cur.end());
     }
   }
   return substrings;
@@ -2099,16 +2100,18 @@ PatternMetadata determinePatternKind(
           return PatternMetadata::prefix(
               std::string(unescapedPattern, 0, firstSubPatternLength));
         } else if (lastSubPatternKind == SubPatternKind::kLiteralString) {
-          return PatternMetadata::suffix(std::string(
-              unescapedPattern, lastSubPatternStart, lastSubPatternLength));
+          return PatternMetadata::suffix(
+              std::string(
+                  unescapedPattern, lastSubPatternStart, lastSubPatternLength));
         } else if (
             numSubPatterns == 3 &&
             firstSubPatternKind == SubPatternKind::kAnyCharsWildcard &&
             lastSubPatternKind == SubPatternKind::kAnyCharsWildcard) {
-          return PatternMetadata::substring(std::string(
-              unescapedPattern,
-              subPatternRanges[1].first,
-              subPatternRanges[1].second));
+          return PatternMetadata::substring(
+              std::string(
+                  unescapedPattern,
+                  subPatternRanges[1].first,
+                  subPatternRanges[1].second));
         }
       }
 

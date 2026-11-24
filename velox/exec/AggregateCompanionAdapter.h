@@ -101,6 +101,17 @@ struct AggregateCompanionAdapter {
 
     void extractValues(char** groups, int32_t numGroups, VectorPtr* result)
         override;
+
+    bool supportsToIntermediate() const override {
+      return fn_->supportsToIntermediate();
+    }
+
+    void toIntermediate(
+        const SelectivityVector& rows,
+        std::vector<VectorPtr>& args,
+        VectorPtr& result) const override {
+      fn_->toIntermediate(rows, args, result);
+    }
   };
 
   class MergeFunction : public AggregateCompanionFunctionBase {

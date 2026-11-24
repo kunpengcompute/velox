@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "velox/exec/DebugStat.h"
 #include "velox/exec/HashBuild.h"
 #include "velox/exec/HashPartitionFunction.h"
 #include "velox/exec/HashTable.h"
@@ -31,6 +32,12 @@ class HashProbe : public Operator {
       int32_t operatorId,
       DriverCtx* driverCtx,
       const std::shared_ptr<const core::HashJoinNode>& hashJoinNode);
+
+#ifdef DEBUG_STAT_ENABLED
+  ~HashProbe() override {
+    debugStat_.print();
+  }
+#endif
 
   void initialize() override;
 
@@ -141,10 +148,15 @@ class HashProbe : public Operator {
   vector_size_t evalFilter(vector_size_t numRows);
 
   inline bool filterPassed(vector_size_t row) {
-    return filterInputRows_.isValid(row) &&
-        !decodedFilterResult_.isNullAt(row) &&
-        decodedFilterResult_.valueAt<bool>(row);
+    // Read from pre-computed bitmap instead of triple-checking per row.
+    return bits::isBitSet(passedBits_.data(), row);
   }
+
+  // Compute passedBits_ once after filter evaluation. Merges the three per-row
+  // checks (filterInputRows_.isValid + !isNullAt + valueAt<bool>) into a single
+  // bitmap via batch bit operations, eliminating per-row DecodedVector virtual
+  // calls in the post-filter loops.
+  void computePassedBits(int32_t numRows);
 
   // Create a temporary input vector to be passed to the filter. This ensures it
   // gets destroyed in case its wrapping an unloaded vector which eventually
@@ -418,6 +430,11 @@ class HashProbe : public Operator {
   std::vector<VectorPtr> filterResult_;
   DecodedVector decodedFilterResult_;
 
+  // Pre-computed bitmap: bit i = 1 iff filterPassed(i). Computed once per
+  // evalFilter call after filter evaluation, eliminating per-row triple-check
+  // (isValid + isNullAt + valueAt<bool>) in the post-filter loops.
+  raw_vector<uint64_t> passedBits_;
+
   // Type of the RowVector for filter inputs.
   RowTypePtr filterInputType_;
 
@@ -680,6 +697,8 @@ class HashProbe : public Operator {
 
   // The spilled probe partitions remaining to restore.
   SpillPartitionSet inputSpillPartitionSet_;
+
+  DEBUG_STAT_DEFINE_MEMBER(debugStat_, HashProbe)
 };
 
 inline std::ostream& operator<<(std::ostream& os, ProbeOperatorState state) {
