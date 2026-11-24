@@ -83,6 +83,15 @@ class QueryConfig {
   static constexpr const char* kExprMaxArraySizeInReduce =
       "expression.max_array_size_in_reduce";
 
+  /// Enable the expression optimizer before ExprSet compilation.
+  static constexpr const char* kOptimizerEnabled = "optimizer.enabled";
+
+  /// Print before/after trees when the expression optimizer changes them.
+  static constexpr const char* kOptimizerDumpChanges = "optimizer.dump_changes";
+
+  static constexpr const char* kOptimizerSwitchToInEnabled =
+      "optimizer.switch_to_in_enabled";
+
   /// Controls maximum number of compiled regular expression patterns per
   /// function instance per thread of execution.
   static constexpr const char* kExprMaxCompiledRegexes =
@@ -848,6 +857,14 @@ class QueryConfig {
 
   bool isExpressionEvaluationCacheEnabled() const {
     return get<bool>(kEnableExpressionEvaluationCache, true);
+  }
+
+  bool optimizerEnabled() const {
+    return get<bool>(kOptimizerEnabled, false);
+  }
+
+  bool optimizerDumpChanges() const {
+    return get<bool>(kOptimizerDumpChanges, false);
   }
 
   uint32_t maxSharedSubexprResultsCached() const {

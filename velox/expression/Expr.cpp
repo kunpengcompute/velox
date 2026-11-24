@@ -32,6 +32,7 @@
 #include "velox/expression/PeeledEncoding.h"
 #include "velox/expression/ScopedVarSetter.h"
 #include "velox/expression/VectorFunction.h"
+#include "velox/optimizer/ExpressionOptimizer.h"
 #include "velox/vector/SelectivityVector.h"
 #include "velox/vector/VectorSaver.h"
 
@@ -1720,24 +1721,29 @@ common::Subfield extractSubfield(
     }
     switch (index->value()->typeKind()) {
       case TypeKind::TINYINT:
-        path.push_back(std::make_unique<common::Subfield::LongSubscript>(
-            index->value()->as<ConstantVector<int8_t>>()->value()));
+        path.push_back(
+            std::make_unique<common::Subfield::LongSubscript>(
+                index->value()->as<ConstantVector<int8_t>>()->value()));
         break;
       case TypeKind::SMALLINT:
-        path.push_back(std::make_unique<common::Subfield::LongSubscript>(
-            index->value()->as<ConstantVector<int16_t>>()->value()));
+        path.push_back(
+            std::make_unique<common::Subfield::LongSubscript>(
+                index->value()->as<ConstantVector<int16_t>>()->value()));
         break;
       case TypeKind::INTEGER:
-        path.push_back(std::make_unique<common::Subfield::LongSubscript>(
-            index->value()->as<ConstantVector<int32_t>>()->value()));
+        path.push_back(
+            std::make_unique<common::Subfield::LongSubscript>(
+                index->value()->as<ConstantVector<int32_t>>()->value()));
         break;
       case TypeKind::BIGINT:
-        path.push_back(std::make_unique<common::Subfield::LongSubscript>(
-            index->value()->as<ConstantVector<int64_t>>()->value()));
+        path.push_back(
+            std::make_unique<common::Subfield::LongSubscript>(
+                index->value()->as<ConstantVector<int64_t>>()->value()));
         break;
       case TypeKind::VARCHAR:
-        path.push_back(std::make_unique<common::Subfield::StringSubscript>(
-            index->value()->as<ConstantVector<StringView>>()->value()));
+        path.push_back(
+            std::make_unique<common::Subfield::StringSubscript>(
+                index->value()->as<ConstantVector<StringView>>()->value()));
         break;
       default:
         return {};
@@ -1773,7 +1779,19 @@ ExprSet::ExprSet(
     core::ExecCtx* execCtx,
     bool enableConstantFolding)
     : execCtx_(execCtx) {
-  exprs_ = compileExpressions(sources, execCtx, this, enableConstantFolding);
+  const auto* compilationSources = &sources;
+  std::vector<core::TypedExprPtr> optimizedSources;
+  if (!execCtx || !execCtx->queryCtx() ||
+      execCtx->queryCtx()->queryConfig().optimizerEnabled()) {
+    velox::optimizer::ExpressionOptimizer optimizer(
+        {}, execCtx ? execCtx->queryCtx() : nullptr);
+    if (optimizer.hasActiveRules()) {
+      optimizedSources = optimizer.optimize(sources);
+      compilationSources = &optimizedSources;
+    }
+  }
+  exprs_ = compileExpressions(
+      *compilationSources, execCtx, this, enableConstantFolding);
   std::vector<FieldReference*> allDistinctFields;
   for (auto& expr : exprs_) {
     Expr::mergeFields(
