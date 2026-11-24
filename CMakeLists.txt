@@ -139,7 +139,7 @@ option(VELOX_ENABLE_HDFS "Build Hdfs Connector" OFF)
 option(
   VELOX_ENABLE_ISAL_CRYPTO_MD5
   "Auto-detect ISA-L Crypto for Spark vectorized MD5. Off keeps scalar md5."
-  ON)
+  OFF)
 option(VELOX_ENABLE_PARQUET "Enable Parquet support" OFF)
 option(VELOX_ENABLE_ARROW "Enable Arrow support" OFF)
 option(VELOX_ENABLE_REMOTE_FUNCTIONS "Enable remote function support" OFF)
