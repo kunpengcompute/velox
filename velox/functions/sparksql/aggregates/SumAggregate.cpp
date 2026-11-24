@@ -51,17 +51,20 @@ std::unique_ptr<exec::Aggregate> constructDecimalSumAgg(
   switch (precision) {
     // The sum precision is calculated from the input precision with the formula
     // min(p + 10, 38). Therefore, the sum precision must >= 11.
-#define PRECISION_CASE(precision)                                           \
-  case precision:                                                           \
-    if (inputType->isShortDecimal() && sumType->isShortDecimal()) {         \
-      return std::make_unique<OptimizedSparkDecimalSumAggregate<            \
-          int64_t, int64_t, precision>>(resultType);                        \
-    } else if (inputType->isShortDecimal() && sumType->isLongDecimal()) {   \
-      return std::make_unique<OptimizedSparkDecimalSumAggregate<            \
-          int64_t, int128_t, precision>>(resultType);                       \
-    } else {                                                                \
-      return std::make_unique<OptimizedSparkDecimalSumAggregate<            \
-          int128_t, int128_t, precision>>(resultType);                      \
+#define PRECISION_CASE(precision)                                            \
+  case precision:                                                            \
+    if (inputType->isShortDecimal() && sumType->isShortDecimal()) {          \
+      return std::make_unique<                                               \
+          OptimizedSparkDecimalSumAggregate<int64_t, int64_t, precision>>(   \
+          resultType);                                                       \
+    } else if (inputType->isShortDecimal() && sumType->isLongDecimal()) {    \
+      return std::make_unique<                                               \
+          OptimizedSparkDecimalSumAggregate<int64_t, int128_t, precision>>(  \
+          resultType);                                                       \
+    } else {                                                                 \
+      return std::make_unique<                                               \
+          OptimizedSparkDecimalSumAggregate<int128_t, int128_t, precision>>( \
+          resultType);                                                       \
     }
     PRECISION_CASE(11)
     PRECISION_CASE(12)
@@ -125,11 +128,12 @@ exec::AggregateRegistrationResult registerSum(
   };
 
   for (const auto& inputType : {"tinyint", "smallint", "integer", "bigint"}) {
-    signatures.push_back(exec::AggregateFunctionSignatureBuilder()
-                             .returnType("bigint")
-                             .intermediateType("bigint")
-                             .argumentType(inputType)
-                             .build());
+    signatures.push_back(
+        exec::AggregateFunctionSignatureBuilder()
+            .returnType("bigint")
+            .intermediateType("bigint")
+            .argumentType(inputType)
+            .build());
   }
 
   return exec::registerAggregateFunction(
@@ -183,7 +187,7 @@ exec::AggregateRegistrationResult registerSum(
             }
             return varOut.set(
                 std::make_unique<SumAggregate<double, double, double>>(
-                DOUBLE()));
+                    DOUBLE()));
           case TypeKind::ROW: {
             VELOX_DCHECK(!exec::isRawInput(step));
             checkAccumulatorRowType(inputType);

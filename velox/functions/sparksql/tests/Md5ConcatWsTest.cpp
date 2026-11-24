@@ -89,8 +89,7 @@ TEST_F(Md5ConcatWsTest, mixedBatchPreservesRowOrder) {
   EXPECT_EQ(result->valueAt(3).str(), kEmptyMd5);
   EXPECT_EQ(result->valueAt(4).str(), kAbcMd5);
   EXPECT_EQ(
-      result->valueAt(5).str(),
-      md5Varbinary(std::string(80, 'a')).value());
+      result->valueAt(5).str(), md5Varbinary(std::string(80, 'a')).value());
 }
 
 TEST_F(Md5ConcatWsTest, rewriteMd5ConcatWs) {
@@ -155,8 +154,8 @@ TEST_F(Md5ConcatWsTest, fusedMatchesMaterializedConcatThenMd5) {
   auto c1 = makeNullableFlatVector<std::string>({"b", "", std::nullopt});
   auto rows = makeRowVector({c0, c1});
 
-  auto concat = evaluate<SimpleVector<StringView>>(
-      "concat_ws(',', c0, c1)", rows);
+  auto concat =
+      evaluate<SimpleVector<StringView>>("concat_ws(',', c0, c1)", rows);
   ASSERT_EQ(concat->size(), 3);
   EXPECT_EQ(concat->valueAt(0).str(), "a,b");
   EXPECT_EQ(concat->valueAt(1).str(), "a,");
@@ -190,8 +189,8 @@ TEST_F(Md5ConcatWsTest, allNullDataArgs) {
   auto rows = makeRowVector({c0, c1});
 
   // Spark / Velox concat_ws skips NULLs; no remaining pieces → "".
-  auto concat = evaluate<SimpleVector<StringView>>(
-      "concat_ws(',', c0, c1)", rows);
+  auto concat =
+      evaluate<SimpleVector<StringView>>("concat_ws(',', c0, c1)", rows);
   ASSERT_FALSE(concat->isNullAt(0));
   EXPECT_EQ(concat->valueAt(0).str(), "");
 

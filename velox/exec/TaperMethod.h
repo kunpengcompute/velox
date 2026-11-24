@@ -1,5 +1,18 @@
-﻿#pragma once
+﻿/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
+#pragma once
 #include <folly/CPortability.h>
 #include <folly/Likely.h>
 #include <cstdint>
@@ -252,17 +265,17 @@ struct MethodSerializedFixed : public MethodBase<taper::FixedBuf> {
       auto offset = preKeySize;
       preKeySize += hashers_[j]->type()->cppSizeInBytes();
       uint8_t nullMask = j + 1;
-#define DISPATCH(LAYOUT)                    \
-  if (layout == (LAYOUT)) {                 \
+#define DISPATCH(LAYOUT)                     \
+  if (layout == (LAYOUT)) {                  \
     VELOX_DYNAMIC_NUMERIC_TYPE_DISPATCH_ALL( \
-        writeColValue,                      \
-        LAYOUT,                             \
-        type->kind(),                       \
-        vector,                             \
-        numElems,                           \
-        nullMask,                           \
-        offset);                            \
-    continue;                               \
+        writeColValue,                       \
+        LAYOUT,                              \
+        type->kind(),                        \
+        vector,                              \
+        numElems,                            \
+        nullMask,                            \
+        offset);                             \
+    continue;                                \
   }
       FOREACH_VALID_LAYOUT(DISPATCH)
 #undef DISPATCH
@@ -553,15 +566,15 @@ struct MethodSerializedCompactKeys : public MethodBase<taper::CompactKeys> {
     auto& vector = hasher.decodedVector();
     auto layout = DecodedVector::getLayout(vector);
 
-#define DISPATCH_CALL(LAYOUT)             \
+#define DISPATCH_CALL(LAYOUT)              \
   VELOX_DYNAMIC_NUMERIC_TYPE_DISPATCH_ALL( \
-      writeNumericCol,                    \
-      LAYOUT,                             \
-      type->kind(),                       \
-      vector,                             \
-      numElems,                           \
-      keyOffset,                          \
-      nullByte,                           \
+      writeNumericCol,                     \
+      LAYOUT,                              \
+      type->kind(),                        \
+      vector,                              \
+      numElems,                            \
+      keyOffset,                           \
+      nullByte,                            \
       nullMask)
 #define DISPATCH(LAYOUT)    \
   if (layout == (LAYOUT)) { \
@@ -594,8 +607,8 @@ struct MethodSerializedCompactKeys : public MethodBase<taper::CompactKeys> {
 
   void initializeStringKeys(uint32_t numElems) {
     // temporary strings on stack memory
-    MemoryView<StringView> strings{
-        static_cast<StringView*>(alloca(sizeof(StringView) * stringHashers_.size()))};
+    MemoryView<StringView> strings{static_cast<StringView*>(
+        alloca(sizeof(StringView) * stringHashers_.size()))};
 
     numRows_ += numElems;
     for (Size rowIdx = 0; rowIdx < numElems; rowIdx++) {
@@ -750,8 +763,8 @@ struct MethodSerializedCompactKeys : public MethodBase<taper::CompactKeys> {
 
     // temporary pointers on stack memory
     MemoryView<FlatVector<StringView>*> vectors{
-        static_cast<FlatVector<StringView>**>(alloca(
-            sizeof(FlatVector<StringView>*) * hashers_.size()))};
+        static_cast<FlatVector<StringView>**>(
+            alloca(sizeof(FlatVector<StringView>*) * hashers_.size()))};
 
     for (const auto& [colIdx, hasher] : stringHashers_) {
       auto* vector =
@@ -918,4 +931,4 @@ struct MethodSerializedCompactKeys : public MethodBase<taper::CompactKeys> {
   DEBUG_STAT_DEFINE_MEMBER(debugStat_, TaperMethod)
 };
 
-} // namespace facebook::bolt::exec::taper
+} // namespace facebook::velox::exec::taper

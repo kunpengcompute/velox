@@ -23,13 +23,13 @@ namespace facebook::velox::functions::sparksql {
 /// Spark md5() over varchar/varbinary. Long strings use ISA-L multi-buffer
 /// MD5; short strings stay on the scalar path.
 class SparkMd5VectorFunction : public exec::VectorFunction {
-public:
-    void apply(
-        const SelectivityVector& rows,
-        std::vector<VectorPtr>& args,
-        const TypePtr& outputType,
-        exec::EvalCtx& context,
-        VectorPtr& result) const override;
+ public:
+  void apply(
+      const SelectivityVector& rows,
+      std::vector<VectorPtr>& args,
+      const TypePtr& outputType,
+      exec::EvalCtx& context,
+      VectorPtr& result) const override;
 };
 
 } // namespace facebook::velox::functions::sparksql

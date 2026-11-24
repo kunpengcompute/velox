@@ -35,49 +35,49 @@ BUILD_TEST_UTILS=OFF
 NUM_THREADS=""
 OTHER_ARGUMENTS=""
 
-OS=`uname -s`
-ARCH=`uname -m`
+OS=$(uname -s)
+ARCH=$(uname -m)
 
 for arg in "$@"; do
   case $arg in
   --velox_home=*)
-    VELOX_HOME=("${arg#*=}")
+    VELOX_HOME="${arg#*=}"
     shift # Remove argument name from processing
     ;;
   --enable_s3=*)
-    ENABLE_S3=("${arg#*=}")
+    ENABLE_S3="${arg#*=}"
     shift # Remove argument name from processing
     ;;
   --enable_gcs=*)
-    ENABLE_GCS=("${arg#*=}")
+    ENABLE_GCS="${arg#*=}"
     shift # Remove argument name from processing
     ;;
   --enable_hdfs=*)
-    ENABLE_HDFS=("${arg#*=}")
+    ENABLE_HDFS="${arg#*=}"
     shift # Remove argument name from processing
     ;;
   --enable_abfs=*)
-    ENABLE_ABFS=("${arg#*=}")
+    ENABLE_ABFS="${arg#*=}"
     shift # Remove argument name from processing
     ;;
   --build_type=*)
-    BUILD_TYPE=("${arg#*=}")
+    BUILD_TYPE="${arg#*=}"
     shift # Remove argument name from processing
     ;;
   --build_test_utils=*)
-    BUILD_TEST_UTILS=("${arg#*=}")
+    BUILD_TEST_UTILS="${arg#*=}"
     shift # Remove argument name from processing
     ;;
   --build_tests=*)
-    ENABLE_TESTS=("${arg#*=}")
+    ENABLE_TESTS="${arg#*=}"
     shift # Remove argument name from processing
     ;;
   --build_benchmarks=*)
-    ENABLE_BENCHMARK=("${arg#*=}")
+    ENABLE_BENCHMARK="${arg#*=}"
     shift # Remove argument name from processing
     ;;
   --num_threads=*)
-    NUM_THREADS=("${arg#*=}")
+    NUM_THREADS="${arg#*=}"
     shift # Remove argument name from processing
     ;;
   *)
@@ -91,49 +91,53 @@ function compile {
   # Maybe there is some set option in velox setup script. Run set command again.
   set -exu
 
-  CXX_FLAGS='-Wno-missing-field-initializers'
-  COMPILE_OPTION="-DCMAKE_CXX_FLAGS=\"$CXX_FLAGS\" -DVELOX_ENABLE_PARQUET=ON -DVELOX_BUILD_TESTING=OFF -DVELOX_MONO_LIBRARY=ON -DVELOX_BUILD_RUNNER=OFF"
-  if [ $BUILD_TEST_UTILS == "ON" ]; then
-      COMPILE_OPTION="$COMPILE_OPTION -DVELOX_BUILD_TEST_UTILS=ON"
+  COMPILE_OPTION=(
+    -DCMAKE_CXX_FLAGS=-Wno-missing-field-initializers
+    -DVELOX_ENABLE_PARQUET=ON
+    -DVELOX_BUILD_TESTING=OFF
+    -DVELOX_MONO_LIBRARY=ON
+    -DVELOX_BUILD_RUNNER=OFF
+  )
+  if [[ $BUILD_TEST_UTILS == "ON" ]]; then
+    COMPILE_OPTION+=(-DVELOX_BUILD_TEST_UTILS=ON)
   fi
-  if [ $ENABLE_HDFS == "ON" ]; then
-    COMPILE_OPTION="$COMPILE_OPTION -DVELOX_ENABLE_HDFS=ON"
+  if [[ $ENABLE_HDFS == "ON" ]]; then
+    COMPILE_OPTION+=(-DVELOX_ENABLE_HDFS=ON)
   fi
-  if [ $ENABLE_S3 == "ON" ]; then
-    COMPILE_OPTION="$COMPILE_OPTION -DVELOX_ENABLE_S3=ON"
+  if [[ $ENABLE_S3 == "ON" ]]; then
+    COMPILE_OPTION+=(-DVELOX_ENABLE_S3=ON)
   fi
   # If ENABLE_BENCHMARK == ON, Velox disables tests and connectors
-  if [ $ENABLE_BENCHMARK == "OFF" ]; then
-    if [ $ENABLE_TESTS == "ON" ]; then
-        COMPILE_OPTION="$COMPILE_OPTION -DVELOX_BUILD_TESTING=ON "
+  if [[ $ENABLE_BENCHMARK == "OFF" ]]; then
+    if [[ $ENABLE_TESTS == "ON" ]]; then
+      COMPILE_OPTION+=(-DVELOX_BUILD_TESTING=ON)
     fi
-    if [ $ENABLE_ABFS == "ON" ]; then
-      COMPILE_OPTION="$COMPILE_OPTION -DVELOX_ENABLE_ABFS=ON"
+    if [[ $ENABLE_ABFS == "ON" ]]; then
+      COMPILE_OPTION+=(-DVELOX_ENABLE_ABFS=ON)
     fi
-    if [ $ENABLE_GCS == "ON" ]; then
-      COMPILE_OPTION="$COMPILE_OPTION -DVELOX_ENABLE_GCS=ON"
+    if [[ $ENABLE_GCS == "ON" ]]; then
+      COMPILE_OPTION+=(-DVELOX_ENABLE_GCS=ON)
     fi
   else
     echo "ENABLE_BENCHMARK is ON. Disabling Tests, GCS and ABFS connectors if enabled."
-    COMPILE_OPTION="$COMPILE_OPTION -DVELOX_ENABLE_BENCHMARKS=ON"
+    COMPILE_OPTION+=(-DVELOX_ENABLE_BENCHMARKS=ON)
   fi
 
-  COMPILE_OPTION="$COMPILE_OPTION -DCMAKE_BUILD_TYPE=${BUILD_TYPE}"
-  COMPILE_TYPE=$(if [[ "$BUILD_TYPE" == "debug" ]] || [[ "$BUILD_TYPE" == "Debug" ]]; then echo 'debug'; else echo 'release'; fi)
-  echo "COMPILE_OPTION: "$COMPILE_OPTION
+  COMPILE_OPTION+=("-DCMAKE_BUILD_TYPE=${BUILD_TYPE}")
+  COMPILE_TYPE=$(if [[ $BUILD_TYPE == "debug" ]] || [[ $BUILD_TYPE == "Debug" ]]; then echo 'debug'; else echo 'release'; fi)
+  echo "COMPILE_OPTION: ${COMPILE_OPTION[*]}"
 
-  NUM_THREADS_OPTS=""
+  MAKE_ARGS=("$COMPILE_TYPE" "EXTRA_CMAKE_FLAGS=${COMPILE_OPTION[*]}")
   if [ -n "${NUM_THREADS:-}" ]; then
-    NUM_THREADS_OPTS="NUM_THREADS=$NUM_THREADS MAX_HIGH_MEM_JOBS=$NUM_THREADS MAX_LINK_JOBS=$NUM_THREADS"
+    MAKE_ARGS+=("NUM_THREADS=$NUM_THREADS" "MAX_HIGH_MEM_JOBS=$NUM_THREADS" "MAX_LINK_JOBS=$NUM_THREADS")
   fi
-  echo "NUM_THREADS_OPTS: $NUM_THREADS_OPTS"
 
   export simdjson_SOURCE=AUTO
   export Arrow_SOURCE=AUTO
   if [ $ARCH == 'x86_64' ]; then
-    make $COMPILE_TYPE $NUM_THREADS_OPTS EXTRA_CMAKE_FLAGS="${COMPILE_OPTION}"
-  elif [[ "$ARCH" == 'arm64' || "$ARCH" == 'aarch64' ]]; then
-    CPU_TARGET=$ARCH make $COMPILE_TYPE $NUM_THREADS_OPTS EXTRA_CMAKE_FLAGS="${COMPILE_OPTION}"
+    make "${MAKE_ARGS[@]}"
+  elif [[ $ARCH == 'arm64' || $ARCH == 'aarch64' ]]; then
+    CPU_TARGET=$ARCH make "${MAKE_ARGS[@]}"
   else
     echo "Unsupported arch: $ARCH"
     exit 1
@@ -153,7 +157,9 @@ function compile {
     if [ -d gtest-build ]; then
       echo "INSTALL gtest."
       if [ $OS == 'Linux' ]; then
-        cd gtest-src; cmake . ; sudo make install -j
+        cd gtest-src
+        cmake .
+        sudo make install -j
         #sudo cmake --install gtest-build/
       elif [ $OS == 'Darwin' ]; then
         sudo cmake --install gtest-build/
@@ -163,7 +169,7 @@ function compile {
 }
 
 CURRENT_DIR=$(
-  cd "$(dirname "$BASH_SOURCE")"
+  cd "$(dirname "${BASH_SOURCE[0]}")"
   pwd
 )
 
@@ -180,7 +186,7 @@ echo "ENABLE_HDFS=${ENABLE_HDFS}"
 echo "ENABLE_ABFS=${ENABLE_ABFS}"
 echo "BUILD_TYPE=${BUILD_TYPE}"
 
-cd ${VELOX_HOME}
+cd "${VELOX_HOME}"
 # Branch-new build requires all untracked files to be deleted. We only need the source code.
 # sudo git clean -dffx :/
 compile

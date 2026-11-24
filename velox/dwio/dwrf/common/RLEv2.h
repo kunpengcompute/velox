@@ -83,8 +83,7 @@ class RleDecoderV2 : public dwio::common::IntDecoder<isSigned> {
     const bool allowNulls = hasNulls && visitor.allowNulls();
 
     if (useBatchRead<hasNulls>(visitor)) {
-      batchReadLoop<hasNulls>(
-          nulls, visitor, current, atEnd, allowNulls);
+      batchReadLoop<hasNulls>(nulls, visitor, current, atEnd, allowNulls);
       return;
     }
 
@@ -127,8 +126,7 @@ class RleDecoderV2 : public dwio::common::IntDecoder<isSigned> {
   /// pre-decoded buffer, so sparse falls back to per-value.
   template <bool hasNulls, typename Visitor>
   bool useBatchRead(Visitor& visitor) {
-    return Visitor::dense &&
-        process::hasSimd() &&
+    return Visitor::dense && process::hasSimd() &&
         !std::is_same_v<typename Visitor::DataType, int128_t> &&
         Visitor::FilterType::deterministic;
   }
@@ -137,11 +135,11 @@ class RleDecoderV2 : public dwio::common::IntDecoder<isSigned> {
   /// fallback (same null checks, same visitor calls, same skip logic), but when
   /// it reaches a non-null row it peeks ahead in the null bitmap to find the
   /// longest run of consecutive non-null rows and decodes them with a single
-  /// next* call into a scratch buffer, then processes each value. This amortizes
-  /// the per-value readValue() dispatch (run-state-machine re-entry + single-
-  /// value next* call) over the run length. Null handling is unchanged: null
-  /// rows go through processNull / checkAndSkipNulls exactly as before, and
-  /// decoder skips between non-contiguous rows use the same skip<hasNulls>.
+  /// next* call into a scratch buffer, then processes each value. This
+  /// amortizes the per-value readValue() dispatch (run-state-machine re-entry +
+  /// single- value next* call) over the run length. Null handling is unchanged:
+  /// null rows go through processNull / checkAndSkipNulls exactly as before,
+  /// and decoder skips between non-contiguous rows use the same skip<hasNulls>.
   template <bool hasNulls, typename Visitor>
   void batchReadLoop(
       const uint64_t* nulls,
@@ -298,15 +296,15 @@ class RleDecoderV2 : public dwio::common::IntDecoder<isSigned> {
       const uint64_t* nulls = nullptr) {
     // SIMD/bulk fast path: no nulls, fb in [1,32], enough values, and the
     // remaining bytes are all in the current contiguous buffer (no refill
-    // needed). This eliminates the per-byte readByte() overhead (buffer-boundary
-    // check + call) by reading bytes directly from bufferStart_. The bit
-    // extraction is SVE-vectorized in whole-vector batches inside
-    // readLongsSimd (MSB-first, matching ORC RLEv2), which is correct for all
-    // fb in [1,32]; the win is from removing readByte() churn and per-value bit
-    // state machine work. The buffer-availability check is done inline here
-    // (cheap) so that small runs with insufficient buffer skip readLongsSimd
-    // entirely with no
-    // inlined overhead, avoiding regression on queries with small RLEv2 runs.
+    // needed). This eliminates the per-byte readByte() overhead
+    // (buffer-boundary check + call) by reading bytes directly from
+    // bufferStart_. The bit extraction is SVE-vectorized in whole-vector
+    // batches inside readLongsSimd (MSB-first, matching ORC RLEv2), which is
+    // correct for all fb in [1,32]; the win is from removing readByte() churn
+    // and per-value bit state machine work. The buffer-availability check is
+    // done inline here (cheap) so that small runs with insufficient buffer skip
+    // readLongsSimd entirely with no inlined overhead, avoiding regression on
+    // queries with small RLEv2 runs.
     if (nulls == nullptr && fb >= 1 && fb <= 32 && len >= 8) {
       const uint64_t bitsFromBuffer =
           (len * fb > bitsLeft_) ? (len * fb - bitsLeft_) : 0;
@@ -353,7 +351,8 @@ class RleDecoderV2 : public dwio::common::IntDecoder<isSigned> {
   /// each (fb in [1,32]) directly from bufferStart_, avoiding the per-byte
   /// readByte() overhead. Requires nulls==nullptr (handled by caller) and that
   /// the whole bit range fits in the current contiguous buffer window
-  /// [bufferStart_, bufferEnd_) with a few bytes of padding for safe wide reads.
+  /// [bufferStart_, bufferEnd_) with a few bytes of padding for safe wide
+  /// reads.
   ///
   /// Bit order is ORC RLEv2 MSB-first: within each byte the high bits are
   /// consumed first (curByte_ >> bitsLeft_).
@@ -364,7 +363,8 @@ class RleDecoderV2 : public dwio::common::IntDecoder<isSigned> {
   /// The scalar loop below drains any residual sub-byte alignment, the tail
   /// shorter than one vector, and the whole range when SVE is unavailable.
   /// Both paths leave curByte_/bitsLeft_/bufferStart_ in the same state.
-  void readLongsSimd(int64_t* data, uint64_t offset, uint64_t len, uint64_t fb) {
+  void
+  readLongsSimd(int64_t* data, uint64_t offset, uint64_t len, uint64_t fb) {
     const uint64_t bulk = readLongsSveBatch(data, offset, len, fb);
     offset += bulk;
     len -= bulk;
@@ -375,8 +375,7 @@ class RleDecoderV2 : public dwio::common::IntDecoder<isSigned> {
     // *(bufferStart_ - 1); once those are drained the stream continues at
     // *bufferStart_. We process values one at a time but pull bytes straight
     // from 'p' (no readByte() boundary checks), which is the main win.
-    const uint8_t* p =
-        reinterpret_cast<const uint8_t*>(this->bufferStart_);
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(this->bufferStart_);
     uint32_t bitsLeft = bitsLeft_;
     uint32_t curByte = curByte_;
 

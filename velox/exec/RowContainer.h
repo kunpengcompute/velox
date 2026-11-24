@@ -636,8 +636,7 @@ class RowContainer {
   __attribute__((__no_sanitize__("thread")))
 #endif
 #endif
-  int32_t
-  listRows(
+  int32_t listRows(
       RowContainerIterator* iter,
       int32_t maxRows,
       uint64_t maxBytes,
@@ -731,8 +730,7 @@ class RowContainer {
   __attribute__((__no_sanitize__("thread")))
 #endif
 #endif
-  void
-  setProbedFlag(char** rows, int32_t numRows);
+  void setProbedFlag(char** rows, int32_t numRows);
 
   /// Returns true if 'row' at 'column' equals the value at 'index' in
   /// 'decoded'. 'mayHaveNulls' specifies if nulls need to be checked. This is a
@@ -930,8 +928,8 @@ class RowContainer {
   /// Backed by the O(1) incrementally-maintained 'columnHasNulls_' flag, NOT
   /// the lazily-materialized full stats — callers (extractColumn fast/slow
   /// path, PrefixSort normalized key, prepareJoinTable flag
-  /// merge) only need the boolean. This avoids triggering recomputeColumnStats()
-  /// on the store/finish/spill hot paths.
+  /// merge) only need the boolean. This avoids triggering
+  /// recomputeColumnStats() on the store/finish/spill hot paths.
   inline bool columnHasNulls(int32_t columnIndex) const {
     return columnHasNulls_[columnIndex];
   }
@@ -1298,7 +1296,11 @@ class RowContainer {
       char* row,
       int32_t offset) {
     storeNoNullsDispatch<DVecLayout::kUnknown>(
-        decoded, rowIndex, row, offset, std::integral_constant<TypeKind, Kind>{});
+        decoded,
+        rowIndex,
+        row,
+        offset,
+        std::integral_constant<TypeKind, Kind>{});
   }
 
   template <DVecLayout Layout, TypeKind Kind>
@@ -1480,8 +1482,15 @@ class RowContainer {
 
     if constexpr (std::is_same_v<T, StringView>) {
       extractStringsBatch(
-          rows, rowNumbers, numRows, offset, nullByte, nullMask, resultOffset,
-          result, true);
+          rows,
+          rowNumbers,
+          numRows,
+          offset,
+          nullByte,
+          nullMask,
+          resultOffset,
+          result,
+          true);
       return;
     }
 
@@ -2104,8 +2113,8 @@ inline bool RowContainer::equalsWithNulls(
       Kind == TypeKind::ROW || Kind == TypeKind::ARRAY ||
       Kind == TypeKind::MAP) {
     auto stream = prepareRead(row, offset);
-    return ContainerRowSerde::compare(*stream, decoded, index, CompareFlags{}) ==
-        0;
+    return ContainerRowSerde::compare(
+               *stream, decoded, index, CompareFlags{}) == 0;
   }
   auto rowVal = valueAt<T>(row, offset);
   auto decodedVal = decoded.valueAt<T, Layout>(index);
@@ -2132,8 +2141,8 @@ inline bool RowContainer::equalsNoNulls(
       Kind == TypeKind::ROW || Kind == TypeKind::ARRAY ||
       Kind == TypeKind::MAP) {
     auto stream = prepareRead(row, offset);
-    return ContainerRowSerde::compare(*stream, decoded, index, CompareFlags{}) ==
-        0;
+    return ContainerRowSerde::compare(
+               *stream, decoded, index, CompareFlags{}) == 0;
   }
   auto rowVal = valueAt<T>(row, offset);
   auto decodedVal = decoded.valueAt<T, Layout>(index);

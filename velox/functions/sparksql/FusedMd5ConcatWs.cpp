@@ -50,8 +50,8 @@ class FusedMd5ConcatWs : public exec::VectorFunction {
 
     // NULL separator => all results NULL
     if (isConstantSeparator() && args[0]->isNullAt(0)) {
-      auto localResult = BaseVector::createNullConstant(
-          VARCHAR(), rows.end(), context.pool());
+      auto localResult =
+          BaseVector::createNullConstant(VARCHAR(), rows.end(), context.pool());
       context.moveOrCopyResult(localResult, rows, result);
       return;
     }
@@ -141,7 +141,8 @@ class FusedMd5ConcatWs : public exec::VectorFunction {
     }
 
     // Single-pass feed+finish per row. Two-phase ILP finish needed 96B×N
-    // partialStates and only paid off at 3+ MD5Transform; this keeps work in L1.
+    // partialStates and only paid off at 3+ MD5Transform; this keeps work in
+    // L1.
 
     // Pre-allocate string buffer for MD5 hex output (worst case: all non-NULL)
     const int numSelected = rows.countSelected();
@@ -171,8 +172,9 @@ class FusedMd5ConcatWs : public exec::VectorFunction {
         if (isFirst) {
           isFirst = false;
         } else {
-          md5Ctx.Add(reinterpret_cast<const unsigned char*>(separator.data()),
-                     separator.size());
+          md5Ctx.Add(
+              reinterpret_cast<const unsigned char*>(separator.data()),
+              separator.size());
         }
         md5Ctx.Add(reinterpret_cast<const unsigned char*>(data), size);
       };
@@ -194,8 +196,8 @@ class FusedMd5ConcatWs : public exec::VectorFunction {
 
           for (auto k = 0; k < size; ++k) {
             if (!decodedElements[argIsArray[j]].isNullAt(offset + k)) {
-              auto element =
-                  decodedElements[argIsArray[j]].valueAt<StringView>(offset + k);
+              auto element = decodedElements[argIsArray[j]].valueAt<StringView>(
+                  offset + k);
               feedValue(element.data(), element.size());
             }
           }
@@ -260,10 +262,9 @@ std::shared_ptr<exec::VectorFunction> makeFusedMd5ConcatWs(
     const std::vector<exec::VectorFunctionArg>& inputArgs,
     const core::QueryConfig& /*config*/) {
   std::optional<StringView> separator = std::nullopt;
-  if (auto* constantVector =
-          inputArgs[0].constantValue
-              ? inputArgs[0].constantValue->as<ConstantVector<StringView>>()
-              : nullptr) {
+  if (auto* constantVector = inputArgs[0].constantValue
+          ? inputArgs[0].constantValue->as<ConstantVector<StringView>>()
+          : nullptr) {
     if (!constantVector->isNullAt(0)) {
       separator = constantVector->valueAt(0);
     }
@@ -303,7 +304,7 @@ core::TypedExprPtr rewriteMd5ConcatWs(
 
   // Rewrite to fused_md5_concat_ws(sep, ...); reuse concat_ws children.
   return std::make_shared<core::CallTypedExpr>(
-      VARCHAR(),  // md5 returns varchar (hex)
+      VARCHAR(), // md5 returns varchar (hex)
       concatCall->inputs(),
       prefix + "fused_md5_concat_ws");
 }

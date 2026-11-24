@@ -3128,10 +3128,8 @@ TEST_F(RLEv2Test, deltaFixedNegativeDelta) {
 // ===========================================================================
 
 // Helper: read all `count` values from a fresh decoder over `bytes`.
-static std::vector<int64_t> readAllRLEv2(
-    const unsigned char* bytes,
-    unsigned long l,
-    size_t count) {
+static std::vector<int64_t>
+readAllRLEv2(const unsigned char* bytes, unsigned long l, size_t count) {
   auto pool = memory::memoryManager()->addLeafPool();
   std::unique_ptr<dwio::common::IntDecoder<true>> rle = createRleDecoder<true>(
       std::make_unique<dwio::common::SeekableArrayInputStream>(bytes, l),
@@ -3292,8 +3290,24 @@ TEST_F(RLEv2Test, skipMixedEncodings) {
 // and actualGap_ to match nextPatched's per-value loop.
 TEST_F(RLEv2Test, skipPatchedBase0) {
   const unsigned char bytes[] = {
-      0x8e, 0x09, 0x2b, 0x21, 0x07, 0xd0, 0x1e, 0x00, 0x14, 0x70, 0x28,
-      0x32, 0x3c, 0x46, 0x50, 0x5a, 0xfc, 0xe8};
+      0x8e,
+      0x09,
+      0x2b,
+      0x21,
+      0x07,
+      0xd0,
+      0x1e,
+      0x00,
+      0x14,
+      0x70,
+      0x28,
+      0x32,
+      0x3c,
+      0x46,
+      0x50,
+      0x5a,
+      0xfc,
+      0xe8};
   unsigned long l = sizeof(bytes) / sizeof(char);
   const size_t count = 10;
   auto baseline = readAllRLEv2(bytes, l, count);
@@ -3472,7 +3486,7 @@ TEST_F(RLEv2Test, skipDeltaVariable3) {
 // verify the fast path + fallback interplay. ColumnWriterTest and E2EFilterTest
 // provide end-to-end coverage through the real reader stack.
 // ---------------------------------------------------------------------------
- 
+
 // Regression: the next()/doNext path (used by skip and the fallback loop) must
 // be unaffected. Exercises DIRECT across multiple chunk sizes and run
 // boundaries. Uses the verified bitSize2Direct bytes (0,1 repeated 10x).
@@ -3488,8 +3502,7 @@ TEST_F(RLEv2Test, nextPathUnchangedDirectMultiChunk) {
     auto got = decodeRLEv2(bytes, l, n, count, nullptr);
     ASSERT_EQ(got.size(), count) << "chunk size " << n;
     for (size_t i = 0; i < count; ++i) {
-      EXPECT_EQ(expected[i], got[i])
-          << "chunk size " << n << " at " << i;
+      EXPECT_EQ(expected[i], got[i]) << "chunk size " << n << " at " << i;
     }
   }
 }
@@ -3512,9 +3525,10 @@ std::vector<unsigned char> encodeDirectRun(
   const uint64_t runMinus1 = values.size() - 1;
   VELOX_CHECK_LE(runMinus1, 0x1ff);
   std::vector<unsigned char> out;
-  out.push_back(static_cast<unsigned char>(
-      (0x1u << 6) | (directBitWidthField(fb) << 1) |
-      static_cast<uint32_t>(runMinus1 >> 8)));
+  out.push_back(
+      static_cast<unsigned char>(
+          (0x1u << 6) | (directBitWidthField(fb) << 1) |
+          static_cast<uint32_t>(runMinus1 >> 8)));
   out.push_back(static_cast<unsigned char>(runMinus1 & 0xff));
   const uint64_t mask = (1ULL << fb) - 1;
   uint64_t pending = 0;
@@ -3567,8 +3581,8 @@ std::vector<int64_t> decodeUnsignedRLEv2(
 // sizes that cross the len>=8 fast-path gate and hit several bit phases
 // (chunk 9 leaves a non-zero bitsLeft_ for widths that are not byte aligned).
 TEST_F(RLEv2Test, directRunSveBulkBitUnpack) {
-  const std::vector<int> widths =
-      {1, 2, 3, 5, 7, 8, 11, 13, 16, 17, 24, 26, 32};
+  const std::vector<int> widths = {
+      1, 2, 3, 5, 7, 8, 11, 13, 16, 17, 24, 26, 32};
   const std::vector<size_t> counts = {8, 9, 63, 64, 65, 259};
   const std::vector<size_t> chunks = {1, 3, 8, 9, 64, 259};
   for (int fb : widths) {

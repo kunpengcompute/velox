@@ -1009,35 +1009,37 @@ void BaseVector::transposeIndices(
     vector_size_t* resultIndices) {
 #if defined(__ARM_FEATURE_SVE)
   // Use SVE svld1_gather for efficient indexed access
-  static_assert(sizeof(vector_size_t) == sizeof(int32_t), "SVE implementation assumes vector_size_t is 32-bit");
+  static_assert(
+      sizeof(vector_size_t) == sizeof(int32_t),
+      "SVE implementation assumes vector_size_t is 32-bit");
   int32_t i = 0;
-  
+
   // Main loop: process full vectors
   int32_t svSize = svcntw();
   for (; i + svSize <= wrapSize; i += svSize) {
     // No need for svwhilelt here - full vector
     svbool_t pg = svptrue_b32();
-    
+
     // Load wrap indices
     svint32_t indices = svld1_s32(pg, wrapIndices + i);
-    
+
     // Gather from baseIndices using wrapIndices
     svint32_t gathered = svld1_gather_s32index_s32(pg, baseIndices, indices);
-    
+
     // Store results
     svst1_s32(pg, resultIndices + i, gathered);
   }
-  
+
   // Tail handling: process remaining elements
   if (i < wrapSize) {
     svbool_t pg = svwhilelt_b32(i, wrapSize);
-    
+
     // Load wrap indices
     svint32_t indices = svld1_s32(pg, wrapIndices + i);
-    
+
     // Gather from baseIndices using wrapIndices
     svint32_t gathered = svld1_gather_s32index_s32(pg, baseIndices, indices);
-    
+
     // Store results
     svst1_s32(pg, resultIndices + i, gathered);
   }
@@ -1076,39 +1078,41 @@ void BaseVector::transposeIndicesWithNulls(
     uint64_t* resultNulls) {
 #if defined(__ARM_FEATURE_SVE)
   // Use SVE for efficient indexed access with predication
-  static_assert(sizeof(vector_size_t) == sizeof(int32_t), "SVE implementation assumes vector_size_t is 32-bit");
+  static_assert(
+      sizeof(vector_size_t) == sizeof(int32_t),
+      "SVE implementation assumes vector_size_t is 32-bit");
   int32_t i = 0;
-  
+
   // Main loop: process full vectors
   int32_t svSize = svcntw();
   for (; i + svSize <= wrapSize; i += svSize) {
     // No need for svwhilelt here - full vector
     svbool_t pg = svptrue_b32();
-    
+
     // Load wrap indices
     svint32_t indices = svld1_s32(pg, wrapIndices + i);
-    
+
     // Gather from baseIndices
     svint32_t gathered = svld1_gather_s32index_s32(pg, baseIndices, indices);
-    
+
     // Store results
     svst1_s32(pg, resultIndices + i, gathered);
   }
-  
+
   // Tail handling: process remaining elements
   if (i < wrapSize) {
     svbool_t pg = svwhilelt_b32(i, wrapSize);
-    
+
     // Load wrap indices
     svint32_t indices = svld1_s32(pg, wrapIndices + i);
-    
+
     // Gather from baseIndices
     svint32_t gathered = svld1_gather_s32index_s32(pg, baseIndices, indices);
-    
+
     // Store results
     svst1_s32(pg, resultIndices + i, gathered);
   }
-  
+
   // Handle nulls separately (simplified for initial SVE support)
   if (wrapNulls || baseNulls) {
     for (auto i = 0; i < wrapSize; ++i) {

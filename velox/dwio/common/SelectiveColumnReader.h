@@ -420,14 +420,12 @@ class SelectiveColumnReader {
   bool useArmBulkPath() const {
     auto* filter = scanSpec_->filter();
     const auto typeKind = requestedType_->kind();
-    const bool shouldDisableArmBulk =
-        requestedType_->isDecimal() || typeKind == TypeKind::BOOLEAN ||
-        typeKind == TypeKind::TINYINT || typeKind == TypeKind::SMALLINT ||
-        typeKind == TypeKind::INTEGER || typeKind == TypeKind::BIGINT ||
-        typeKind == TypeKind::HUGEINT || typeKind == TypeKind::VARCHAR ||
-        typeKind == TypeKind::VARBINARY;
-    return hasBulkPath() &&
-        !shouldDisableArmBulk &&
+    const bool shouldDisableArmBulk = requestedType_->isDecimal() ||
+        typeKind == TypeKind::BOOLEAN || typeKind == TypeKind::TINYINT ||
+        typeKind == TypeKind::SMALLINT || typeKind == TypeKind::INTEGER ||
+        typeKind == TypeKind::BIGINT || typeKind == TypeKind::HUGEINT ||
+        typeKind == TypeKind::VARCHAR || typeKind == TypeKind::VARBINARY;
+    return hasBulkPath() && !shouldDisableArmBulk &&
         (!filter ||
          (filter->isDeterministic() &&
           (!nullsInReadRange_ || !filter->testNull()))) &&

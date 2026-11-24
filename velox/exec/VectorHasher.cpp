@@ -80,10 +80,7 @@ uint64_t hashOne(DecodedVector& decoded, vector_size_t index) {
   }
 }
 
-template <
-    bool typeProvidesCustomComparison,
-    TypeKind Kind,
-    DVecLayout Layout>
+template <bool typeProvidesCustomComparison, TypeKind Kind, DVecLayout Layout>
 void hashRows(
     const SelectivityVector& rows,
     uint64_t* hashVec,
@@ -98,10 +95,7 @@ void hashRows(
   });
 }
 
-template <
-    bool typeProvidesCustomComparison,
-    TypeKind Kind,
-    DVecLayout Layout>
+template <bool typeProvidesCustomComparison, TypeKind Kind, DVecLayout Layout>
 void hashMixRows(
     const SelectivityVector& rows,
     uint64_t* result,
@@ -110,7 +104,7 @@ void hashMixRows(
   rows.applyToSelected([&](vector_size_t row) {
     if (decoded.isNullAt<Layout>(row)) {
       result[row] = mix ? bits::hashMix(result[row], VectorHasher::kNullHash)
-                          : VectorHasher::kNullHash;
+                        : VectorHasher::kNullHash;
       return;
     }
     auto hash =
@@ -184,8 +178,10 @@ void VectorHasher::hashValues(
             Kind,
             DVecLayout::kIndexedNullableExtra>(rows, hashVec, decoded_);
       } else {
-        hashRows<typeProvidesCustomComparison, Kind, DVecLayout::kIndexedNullable>(
-            rows, hashVec, decoded_);
+        hashRows<
+            typeProvidesCustomComparison,
+            Kind,
+            DVecLayout::kIndexedNullable>(rows, hashVec, decoded_);
       }
       if (mix) {
         rows.applyToSelected([&](vector_size_t row) {

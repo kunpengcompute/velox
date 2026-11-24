@@ -18,13 +18,13 @@
 #include <algorithm>
 #include <cstring>
 
+#include "velox/buffer/Buffer.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/SimdUtil.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/Operator.h"
 #include "velox/exec/PrefixSort.h"
 #include "velox/external/timsort/TimSort.hpp"
-#include "velox/buffer/Buffer.h"
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -200,11 +200,7 @@ int compareNonPrefixKeys(
 constexpr int32_t kNumWays = 4;
 constexpr int32_t kPrefetchDistance = 64;
 
-void countingPass(
-    char** in,
-    char** out,
-    size_t numRows,
-    uint32_t byteOffset) {
+void countingPass(char** in, char** out, size_t numRows, uint32_t byteOffset) {
   uint32_t counts[kNumWays][257];
   std::memset(counts, 0, sizeof(counts));
 
@@ -213,10 +209,12 @@ void countingPass(
   size_t i = 0;
   for (; i + kPrefetchDistance < numRows; ++i) {
     __builtin_prefetch(in[i + kPrefetchDistance] + byteOffset);
-    ++counts[i & (kNumWays - 1)][1 + static_cast<uint8_t>(*(in[i] + byteOffset))];
+    ++counts[i & (kNumWays - 1)]
+            [1 + static_cast<uint8_t>(*(in[i] + byteOffset))];
   }
   for (; i < numRows; ++i) {
-    ++counts[i & (kNumWays - 1)][1 + static_cast<uint8_t>(*(in[i] + byteOffset))];
+    ++counts[i & (kNumWays - 1)]
+            [1 + static_cast<uint8_t>(*(in[i] + byteOffset))];
   }
 
   // Merge sub-histograms into counts[0].
@@ -289,7 +287,8 @@ bool SpillRadixSort::canSort(
   if (rowContainer == nullptr) {
     return false;
   }
-  const auto normalizedFlags = compareFlagsOrDefault(rowContainer, compareFlags);
+  const auto normalizedFlags =
+      compareFlagsOrDefault(rowContainer, compareFlags);
   const auto layout = generateLayout(rowContainer, normalizedFlags, config);
   return validForRadix(layout, numRows, config);
 }
@@ -302,7 +301,8 @@ void SpillRadixSort::sort(
     memory::MemoryPool* pool,
     SpillRows& rows) {
   const auto numRows = rows.size();
-  const auto normalizedFlags = compareFlagsOrDefault(rowContainer, compareFlags);
+  const auto normalizedFlags =
+      compareFlagsOrDefault(rowContainer, compareFlags);
   const auto layout = generateLayout(rowContainer, normalizedFlags, config);
   VELOX_CHECK(
       validForRadix(layout, numRows, config),
@@ -320,10 +320,8 @@ void SpillRadixSort::sort(
   const auto bytesPerChunk =
       static_cast<uint64_t>(config.maxPrefixBufferChunkPages) *
       memory::AllocationTraits::kPageSize;
-  const auto rowsPerChunk =
-      std::max<uint64_t>(1, bytesPerChunk / entrySize);
-  const auto numChunks =
-      (numRows + rowsPerChunk - 1) / rowsPerChunk;
+  const auto rowsPerChunk = std::max<uint64_t>(1, bytesPerChunk / entrySize);
+  const auto numChunks = (numRows + rowsPerChunk - 1) / rowsPerChunk;
   std::vector<memory::ContiguousAllocation> chunkAllocs(numChunks);
   std::vector<char*> chunks(numChunks);
   BufferPtr srcBuffer;
@@ -385,11 +383,8 @@ void SpillRadixSort::sort(
         << "SpillRadixSort::sort falling back to comparator sort after "
         << "allocation failure: " << e.what();
     gfx::timsort(
-        rows.begin(),
-        rows.end(),
-        [&](const char* left, const char* right) {
-          return rowContainer->compareRows(
-                     left, right, normalizedFlags) < 0;
+        rows.begin(), rows.end(), [&](const char* left, const char* right) {
+          return rowContainer->compareRows(left, right, normalizedFlags) < 0;
         });
     return;
   }

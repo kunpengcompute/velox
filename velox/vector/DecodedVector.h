@@ -179,19 +179,18 @@ class DecodedVector {
   /// data().
   template <Layout layout = Layout::kUnknown>
   vector_size_t index(vector_size_t idx) const {
-    if constexpr (layout == Layout::kIdentity ||
-                  layout == Layout::kIdentityNullable) {
+    if constexpr (
+        layout == Layout::kIdentity || layout == Layout::kIdentityNullable) {
       return idx;
-                  }
-    if constexpr (layout == Layout::kConst ||
-                  layout == Layout::kConstNull) {
+    }
+    if constexpr (layout == Layout::kConst || layout == Layout::kConstNull) {
       return constantIndex_;
-                  }
-    if constexpr (layout == Layout::kIndexed ||
-                  layout == Layout::kIndexedNullable ||
-                  layout == Layout::kIndexedNullableExtra) {
+    }
+    if constexpr (
+        layout == Layout::kIndexed || layout == Layout::kIndexedNullable ||
+        layout == Layout::kIndexedNullableExtra) {
       return indices_[idx];
-                  }
+    }
 
     if (isIdentityMapping_) {
       return idx;
@@ -249,8 +248,9 @@ class DecodedVector {
       return false;
     } else if constexpr (layout == Layout::kConstNull) {
       return true;
-    } else if constexpr (layout == Layout::kIdentityNullable ||
-                         layout == Layout::kIndexedNullableExtra) {
+    } else if constexpr (
+        layout == Layout::kIdentityNullable ||
+        layout == Layout::kIndexedNullableExtra) {
       return bits::isBitNull(nulls_, idx);
     } else if constexpr (layout == Layout::kIndexedNullable) {
       return bits::isBitNull(nulls_, indices_[idx]);
@@ -411,9 +411,8 @@ class DecodedVector {
   }
 
   static constexpr bool withoutNull(Layout layout) {
-    return layout == Layout::kIdentity ||
-           layout == Layout::kConst ||
-           layout == Layout::kIndexed;
+    return layout == Layout::kIdentity || layout == Layout::kConst ||
+        layout == Layout::kIndexed;
   }
 
  private:

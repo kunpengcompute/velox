@@ -21,6 +21,24 @@ import regex
 import sys
 
 
+DEFAULT_HEADER = "scripts/checks/license.header"
+META_COPYRIGHT = " Copyright (c) Meta Platforms, Inc. and its affiliates."
+ASF_HEADER = """ Licensed to the Apache Software Foundation (ASF) under one or more
+ contributor license agreements.  See the NOTICE file distributed with
+ this work for additional information regarding copyright ownership.
+ The ASF licenses this file to You under the Apache License, Version 2.0
+ (the "License"); you may not use this file except in compliance with
+ the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.""".splitlines()
+
+
 class attrdict(dict):
     __getattr__ = dict.__getitem__
     __setattr__ = dict.__setitem__
@@ -28,9 +46,7 @@ class attrdict(dict):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Update license headers")
-    parser.add_argument(
-        "--header", default="scripts/checks/license.header", help="header file"
-    )
+    parser.add_argument("--header", default=DEFAULT_HEADER, help="header file")
     parser.add_argument(
         "--extra",
         default=80,
@@ -163,6 +179,16 @@ def main():
             log_to = sys.stdout
 
     header_text = file_lines(args.header)
+    alternate_headers = []
+    if not args.remove and os.path.normpath(args.header) == os.path.normpath(
+        DEFAULT_HEADER
+    ):
+        # Accept complete Apache 2.0 notices without assigning new copyright.
+        alternate_headers = [
+            header_text[2:],
+            [META_COPYRIGHT, *header_text[1:]],
+            ASF_HEADER,
+        ]
 
     if len(args.files) == 1 and args.files[0] == "-":
         files = [file.strip() for file in sys.stdin.readlines()]
@@ -189,11 +215,18 @@ def main():
         # Look for an exact substr match
         #
         found = content.find(header_comment, 0, len(header_comment) + args.extra)
+        if not args.remove and (
+            found >= 0
+            or any(
+                content.find(comment, 0, len(comment) + args.extra) >= 0
+                for comment in (
+                    wrap.wrapper(header, args) for header in alternate_headers
+                )
+            )
+        ):
+            message(log_to, "OK   : " + filepath)
+            continue
         if found >= 0:
-            if not args.remove:
-                message(log_to, "OK   : " + filepath)
-                continue
-
             start = found
             end = found + len(header_comment)
         else:

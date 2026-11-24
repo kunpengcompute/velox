@@ -1,21 +1,34 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #pragma once
 
 #include <unordered_map>
 
 #include "velox/common/base/RuntimeMetrics.h"
-#include "velox/vector/ComplexVector.h"
 #include "velox/common/base/SpillStats.h"
 #include "velox/exec/AggregateInfo.h"
 #include "velox/exec/HashTable.h"
+#include "velox/vector/ComplexVector.h"
 
 namespace facebook::velox::exec {
 
 using RuntimeStats = std::unordered_map<std::string, RuntimeMetric>;
 
 class GroupAggregation {
-public:
-
-  virtual void addInput(const RowVectorPtr &input, bool mayPushdown) = 0;
+ public:
+  virtual void addInput(const RowVectorPtr& input, bool mayPushdown) = 0;
 
   virtual void noMoreInput() = 0;
 
@@ -34,8 +47,8 @@ public:
   virtual bool getOutput(
       int32_t maxOutputRows,
       int32_t maxOutputBytes,
-      RowContainerIterator &iterator,
-      RowVectorPtr &result) = 0;
+      RowContainerIterator& iterator,
+      RowVectorPtr& result) = 0;
 
   virtual uint64_t allocatedBytes() const = 0;
 
@@ -54,10 +67,11 @@ public:
   virtual bool isPartialFull(int64_t maxBytes) = 0;
 
   /// Returns the count of the hash table, if any.
-  virtual int64_t numDistinct() const  = 0;
+  virtual int64_t numDistinct() const = 0;
 
   /// Returns number of global grouping sets rows if there is default output.
-  virtual std::optional<vector_size_t> numDefaultGlobalGroupingSetRows() const  = 0;
+  virtual std::optional<vector_size_t> numDefaultGlobalGroupingSetRows()
+      const = 0;
 
   /// Spills all the rows in container.
   virtual void spill() = 0;
@@ -65,7 +79,7 @@ public:
   /// Spills all the rows in container starting from the offset specified by
   /// 'rowIterator'. This should be only called during output processing and
   /// when no spill has occurred previously.
-  virtual void spill(const RowContainerIterator &rowIterator) = 0;
+  virtual void spill(const RowContainerIterator& rowIterator) = 0;
 
   /// Returns the spiller stats including total bytes and rows spilled so far.
   virtual std::optional<common::SpillStats> spilledStats() const = 0;
@@ -82,21 +96,23 @@ public:
 
   /// Translates the raw input in input to accumulators initialized from a
   /// single input row. Passes grouping keys through.
-  virtual void toIntermediate(const RowVectorPtr &input, RowVectorPtr &result) = 0;
+  virtual void toIntermediate(
+      const RowVectorPtr& input,
+      RowVectorPtr& result) = 0;
 
   /// Returns default global grouping sets output if there are no input rows.
   /// The default global grouping set output is a single row per global grouping
   /// set with the groupId key and the default aggregate value.
   /// This function can also be used with distinct aggregations.
   virtual bool getDefaultGlobalGroupingSetOutput(
-      RowContainerIterator &iterator,
-      RowVectorPtr &result) = 0;
+      RowContainerIterator& iterator,
+      RowVectorPtr& result) = 0;
 
-  virtual memory::MemoryPool &testingPool() const  = 0;
+  virtual memory::MemoryPool& testingPool() const = 0;
 
   virtual std::optional<int64_t> estimateOutputRowSize() const = 0;
 
-  virtual void updateRuntimeStats(RuntimeStats &runtimeStats) = 0;
+  virtual void updateRuntimeStats(RuntimeStats& runtimeStats) = 0;
 
   virtual size_t distinctNewGroupsNum() = 0;
 
@@ -107,7 +123,6 @@ public:
   virtual void getNewGroupIndices(BufferPtr indices) = 0;
 
   virtual ~GroupAggregation() {}
-
 };
 
 struct GroupAggParams {
@@ -123,7 +138,6 @@ struct GroupAggParams {
   tsan_atomic<bool>* nonReclaimableSection;
   OperatorCtx* operatorCtx;
   bool supportFlatAgg;
-
 };
 
-}
+} // namespace facebook::velox::exec

@@ -15,7 +15,6 @@
  */
 
 #include "velox/exec/Spiller.h"
-#include "velox/exec/TaperHashTableWrapper.h"
 #include <folly/ScopeGuard.h>
 #include "velox/common/base/AsyncSource.h"
 #include "velox/common/memory/MemoryArbitrator.h"
@@ -24,6 +23,7 @@
 #include "velox/exec/HashJoinBridge.h"
 #include "velox/exec/PrefixSort.h"
 #include "velox/exec/SpillRadixSort.h"
+#include "velox/exec/TaperHashTableWrapper.h"
 #include "velox/external/timsort/TimSort.hpp"
 
 using facebook::velox::common::testutil::TestValue;
@@ -182,8 +182,9 @@ void SpillerBase::runSpill(bool lastRun) {
     if (spillRuns_[partition].rows.empty()) {
       continue;
     }
-    writes.push_back(memory::createAsyncMemoryReclaimTask<SpillStatus>(
-        [partition, this]() { return writeSpill(partition); }));
+    writes.push_back(
+        memory::createAsyncMemoryReclaimTask<SpillStatus>(
+            [partition, this]() { return writeSpill(partition); }));
     if ((writes.size() > 1) && executor_ != nullptr) {
       executor_->add([source = writes.back()]() { source->prepare(); });
     }
@@ -482,9 +483,7 @@ void SortOutputSpiller::runSpill(bool lastRun) {
   }
 }
 
-template void SpillerBase::spill(
-    const RowContainerIterator*,
-    RowContainer*);
+template void SpillerBase::spill(const RowContainerIterator*, RowContainer*);
 template void SpillerBase::spill(
     const RowContainerIterator*,
     TaperFlatHashTableWrapper::FlatRowContainer*);

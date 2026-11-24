@@ -17,8 +17,8 @@
 
 #include <algorithm>
 
-#include "velox/common/testutil/TestValue.h"
 #include "velox/common/base/TemplateHelpers.h"
+#include "velox/common/testutil/TestValue.h"
 #include "velox/exec/AggregateInfo.h"
 #include "velox/exec/HashTable.h"
 #include "velox/exec/Task.h"
@@ -494,8 +494,7 @@ void GroupingSet::createHashTable() {
   }
 
   lookup_ = std::make_unique<HashLookup>(table_->hashers());
-  if (!isAdaptive_ &&
-      !BaseHashTable::isGenericHashMode(table_->hashMode())) {
+  if (!isAdaptive_ && !BaseHashTable::isGenericHashMode(table_->hashMode())) {
     table_->forceGenericHashMode(BaseHashTable::kNoSpillInputStartPartitionBit);
   }
 }
@@ -1514,8 +1513,9 @@ void GroupingSet::toIntermediate(
         &aggregateVector);
   }
   if (intermediateRows_) {
-    intermediateRows_->eraseRows(folly::Range<char**>(
-        intermediateGroups_.data(), intermediateGroups_.size()));
+    intermediateRows_->eraseRows(
+        folly::Range<char**>(
+            intermediateGroups_.data(), intermediateGroups_.size()));
   }
 
   // It's unnecessary to call function->clear() to reset the internal states of

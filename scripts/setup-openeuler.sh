@@ -33,9 +33,9 @@ set -efx -o pipefail
 SCRIPTDIR=$(dirname "${BASH_SOURCE[0]}")
 source $SCRIPTDIR/setup-helper-functions.sh
 NPROC=$(getconf _NPROCESSORS_ONLN)
-export CXXFLAGS=$(get_cxx_flags) # Used by boost.
-export CFLAGS=${CXXFLAGS//"-std=c++17"/} # Used by LZO.
-CMAKE_BUILD_TYPE="${BUILD_TYPE:-Release}"
+CXXFLAGS=$(get_cxx_flags) # Used by boost.
+export CXXFLAGS
+export CFLAGS=${CXXFLAGS//"-std=c++17"/}        # Used by LZO.
 VELOX_BUILD_SHARED=${VELOX_BUILD_SHARED:-"OFF"} #Build folly and gflags shared for use in libvelox.so.
 BUILD_DUCKDB="${BUILD_DUCKDB:-true}"
 USE_CLANG="${USE_CLANG:-false}"
@@ -45,8 +45,6 @@ DEPENDENCY_DIR=${DEPENDENCY_DIR:-$(pwd)/deps-download}
 
 FB_OS_VERSION="v2024.07.01.00"
 FMT_VERSION="10.1.1"
-BOOST_VERSION="boost-1.84.0"
-ARROW_VERSION="15.0.0"
 STEMMER_VERSION="2.2.0"
 DUCKDB_VERSION="v0.8.1"
 
@@ -60,7 +58,7 @@ function get_dependency_url {
   local OVERRIDE_VAR="VELOX_SETUP_${DEPENDENCY_NAME}_URL"
   local OVERRIDE_URL="${!OVERRIDE_VAR:-}"
 
-  if [[ -n "${OVERRIDE_URL}" ]]; then
+  if [[ -n ${OVERRIDE_URL} ]]; then
     echo -n "${OVERRIDE_URL}"
   else
     echo -n "${DEFAULT_URL}"
@@ -199,7 +197,7 @@ function install_mvfst {
 }
 
 function install_duckdb {
-  if $BUILD_DUCKDB ; then
+  if $BUILD_DUCKDB; then
     echo 'Building DuckDB'
     wget_and_untar_dependency DUCKDB https://gitee.com/mirrors/duckdb/repository/archive/${DUCKDB_VERSION}.tar.gz duckdb
     cmake_install_dir duckdb -DBUILD_UNITTESTS=OFF -DENABLE_SANITIZER=OFF -DENABLE_UBSAN=OFF -DBUILD_SHELL=OFF -DEXPORT_DLL_SYMBOLS=OFF -DCMAKE_BUILD_TYPE=Release
@@ -250,8 +248,9 @@ function install_arrow {
 function install_cuda {
   # See https://developer.nvidia.com/cuda-downloads
   ${SUDO} dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
-  local dashed="$(echo $1 | tr '.' '-')"
-  ${SUDO} dnf install -y cuda-nvcc-$dashed cuda-cudart-devel-$dashed cuda-nvrtc-devel-$dashed cuda-driver-devel-$dashed 
+  local dashed
+  dashed="$(echo "$1" | tr '.' '-')"
+  ${SUDO} dnf install -y cuda-nvcc-$dashed cuda-cudart-devel-$dashed cuda-nvrtc-devel-$dashed cuda-driver-devel-$dashed
 }
 
 function install_velox_deps {
@@ -273,7 +272,7 @@ function install_velox_deps {
   run_and_time install_arrow
 }
 
-(return 2> /dev/null) && return # If script was sourced, don't run commands.
+(return 2>/dev/null) && return # If script was sourced, don't run commands.
 
 (
   if [[ $# -ne 0 ]]; then

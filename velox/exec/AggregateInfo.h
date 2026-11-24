@@ -31,9 +31,8 @@ template <
     typename TAccumulator,
     typename ResultType,
     bool Overflow>
-using SumAggregate =
-    functions::aggregate::
-        SumAggregateBase<TInput, TAccumulator, ResultType, Overflow>;
+using SumAggregate = functions::aggregate::
+    SumAggregateBase<TInput, TAccumulator, ResultType, Overflow>;
 
 using RowBasedAggVars = std::variant<
     std::monostate,
@@ -43,7 +42,7 @@ using RowBasedAggVars = std::variant<
 struct RowBasedAggVarsWrapper {
   RowBasedAggVars vars;
 
-  template<typename T>
+  template <typename T>
   std::unique_ptr<T> set(std::unique_ptr<T> p) {
     vars = *p;
     return p;

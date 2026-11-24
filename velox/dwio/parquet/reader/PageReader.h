@@ -271,7 +271,8 @@ class PageReader {
   callDecoder(const uint64_t* nulls, bool& nullsFromFastPath, Visitor visitor) {
     if (nulls) {
 #if defined(__aarch64__)
-    nullsFromFastPath = dwio::common::useArmFastPath<Visitor, true>(visitor) &&
+      nullsFromFastPath =
+          dwio::common::useArmFastPath<Visitor, true>(visitor) &&
 #else
       nullsFromFastPath = dwio::common::useFastPath<Visitor, true>(visitor) &&
 #endif
@@ -311,7 +312,8 @@ class PageReader {
     if (nulls) {
       if (isDictionary()) {
 #if defined(__aarch64__)
-        nullsFromFastPath = dwio::common::useArmFastPath<Visitor, true>(visitor);
+        nullsFromFastPath =
+            dwio::common::useArmFastPath<Visitor, true>(visitor);
 #else
         nullsFromFastPath = dwio::common::useFastPath<Visitor, true>(visitor);
 #endif

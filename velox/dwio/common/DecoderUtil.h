@@ -406,11 +406,9 @@ bool nonNullRowsFromSparse(
 // See SelectiveColumnReader::useArmBulkPath.
 template <typename Visitor, bool hasNulls>
 bool useArmFastPath(Visitor& visitor) {
-  constexpr bool isInteger =
-      std::is_integral_v<typename Visitor::DataType> ||
+  constexpr bool isInteger = std::is_integral_v<typename Visitor::DataType> ||
       std::is_same_v<typename Visitor::DataType, int128_t>;
-  return !isInteger &&
-      Visitor::FilterType::deterministic &&
+  return !isInteger && Visitor::FilterType::deterministic &&
       Visitor::kHasBulkPath &&
       (std::
            is_same_v<typename Visitor::FilterType, velox::common::AlwaysTrue> ||

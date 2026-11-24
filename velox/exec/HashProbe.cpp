@@ -1428,8 +1428,8 @@ void HashProbe::computePassedBits(int32_t numRows) {
       bits::andBits(passedBits_.data(), values, 0, numRows);
     }
   } else if (decodedFilterResult_.isConstantMapping()) {
-    // Constant result: if true and non-null, passedBits_ already has input bits.
-    // If false or null, clear all.
+    // Constant result: if true and non-null, passedBits_ already has input
+    // bits. If false or null, clear all.
     if (decodedFilterResult_.isNullAt(0) ||
         !decodedFilterResult_.valueAt<bool>(0)) {
       std::memset(passedBits_.data(), 0, numWords * sizeof(uint64_t));
@@ -1437,8 +1437,7 @@ void HashProbe::computePassedBits(int32_t numRows) {
   } else {
     // Dictionary or other encoding: fall back to per-row check.
     for (auto i = 0; i < numRows; ++i) {
-      if (!filterInputRows_.isValid(i) ||
-          decodedFilterResult_.isNullAt(i) ||
+      if (!filterInputRows_.isValid(i) || decodedFilterResult_.isNullAt(i) ||
           !decodedFilterResult_.valueAt<bool>(i)) {
         bits::clearBit(passedBits_.data(), i);
       }

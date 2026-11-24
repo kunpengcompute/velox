@@ -40,10 +40,8 @@ inline bool aarch64HasCrc32() {
 // state and the caller inverts the final result. The armv8 CRC32 extension
 // implements exactly this polynomial, so results are bit-identical to the
 // folly/boost table-driven implementation.
-__attribute__((target("+crc"))) inline uint32_t crc32Hw(
-    const uint8_t* data,
-    size_t size,
-    uint32_t crc) {
+__attribute__((target("+crc"))) inline uint32_t
+crc32Hw(const uint8_t* data, size_t size, uint32_t crc) {
   while (size >= 8) {
     uint64_t v;
     std::memcpy(&v, data, 8);

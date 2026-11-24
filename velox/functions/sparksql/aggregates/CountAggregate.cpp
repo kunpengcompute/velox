@@ -59,8 +59,7 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
         std::fill_n(values, rows.size(), int64_t(1));
       } else {
         std::memset(values, 0, rows.size() * sizeof(int64_t));
-        rows.applyToSelected(
-            [&](vector_size_t i) { values[i] = 1; });
+        rows.applyToSelected([&](vector_size_t i) { values[i] = 1; });
       }
       return;
     }
@@ -81,17 +80,14 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
         if (rows.isAllSelected()) {
           std::fill_n(values, rows.size(), int64_t(1));
         } else {
-          rows.applyToSelected(
-              [&](vector_size_t i) { values[i] = 1; });
+          rows.applyToSelected([&](vector_size_t i) { values[i] = 1; });
         }
       } else {
         // bit == 1 means non-null.
         if (rows.isAllSelected()) {
           std::memset(values, 0, rows.size() * sizeof(int64_t));
           bits::forEachWord(
-              rows.begin(),
-              rows.end(),
-              [&](int32_t wordIdx, uint64_t mask) {
+              rows.begin(), rows.end(), [&](int32_t wordIdx, uint64_t mask) {
                 uint64_t word = rawNulls[wordIdx] & mask;
                 while (word) {
                   const auto bit = __builtin_ctzll(word);
@@ -102,9 +98,7 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
         } else {
           const uint64_t* selectedBits = rows.allBits();
           bits::forEachWord(
-              rows.begin(),
-              rows.end(),
-              [&](int32_t wordIdx, uint64_t mask) {
+              rows.begin(), rows.end(), [&](int32_t wordIdx, uint64_t mask) {
                 uint64_t word =
                     (selectedBits[wordIdx] & rawNulls[wordIdx]) & mask;
                 while (word) {
@@ -124,8 +118,7 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
         if (rows.isAllSelected()) {
           std::fill_n(values, rows.size(), int64_t(1));
         } else {
-          rows.applyToSelected(
-              [&](vector_size_t i) { values[i] = 1; });
+          rows.applyToSelected([&](vector_size_t i) { values[i] = 1; });
         }
       } else if (rows.isAllSelected()) {
         std::memset(values, 0, rows.size() * sizeof(int64_t));
@@ -140,8 +133,7 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
       if (rows.isAllSelected()) {
         std::fill_n(values, rows.size(), v);
       } else if (v) {
-        rows.applyToSelected(
-            [&](vector_size_t i) { values[i] = 1; });
+        rows.applyToSelected([&](vector_size_t i) { values[i] = 1; });
       }
     } else if (decoded.mayHaveNulls()) {
       rows.applyToSelected(
@@ -324,8 +316,7 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
           sum += rawValues[i];
         }
       } else {
-        rows.applyToSelected(
-            [&](vector_size_t i) { sum += rawValues[i]; });
+        rows.applyToSelected([&](vector_size_t i) { sum += rawValues[i]; });
       }
       addToGroup(group, sum);
       return;
@@ -375,9 +366,7 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
     }
     const uint64_t* selectedBits = rows.allBits();
     bits::forEachWord(
-        rows.begin(),
-        rows.end(),
-        [&](int32_t wordIdx, uint64_t mask) {
+        rows.begin(), rows.end(), [&](int32_t wordIdx, uint64_t mask) {
           uint64_t word = selectedBits[wordIdx] & mask;
           while (word) {
             const auto bit = __builtin_ctzll(word);
@@ -395,9 +384,7 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
       const uint64_t* rawNulls) {
     if (rows.isAllSelected()) {
       bits::forEachWord(
-          rows.begin(),
-          rows.end(),
-          [&](int32_t wordIdx, uint64_t mask) {
+          rows.begin(), rows.end(), [&](int32_t wordIdx, uint64_t mask) {
             uint64_t word = rawNulls[wordIdx] & mask;
             while (word) {
               const auto bit = __builtin_ctzll(word);
@@ -411,9 +398,7 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
     }
     const uint64_t* selectedBits = rows.allBits();
     bits::forEachWord(
-        rows.begin(),
-        rows.end(),
-        [&](int32_t wordIdx, uint64_t mask) {
+        rows.begin(), rows.end(), [&](int32_t wordIdx, uint64_t mask) {
           uint64_t word = (selectedBits[wordIdx] & rawNulls[wordIdx]) & mask;
           while (word) {
             const auto bit = __builtin_ctzll(word);
@@ -434,9 +419,7 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
     const uint64_t* selectedBits = rows.allBits();
     int64_t cnt = 0;
     bits::forEachWord(
-        rows.begin(),
-        rows.end(),
-        [&](int32_t wordIdx, uint64_t mask) {
+        rows.begin(), rows.end(), [&](int32_t wordIdx, uint64_t mask) {
           cnt += __builtin_popcountll(
               (selectedBits[wordIdx] & rawNulls[wordIdx]) & mask);
         });

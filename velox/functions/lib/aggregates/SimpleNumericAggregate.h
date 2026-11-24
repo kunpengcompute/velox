@@ -35,8 +35,8 @@ class SimpleNumericAggregate : public exec::Aggregate {
   }
 
   DecodedVector::Layout registerSingleInput(
-       const std::vector<VectorPtr>& inputVecs,
-       const SelectivityVector& rows) {
+      const std::vector<VectorPtr>& inputVecs,
+      const SelectivityVector& rows) {
     VELOX_CHECK_EQ(inputVecs.size(), 1);
     inputDecoded_.decode(*inputVecs.at(0), rows);
     return DecodedVector::getLayout(inputDecoded_);
@@ -91,10 +91,10 @@ class SimpleNumericAggregate : public exec::Aggregate {
 
   template <typename TData = TResult, typename ExtractOneValue>
   void doExtractValue(
-    char* group,
-    VectorPtr &result,
-    int32_t rowIndex,
-    ExtractOneValue extractOneValue) {
+      char* group,
+      VectorPtr& result,
+      int32_t rowIndex,
+      ExtractOneValue extractOneValue) {
     VELOX_CHECK_EQ((result)->encoding(), VectorEncoding::Simple::FLAT);
     auto vector = (result)->as<FlatVector<TData>>();
     VELOX_CHECK(

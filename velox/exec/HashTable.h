@@ -20,8 +20,8 @@
 
 #include "velox/common/base/Portability.h"
 #include "velox/common/memory/MemoryAllocator.h"
-#include "velox/exec/Operator.h"
 #include "velox/exec/AggregateInfo.h"
+#include "velox/exec/Operator.h"
 #include "velox/exec/RowContainer.h"
 #include "velox/exec/TaperHashTableWrapper.h"
 #include "velox/exec/VectorHasher.h"
@@ -136,13 +136,7 @@ class BaseHashTable {
   static constexpr uint64_t kArrayHashMaxSize = 2L << 20;
 
   /// Specifies the hash mode of a table.
-  enum class HashMode {
-    kHash,
-    kArray,
-    kNormalizedKey,
-    kTaperHash,
-    kTaperFlat
-  };
+  enum class HashMode { kHash, kArray, kNormalizedKey, kTaperHash, kTaperFlat };
 
   static constexpr int8_t kNoSpillInputStartPartitionBit = -1;
 
@@ -455,8 +449,7 @@ class BaseHashTable {
   __attribute__((__no_sanitize__("thread")))
 #endif
 #endif
-  static TagVector
-  loadTags(uint8_t* tags, int64_t tagIndex) {
+  static TagVector loadTags(uint8_t* tags, int64_t tagIndex) {
     // Cannot use xsimd::batch::unaligned here because we need to skip TSAN.
     auto src = tags + tagIndex;
 #if XSIMD_WITH_SSE2
@@ -1032,7 +1025,8 @@ class HashTable : public BaseHashTable {
     ColEqualsFn equalsFn;
   };
 
-  void buildCompareInfos(const std::vector<std::unique_ptr<VectorHasher>>& hashers);
+  void buildCompareInfos(
+      const std::vector<std::unique_ptr<VectorHasher>>& hashers);
 
   bool fastCompareKeys(const char* group, vector_size_t row);
 
@@ -1189,9 +1183,8 @@ class HashTable : public BaseHashTable {
   // modes: kHash (when enableTaper_ is false) or kTaperHash (when
   // enableTaper_ is true).
   bool isPlainHashMode() const {
-    return enableTaper_
-        ? hashMode_ == HashMode::kTaperHash
-        : hashMode_ == HashMode::kHash;
+    return enableTaper_ ? hashMode_ == HashMode::kTaperHash
+                        : hashMode_ == HashMode::kHash;
   }
 
   // Returns the byte offset of the bucket for 'hash' starting from 'table_'.

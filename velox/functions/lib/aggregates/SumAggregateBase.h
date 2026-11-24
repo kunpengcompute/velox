@@ -123,8 +123,8 @@ class SumAggregateBase
     if (BaseAggregate::inputDecoded_.template isNullAt<layout>(rowIdx)) {
       return;
     }
-    auto val = BaseAggregate::inputDecoded_.template valueAt<TValue, layout>(
-        rowIdx);
+    auto val =
+        BaseAggregate::inputDecoded_.template valueAt<TValue, layout>(rowIdx);
     updateSingleValue(*exec::Aggregate::value<TData>(group), TData(val));
     if (exec::Aggregate::isNull(group)) {
       exec::Aggregate::numNulls_--;
@@ -203,17 +203,13 @@ class SumAggregateBase
                            : "memory");
       return pg;
     } else if (mode == 2) {
-      if (!isBitNull(
-              reinterpret_cast<uint64_t*>(nulls_),
-              0))
-      {
+      if (!isBitNull(reinterpret_cast<uint64_t*>(nulls_), 0)) {
         pg = svptrue_b8();
       } else {
         pg = svpfalse();
       }
       return pg;
     } else if (mode == 3) {
-
       svuint32_t onc = svdup_u32(1);
       svuint32_t inv = svindex_u32(0, 1);
       svuint32_t pow = svlsl_m(svptrue_b32(), onc, inv);
@@ -223,7 +219,7 @@ class SumAggregateBase
       svuint32_t posv, idxbufv, bufv, offsetv;
       svbool_t nullvec, pg1;
 
-      pg1 = svwhilelt_b32(index*8, length);
+      pg1 = svwhilelt_b32(index * 8, length);
       posv = svld1(pg1, dic + index * 8);
       idxbufv = svlsr_x(pg1, posv, 5); // Word index is pos / 32.
       bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
@@ -238,8 +234,8 @@ class SumAggregateBase
         tmpNulls[0] = 0;
       }
 
-      pg1 = svwhilelt_b32(index*8 + 8, length);
-      posv = svld1(pg1, dic + index*8 + 8);
+      pg1 = svwhilelt_b32(index * 8 + 8, length);
+      posv = svld1(pg1, dic + index * 8 + 8);
       idxbufv = svlsr_x(pg1, posv, 5); // Word index is pos / 32.
       bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
       offsetv = svand_m(pg1, posv, 0b11111); // Bit offset is pos % 32.
@@ -253,8 +249,8 @@ class SumAggregateBase
         tmpNulls[1] = 0;
       }
 
-      pg1 = svwhilelt_b32(index*8 + 16, length);
-      posv = svld1(pg1, dic + index*8 + 16);
+      pg1 = svwhilelt_b32(index * 8 + 16, length);
+      posv = svld1(pg1, dic + index * 8 + 16);
       idxbufv = svlsr_x(pg1, posv, 5); // Word index is pos / 32.
       bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
       offsetv = svand_m(pg1, posv, 0b11111); // Bit offset is pos % 32.
@@ -268,8 +264,8 @@ class SumAggregateBase
         tmpNulls[2] = 0;
       }
 
-      pg1 = svwhilelt_b32(index*8 + 24, length);
-      posv = svld1(pg1, dic + index*8 + 24);
+      pg1 = svwhilelt_b32(index * 8 + 24, length);
+      posv = svld1(pg1, dic + index * 8 + 24);
       idxbufv = svlsr_x(pg1, posv, 5); // Word index is pos / 32.
       bufv = svld1_gather_index(pg1, null32ptr, idxbufv);
       offsetv = svand_m(pg1, posv, 0b11111); // Bit offset is pos % 32.
@@ -293,11 +289,10 @@ class SumAggregateBase
     return pg;
   }
 
-  bool clearNullSVE(svuint64_t ptr, svbool_t pg)
-  {
+  bool clearNullSVE(svuint64_t ptr, svbool_t pg) {
     if (this->numNulls_) {
-      svint64_t group = svld1sb_gather_u64base_offset_s64(
-          pg, ptr, this->nullByte_);
+      svint64_t group =
+          svld1sb_gather_u64base_offset_s64(pg, ptr, this->nullByte_);
       svuint8_t group8 = svreinterpret_u8(group);
 
       svuint8_t tmp = svand_n_u8_z(pg, group8, this->nullMask_);
@@ -335,7 +330,7 @@ class SumAggregateBase
     return mask;
   }
 
-    void hashAggUpdateSVEWithCharForNormal(
+  void hashAggUpdateSVEWithCharForNormal(
       char** result,
       uint64_t* bitmap1,
       uint64_t* bitmap2,
@@ -353,21 +348,23 @@ class SumAggregateBase
     int32_t lastWord = roundUp(end, 32);
     svbool_t mask, mask1, mask2;
     svint64_t tmpValue;
-        // count is the element index; one svbool load covers 32 bitmap bits.
+    // count is the element index; one svbool load covers 32 bitmap bits.
     // Helper lambda to get a value for a row index, covering all mode2 cases.
     auto getValueForRow = [&](int32_t row) -> int64_t {
-      if (mode2 == 3) return value[dic[row]];
-      if (mode2 == 2) return value[0];
+      if (mode2 == 3)
+        return value[dic[row]];
+      if (mode2 == 2)
+        return value[0];
       return value[row];
     };
 
-            for (int32_t count = firstWord; count + 32 <= lastWord; count += 32) {
+    for (int32_t count = firstWord; count + 32 <= lastWord; count += 32) {
       int32_t arr8Index = count / 8;
       VELOX_DCHECK(mode1 == 0 || bitmap2_8 != nullptr);
       mask2 = getBitMask(bitmap2_8, arr8Index, mode1, dic, end);
       __asm__ __volatile__("ldr %0, [%1]"
-                                 : "=Upl"(mask1)
-                                                            : "r"(&bitmap1_8[arr8Index])
+                           : "=Upl"(mask1)
+                           : "r"(&bitmap1_8[arr8Index])
                            : "memory");
       mask = svand_b_z(svptrue_b8(), mask1, mask2);
       mask = svand_b_z(svptrue_b8(), mask, svwhilelt_b8(count, end));
@@ -388,11 +385,15 @@ class SumAggregateBase
             svbool_t m20 = getUinqMask(mask20, ptr);
             clearNullSVE(ptr, m20);
             uint8_t flag0[4] = {0, 0, 0, 0};
-            __asm__ __volatile__("str %1, [%0]": : "r" (&flag0[0]), "Upl" (mask20) : "memory");
-            
+            __asm__ __volatile__("str %1, [%0]"
+                                 :
+                                 : "r"(&flag0[0]), "Upl"(mask20)
+                                 : "memory");
+
             for (int i = 0; i < 4; i++) {
               if (flag0[i] != 0) {
-                *exec::Aggregate::value<int64_t>(*(result + count + i)) += getValueForRow(count + i);
+                *exec::Aggregate::value<int64_t>(*(result + count + i)) +=
+                    getValueForRow(count + i);
               }
             }
           }
@@ -403,11 +404,15 @@ class SumAggregateBase
             svbool_t m21 = getUinqMask(mask21, ptr);
             clearNullSVE(ptr, m21);
             uint8_t flag1[4] = {0, 0, 0, 0};
-            __asm__ __volatile__("str %1, [%0]": : "r" (&flag1[0]), "Upl" (mask21) : "memory");
-            
+            __asm__ __volatile__("str %1, [%0]"
+                                 :
+                                 : "r"(&flag1[0]), "Upl"(mask21)
+                                 : "memory");
+
             for (int i = 0; i < 4; i++) {
               if (flag1[i] != 0) {
-                *exec::Aggregate::value<int64_t>(*(result + count + 4 + i)) += getValueForRow(count + 4 + i);
+                *exec::Aggregate::value<int64_t>(*(result + count + 4 + i)) +=
+                    getValueForRow(count + 4 + i);
               }
             }
           }
@@ -422,11 +427,15 @@ class SumAggregateBase
             svbool_t m22 = getUinqMask(mask22, ptr);
             clearNullSVE(ptr, m22);
             uint8_t flag2[4] = {0, 0, 0, 0};
-            __asm__ __volatile__("str %1, [%0]": : "r" (&flag2[0]), "Upl" (mask22) : "memory");
-            
+            __asm__ __volatile__("str %1, [%0]"
+                                 :
+                                 : "r"(&flag2[0]), "Upl"(mask22)
+                                 : "memory");
+
             for (int i = 0; i < 4; i++) {
               if (flag2[i] != 0) {
-                *exec::Aggregate::value<int64_t>(*(result + count + 8 + i)) += getValueForRow(count + 8 + i);
+                *exec::Aggregate::value<int64_t>(*(result + count + 8 + i)) +=
+                    getValueForRow(count + 8 + i);
               }
             }
           }
@@ -437,11 +446,15 @@ class SumAggregateBase
             svbool_t m23 = getUinqMask(mask23, ptr);
             clearNullSVE(ptr, m23);
             uint8_t flag3[4] = {0, 0, 0, 0};
-            __asm__ __volatile__("str %1, [%0]": : "r" (&flag3[0]), "Upl" (mask23) : "memory");
-            
+            __asm__ __volatile__("str %1, [%0]"
+                                 :
+                                 : "r"(&flag3[0]), "Upl"(mask23)
+                                 : "memory");
+
             for (int i = 0; i < 4; i++) {
               if (flag3[i] != 0) {
-                *exec::Aggregate::value<int64_t>(*(result + count + 12 + i)) += getValueForRow(count + 12 + i);
+                *exec::Aggregate::value<int64_t>(*(result + count + 12 + i)) +=
+                    getValueForRow(count + 12 + i);
               }
             }
           }
@@ -460,11 +473,15 @@ class SumAggregateBase
             svbool_t m24 = getUinqMask(mask24, ptr);
             clearNullSVE(ptr, m24);
             uint8_t flag4[4] = {0, 0, 0, 0};
-            __asm__ __volatile__("str %1, [%0]": : "r" (&flag4[0]), "Upl" (mask24) : "memory");
-            
+            __asm__ __volatile__("str %1, [%0]"
+                                 :
+                                 : "r"(&flag4[0]), "Upl"(mask24)
+                                 : "memory");
+
             for (int i = 0; i < 4; i++) {
               if (flag4[i] != 0) {
-                *exec::Aggregate::value<int64_t>(*(result + count + 16 + i)) += getValueForRow(count + 16 + i);
+                *exec::Aggregate::value<int64_t>(*(result + count + 16 + i)) +=
+                    getValueForRow(count + 16 + i);
               }
             }
           }
@@ -475,11 +492,15 @@ class SumAggregateBase
             svbool_t m25 = getUinqMask(mask25, ptr);
             clearNullSVE(ptr, m25);
             uint8_t flag5[4] = {0, 0, 0, 0};
-            __asm__ __volatile__("str %1, [%0]": : "r" (&flag5[0]), "Upl" (mask25) : "memory");
-            
+            __asm__ __volatile__("str %1, [%0]"
+                                 :
+                                 : "r"(&flag5[0]), "Upl"(mask25)
+                                 : "memory");
+
             for (int i = 0; i < 4; i++) {
               if (flag5[i] != 0) {
-                *exec::Aggregate::value<int64_t>(*(result + count + 20 + i)) += getValueForRow(count + 20 + i);
+                *exec::Aggregate::value<int64_t>(*(result + count + 20 + i)) +=
+                    getValueForRow(count + 20 + i);
               }
             }
           }
@@ -495,11 +516,15 @@ class SumAggregateBase
             svbool_t m26 = getUinqMask(mask26, ptr);
             clearNullSVE(ptr, m26);
             uint8_t flag6[4] = {0, 0, 0, 0};
-            __asm__ __volatile__("str %1, [%0]": : "r" (&flag6[0]), "Upl" (mask26) : "memory");
-            
+            __asm__ __volatile__("str %1, [%0]"
+                                 :
+                                 : "r"(&flag6[0]), "Upl"(mask26)
+                                 : "memory");
+
             for (int i = 0; i < 4; i++) {
               if (flag6[i] != 0) {
-                *exec::Aggregate::value<int64_t>(*(result + count + 24 + i)) += getValueForRow(count + 24 + i);
+                *exec::Aggregate::value<int64_t>(*(result + count + 24 + i)) +=
+                    getValueForRow(count + 24 + i);
               }
             }
           }
@@ -510,11 +535,15 @@ class SumAggregateBase
             svbool_t m27 = getUinqMask(mask27, ptr);
             clearNullSVE(ptr, m27);
             uint8_t flag7[4] = {0, 0, 0, 0};
-            __asm__ __volatile__("str %1, [%0]": : "r" (&flag7[0]), "Upl" (mask27) : "memory");
-            
+            __asm__ __volatile__("str %1, [%0]"
+                                 :
+                                 : "r"(&flag7[0]), "Upl"(mask27)
+                                 : "memory");
+
             for (int i = 0; i < 4; i++) {
               if (flag7[i] != 0) {
-                *exec::Aggregate::value<int64_t>(*(result + count + 28 + i)) += getValueForRow(count + 28 + i);
+                *exec::Aggregate::value<int64_t>(*(result + count + 28 + i)) +=
+                    getValueForRow(count + 28 + i);
               }
             }
           }
@@ -565,10 +594,14 @@ class SumAggregateBase
         *exec::Aggregate::value<int64_t>(g2) += getValue(rowBase + r + 2);
         *exec::Aggregate::value<int64_t>(g3) += getValue(rowBase + r + 3);
       } else {
-        if (nibble & 1) accumInt32Row(result[rowBase + r], getValue(rowBase + r));
-        if (nibble & 2) accumInt32Row(result[rowBase + r + 1], getValue(rowBase + r + 1));
-        if (nibble & 4) accumInt32Row(result[rowBase + r + 2], getValue(rowBase + r + 2));
-        if (nibble & 8) accumInt32Row(result[rowBase + r + 3], getValue(rowBase + r + 3));
+        if (nibble & 1)
+          accumInt32Row(result[rowBase + r], getValue(rowBase + r));
+        if (nibble & 2)
+          accumInt32Row(result[rowBase + r + 1], getValue(rowBase + r + 1));
+        if (nibble & 4)
+          accumInt32Row(result[rowBase + r + 2], getValue(rowBase + r + 2));
+        if (nibble & 8)
+          accumInt32Row(result[rowBase + r + 3], getValue(rowBase + r + 3));
       }
     }
     for (; r < rEnd; ++r) {
@@ -580,11 +613,8 @@ class SumAggregateBase
   // Sparse path: ctz bit-scan extracts only set-bit positions, then 4x
   // unrolled accumulation. Efficient when most bits are zero.
   template <typename F>
-  inline __attribute__((always_inline)) void accumWordSparse(
-      char** result,
-      uint64_t bits,
-      int32_t rowBase,
-      F getValue) {
+  inline __attribute__((always_inline)) void
+  accumWordSparse(char** result, uint64_t bits, int32_t rowBase, F getValue) {
     int32_t rows[64];
     int cnt = 0;
     {
@@ -618,11 +648,8 @@ class SumAggregateBase
 
   // Clips bitmap word to [begin, end) range within the 64-row window
   // starting at rowBase. Returns 0 if no active bits remain.
-  static inline __attribute__((always_inline)) uint64_t clipBitsToRange(
-      uint64_t bits,
-      int32_t rowBase,
-      int32_t begin,
-      int32_t end) {
+  static inline __attribute__((always_inline)) uint64_t
+  clipBitsToRange(uint64_t bits, int32_t rowBase, int32_t begin, int32_t end) {
     if (rowBase < begin)
       bits &= ~((1ULL << (begin - rowBase)) - 1);
     if (rowBase + 64 > end) {
@@ -673,7 +700,6 @@ class SumAggregateBase
       int mode1,
       int mode2,
       uint32_t* dic) {
-
     auto getNullBit = [&](int32_t idx) -> bool {
       if (bitmap2 == nullptr)
         return true;
@@ -792,7 +818,6 @@ class SumAggregateBase
       UpdateSingleValue updateSingleValue,
       bool mayPushdown,
       DecodedVector& decoded) {
-
     if constexpr (kMayPushdown<TData>) {
       auto encoding = decoded.base()->encoding();
       if (encoding == VectorEncoding::Simple::LAZY &&
@@ -828,26 +853,10 @@ class SumAggregateBase
     if constexpr (std::is_same_v<TValue, int32_t>) {
       int32_t* value32 = const_cast<int32_t*>(decoded.data<int32_t>());
       hashAggUpdateSVEWithCharForNormalInt32(
-          groups,
-          bitmask1,
-          bitmask2,
-          value32,
-          begin,
-          end,
-          mode1,
-          mode2,
-          dic);
+          groups, bitmask1, bitmask2, value32, begin, end, mode1, mode2, dic);
     } else {
       hashAggUpdateSVEWithCharForNormal(
-          groups,
-          bitmask1,
-          bitmask2,
-          value,
-          begin,
-          end,
-          mode1,
-          mode2,
-          dic);
+          groups, bitmask1, bitmask2, value, begin, end, mode1, mode2, dic);
     }
   }
 
@@ -902,7 +911,7 @@ class SumAggregateBase
       }
     } else
 #endif
-    if (exec::Aggregate::numNulls_) {
+        if (exec::Aggregate::numNulls_) {
       BaseAggregate::template updateGroups<true, TData, TValue>(
           groups, rows, arg, &updateSingleValue<TData>, false);
     } else {

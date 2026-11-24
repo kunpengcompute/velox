@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include <functional>
 #include <gtest/gtest.h>
+#include <functional>
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/testutil/TestValue.h"
@@ -123,8 +123,9 @@ class PrefixSortTest : public exec::test::OperatorTestBase {
         1024,
         12,
     };
-    ASSERT_TRUE(SpillRadixSort::canSort(
-        &rowContainer, compareFlags, rows.size(), config));
+    ASSERT_TRUE(
+        SpillRadixSort::canSort(
+            &rowContainer, compareFlags, rows.size(), config));
     SpillRadixSort::sort(
         &rowContainer, compareFlags, config, sortPool.get(), rows);
 
@@ -264,9 +265,11 @@ TEST_F(PrefixSortTest, spillRadixSortBigintAndString) {
   auto data = makeRowVector({
       makeFlatVector<int64_t>(
           kNumRows, [](auto row) { return 100000 - (row * 37) % 100000; }),
-      makeFlatVector<std::string>(kNumRows, [](auto row) {
-        return fmt::format("same_prefix_{:06}", 100000 - row);
-      }),
+      makeFlatVector<std::string>(
+          kNumRows,
+          [](auto row) {
+            return fmt::format("same_prefix_{:06}", 100000 - row);
+          }),
       makeFlatVector<int32_t>(
           kNumRows, [](auto row) { return static_cast<int32_t>(row); }),
   });
@@ -285,71 +288,78 @@ TEST_F(PrefixSortTest, spillRadixSortWithNulls) {
   auto nullAt = [](vector_size_t row) { return row % 7 == 3; };
 
   std::vector<VectorPtr> testData;
-  testData.push_back(makeFlatVector<int16_t>(
-      kNumRows,
-      [](vector_size_t row) {
-        return static_cast<int16_t>(7919 - (row * 31) % 7919);
-      },
-      nullAt));
-  testData.push_back(makeFlatVector<int32_t>(
-      kNumRows,
-      [](vector_size_t row) {
-        return static_cast<int32_t>(1'000'003 - (row * 131) % 1'000'003);
-      },
-      nullAt));
-  testData.push_back(makeFlatVector<int64_t>(
-      kNumRows,
-      [](vector_size_t row) {
-        return 1'000'000'007LL -
-            (static_cast<int64_t>(row) * 1031) % 1'000'000'007LL;
-      },
-      nullAt));
-  testData.push_back(makeFlatVector<int128_t>(
-      kNumRows,
-      [](vector_size_t row) {
-        return HugeInt::build(
-            static_cast<int64_t>(row) - 750,
-            static_cast<uint64_t>(row) * 6364136223846793005ULL);
-      },
-      nullAt,
-      HUGEINT()));
+  testData.push_back(
+      makeFlatVector<int16_t>(
+          kNumRows,
+          [](vector_size_t row) {
+            return static_cast<int16_t>(7919 - (row * 31) % 7919);
+          },
+          nullAt));
+  testData.push_back(
+      makeFlatVector<int32_t>(
+          kNumRows,
+          [](vector_size_t row) {
+            return static_cast<int32_t>(1'000'003 - (row * 131) % 1'000'003);
+          },
+          nullAt));
+  testData.push_back(
+      makeFlatVector<int64_t>(
+          kNumRows,
+          [](vector_size_t row) {
+            return 1'000'000'007LL -
+                (static_cast<int64_t>(row) * 1031) % 1'000'000'007LL;
+          },
+          nullAt));
+  testData.push_back(
+      makeFlatVector<int128_t>(
+          kNumRows,
+          [](vector_size_t row) {
+            return HugeInt::build(
+                static_cast<int64_t>(row) - 750,
+                static_cast<uint64_t>(row) * 6364136223846793005ULL);
+          },
+          nullAt,
+          HUGEINT()));
   // Floats include a mix of negatives, infinities and NaN to exercise the
   // IEEE-754 bit-twiddling in the encoder.
-  testData.push_back(makeFlatVector<float>(
-      kNumRows,
-      [](vector_size_t row) {
-        if (row == 0) {
-          return std::numeric_limits<float>::quiet_NaN();
-        }
-        if (row == 1) {
-          return -std::numeric_limits<float>::infinity();
-        }
-        if (row == 2) {
-          return std::numeric_limits<float>::infinity();
-        }
-        return 0.5f - static_cast<float>(row) * 0.25f;
-      },
-      nullAt));
-  testData.push_back(makeFlatVector<double>(
-      kNumRows,
-      [](vector_size_t row) {
-        if (row == 0) {
-          return -0.0;
-        }
-        if (row == 1) {
-          return 0.0;
-        }
-        return 1.5 - static_cast<double>(row) * 0.125;
-      },
-      nullAt));
-  testData.push_back(makeFlatVector<Timestamp>(
-      kNumRows,
-      [](vector_size_t row) {
-        return Timestamp(
-            static_cast<int64_t>(1'700'000'000) - row * 13,
-            static_cast<uint64_t>((row * 17) % 1'000'000'000));
-      },
-      nullAt));
+  testData.push_back(
+      makeFlatVector<float>(
+          kNumRows,
+          [](vector_size_t row) {
+            if (row == 0) {
+              return std::numeric_limits<float>::quiet_NaN();
+            }
+            if (row == 1) {
+              return -std::numeric_limits<float>::infinity();
+            }
+            if (row == 2) {
+              return std::numeric_limits<float>::infinity();
+            }
+            return 0.5f - static_cast<float>(row) * 0.25f;
+          },
+          nullAt));
+  testData.push_back(
+      makeFlatVector<double>(
+          kNumRows,
+          [](vector_size_t row) {
+            if (row == 0) {
+              return -0.0;
+            }
+            if (row == 1) {
+              return 0.0;
+            }
+            return 1.5 - static_cast<double>(row) * 0.125;
+          },
+          nullAt));
+  testData.push_back(
+      makeFlatVector<Timestamp>(
+          kNumRows,
+          [](vector_size_t row) {
+            return Timestamp(
+                static_cast<int64_t>(1'700'000'000) - row * 13,
+                static_cast<uint64_t>((row * 17) % 1'000'000'000));
+          },
+          nullAt));
 
   for (const auto& column : testData) {
     SCOPED_TRACE(fmt::format("type {}", column->type()->toString()));
@@ -409,8 +419,7 @@ TEST_F(PrefixSortTest, spillRadixSortResidualCompare) {
             [](vector_size_t row) {
               // First 16+ chars are identical; differences only after the
               // prefix window so radix cannot resolve order alone.
-              return fmt::format(
-                  "common_prefix_padding_{:08}", kNumRows - row);
+              return fmt::format("common_prefix_padding_{:08}", kNumRows - row);
             }),
         makeFlatVector<int64_t>(
             kNumRows,
@@ -447,13 +456,13 @@ TEST_F(PrefixSortTest, spillRadixSortResidualCompare) {
 
     RowContainer rowContainer(keyTypes, {}, pool_.get());
     auto rows = storeRows(numRows, data, &rowContainer);
-    const auto sortPool =
-        rootPool_->addLeafChild("spill-radix-sort-residual");
+    const auto sortPool = rootPool_->addLeafChild("spill-radix-sort-residual");
     // 16 normalized bytes only fits one BIGINT (9 bytes including null
     // byte). The other two keys must be resolved by the timsort fallback.
     const SpillRadixSortConfig config{true, 0, 16, 12};
-    ASSERT_TRUE(SpillRadixSort::canSort(
-        &rowContainer, compareFlags, rows.size(), config));
+    ASSERT_TRUE(
+        SpillRadixSort::canSort(
+            &rowContainer, compareFlags, rows.size(), config));
     SpillRadixSort::sort(
         &rowContainer, compareFlags, config, sortPool.get(), rows);
 
@@ -461,9 +470,7 @@ TEST_F(PrefixSortTest, spillRadixSortResidualCompare) {
     RowContainer ref(keyTypes, {}, pool_.get());
     auto refRows = storeRows(numRows, data, &ref);
     std::sort(
-        refRows.begin(),
-        refRows.end(),
-        [&](const char* l, const char* r) {
+        refRows.begin(), refRows.end(), [&](const char* l, const char* r) {
           for (auto i = 0; i < compareFlags.size(); ++i) {
             const auto c = ref.compare(l, r, i, compareFlags[i]);
             if (c != 0) {
@@ -503,7 +510,8 @@ TEST_F(PrefixSortTest, spillRadixSortFuzz) {
 
   auto runFuzzTest = [&](double nullRatio) {
     for (const auto& type : keyTypes) {
-      SCOPED_TRACE(fmt::format("type {}, nulls {}", type->toString(), nullRatio));
+      SCOPED_TRACE(
+          fmt::format("type {}, nulls {}", type->toString(), nullRatio));
       VectorFuzzer fuzzer(
           {.vectorSize = 4'096, .nullRatio = nullRatio}, pool());
       RowVectorPtr data = fuzzer.fuzzRow(ROW({type}));
@@ -541,17 +549,16 @@ TEST_F(PrefixSortTest, spillRadixSortChunkedAllocation) {
 
   auto runSort = [&](uint32_t chunkPages) {
     const auto rowType = asRowType(data->type());
-    RowContainer rowContainer(
-        {BIGINT(), VARCHAR()}, {}, pool_.get());
+    RowContainer rowContainer({BIGINT(), VARCHAR()}, {}, pool_.get());
     auto rows = storeRows(kNumRows, data, &rowContainer);
-    const auto sortPool =
-        rootPool_->addLeafChild("spill-radix-sort-chunked");
+    const auto sortPool = rootPool_->addLeafChild("spill-radix-sort-chunked");
     SpillRadixSortConfig config;
     config.enabled = true;
     config.minRows = 0;
     config.maxPrefixBufferChunkPages = chunkPages;
-    EXPECT_TRUE(SpillRadixSort::canSort(
-        &rowContainer, compareFlags, rows.size(), config));
+    EXPECT_TRUE(
+        SpillRadixSort::canSort(
+            &rowContainer, compareFlags, rows.size(), config));
     SpillRadixSort::sort(
         &rowContainer, compareFlags, config, sortPool.get(), rows);
 
@@ -597,13 +604,13 @@ TEST_F(PrefixSortTest, spillRadixSortAllocationFailureFallback) {
     const auto rowType = asRowType(data->type());
     RowContainer rowContainer({BIGINT(), VARCHAR()}, {}, pool_.get());
     auto rows = storeRows(kNumRows, data, &rowContainer);
-    const auto sortPool =
-        rootPool_->addLeafChild("spill-radix-sort-fallback");
+    const auto sortPool = rootPool_->addLeafChild("spill-radix-sort-fallback");
     SpillRadixSortConfig config;
     config.enabled = true;
     config.minRows = 0;
-    EXPECT_TRUE(SpillRadixSort::canSort(
-        &rowContainer, compareFlags, rows.size(), config));
+    EXPECT_TRUE(
+        SpillRadixSort::canSort(
+            &rowContainer, compareFlags, rows.size(), config));
 
     if (injectFailure) {
       // Force the chunk allocation to fail so sort() falls back to the
@@ -680,8 +687,9 @@ TEST_F(PrefixSortTest, spillRadixSortCanSortNegative) {
     const std::vector<TypePtr> boolKeys{BOOLEAN()};
     RowContainer boolContainer(boolKeys, {}, pool_.get());
     SpillRadixSortConfig config;
-    EXPECT_FALSE(SpillRadixSort::canSort(
-        &boolContainer, std::vector<CompareFlags>{kAsc}, 10'000, config));
+    EXPECT_FALSE(
+        SpillRadixSort::canSort(
+            &boolContainer, std::vector<CompareFlags>{kAsc}, 10'000, config));
   }
 }
 
@@ -697,10 +705,7 @@ TEST_F(PrefixSortTest, spillRadixSortCountingPass) {
 
   // Reference implementation (scalar).
   auto referenceCountingPass =
-      [](char** in,
-         char** out,
-         size_t numRows,
-         uint32_t byteOffset) {
+      [](char** in, char** out, size_t numRows, uint32_t byteOffset) {
         std::vector<uint32_t> counts(257, 0);
         for (size_t i = 0; i < numRows; ++i) {
           ++counts[1 + static_cast<uint8_t>(*(in[i] + byteOffset))];
@@ -738,11 +743,10 @@ TEST_F(PrefixSortTest, spillRadixSortCountingPass) {
     std::vector<char*> outScalar(kNumRows, nullptr);
     facebook::velox::exec::detail::spillRadixSortCountingPass(
         rows.data(), outSve.data(), kNumRows, byteOffset);
-    referenceCountingPass(
-        rows.data(), outScalar.data(), kNumRows, byteOffset);
+    referenceCountingPass(rows.data(), outScalar.data(), kNumRows, byteOffset);
 
-    EXPECT_EQ(outSve, outScalar) << "counting pass mismatch at byte "
-                                 << byteOffset;
+    EXPECT_EQ(outSve, outScalar)
+        << "counting pass mismatch at byte " << byteOffset;
 
     // Every row must appear exactly once (stable permutation).
     std::vector<bool> seen(kNumRows, false);

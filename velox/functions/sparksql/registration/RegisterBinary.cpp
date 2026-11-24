@@ -15,9 +15,9 @@
  */
 #include "velox/functions/lib/RegistrationHelpers.h"
 #include "velox/functions/prestosql/BinaryFunctions.h"
+#include "velox/functions/sparksql/FusedMd5ConcatWs.h"
 #include "velox/functions/sparksql/Hash.h"
 #include "velox/functions/sparksql/MightContain.h"
-#include "velox/functions/sparksql/FusedMd5ConcatWs.h"
 #include "velox/functions/sparksql/String.h"
 
 namespace facebook::velox::functions::sparksql {
@@ -47,10 +47,9 @@ void registerBinaryFunctions(const std::string& prefix) {
       makeFusedMd5ConcatWs,
       fusedMd5ConcatWsMetadata());
 
-  exec::registerExpressionRewrite(
-      [prefix](const core::TypedExprPtr& expr) {
-        return rewriteMd5ConcatWs(prefix, expr);
-      });
+  exec::registerExpressionRewrite([prefix](const core::TypedExprPtr& expr) {
+    return rewriteMd5ConcatWs(prefix, expr);
+  });
   registerFunction<BloomFilterMightContainFunction, bool, Varbinary, int64_t>(
       {prefix + "might_contain"});
   registerFunction<Sha1HexStringFunction, Varchar, Varbinary>(

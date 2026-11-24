@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include "velox/exec/DebugStat.h"
 #include "velox/exec/HashTable.h"
+#include "velox/exec/DebugStat.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -29,14 +29,13 @@
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/Portability.h"
 #include "velox/common/base/SimdUtil.h"
+#include "velox/common/base/TemplateHelpers.h"
 #include "velox/common/process/ProcessBase.h"
 #include "velox/common/process/TraceContext.h"
 #include "velox/common/testutil/TestValue.h"
+#include "velox/exec/Aggregate.h"
 #include "velox/exec/ContainerRowSerde.h"
 #include "velox/exec/OperatorUtils.h"
-#include "velox/common/base/SimdUtil.h"
-#include "velox/common/base/TemplateHelpers.h"
-#include "velox/exec/Aggregate.h"
 #include "velox/exec/TaperHashTable.h"
 #include "velox/exec/TaperHashTableWrapper.h"
 #include "velox/functions/lib/aggregates/SumAggregateBase.h"
@@ -76,9 +75,13 @@ std::string BaseHashTable::modeString(HashMode mode) {
   }
 }
 
-template <typename TInput, typename TAccumulator, typename ResultType, bool Overflow>
-using SumAggregate =
-    functions::aggregate::SumAggregateBase<TInput, TAccumulator, ResultType, Overflow>;
+template <
+    typename TInput,
+    typename TAccumulator,
+    typename ResultType,
+    bool Overflow>
+using SumAggregate = functions::aggregate::
+    SumAggregateBase<TInput, TAccumulator, ResultType, Overflow>;
 
 #define FOREACH_FLAT_COMPATIBLE_AGGREGATE_CLASS(MACRO) \
   MACRO(SumAggregate<double, double, double, false>)   \
@@ -431,7 +434,7 @@ char* HashTable<ignoreNullKeys>::insertEntry(
 }
 
 namespace {
- 	 
+
 // Type-specialized column equality functions for fastCompareKeys.
 // Resolved once per probe batch via function pointer, eliminating
 // the per-row VELOX_DYNAMIC_TEMPLATE_TYPE_DISPATCH switch.
@@ -443,8 +446,7 @@ bool scalarColEquals(
     const DecodedVector& decoded,
     vector_size_t index) {
   using T = typename KindToFlatVector<Kind>::HashRowType;
-  return *reinterpret_cast<const T*>(row + offset) ==
-      decoded.valueAt<T>(index);
+  return *reinterpret_cast<const T*>(row + offset) == decoded.valueAt<T>(index);
 }
 
 bool varcharColEquals(
@@ -491,8 +493,7 @@ bool varcharColEquals(
   // Slow path: the row's string spans multiple non-contiguous arena chunks.
   // Reassemble via contiguousString() and compare the full string.
   std::string storage;
-  auto contiguous =
-      HashStringAllocator::contiguousString(rowSv, storage);
+  auto contiguous = HashStringAllocator::contiguousString(rowSv, storage);
   return contiguous == probeSv;
 }
 
@@ -739,16 +740,16 @@ inline XXHashColumnBuildResult buildXXHashColumnInfos(
     auto typeKind = decoded.base()->typeKind();
     bool isVarLen =
         (typeKind == TypeKind::VARCHAR || typeKind == TypeKind::VARBINARY);
-    bool isComplex = (typeKind == TypeKind::ROW || typeKind == TypeKind::ARRAY ||
-                      typeKind == TypeKind::MAP);
+    bool isComplex =
+        (typeKind == TypeKind::ROW || typeKind == TypeKind::ARRAY ||
+         typeKind == TypeKind::MAP);
     auto& ci = result.cols[i];
     ci.colType = isComplex ? 2 : (isVarLen ? 1 : 0);
     ci.elementSize =
         (isVarLen || isComplex) ? 0 : decoded.base()->type()->cppSizeInBytes();
     ci.rawData = isComplex ? nullptr : decoded.data<char>();
     ci.decoded = &decoded;
-    ci.nulls =
-        decoded.mayHaveNulls()
+    ci.nulls = decoded.mayHaveNulls()
         ? const_cast<DecodedVector&>(decoded).getNulls()
         : nullptr;
 
@@ -813,10 +814,7 @@ inline void fillChunkColumnIdentity(
         memset(dst + 1, 0, elemSize);
       } else {
         dst[0] = 1;
-        memcpy(
-            dst + 1,
-            data + static_cast<int64_t>(row) * elemSize,
-            elemSize);
+        memcpy(dst + 1, data + static_cast<int64_t>(row) * elemSize, elemSize);
       }
     }
   } else {
@@ -830,10 +828,14 @@ inline void fillChunkColumnIdentity(
           int32x4_t rows = vld1q_s32(sel + i);
           int32x4_t offsets = vshlq_n_s32(rows, 2);
           int32_t src[4];
-          src[0] = *reinterpret_cast<const int32_t*>(data + vgetq_lane_s32(offsets, 0));
-          src[1] = *reinterpret_cast<const int32_t*>(data + vgetq_lane_s32(offsets, 1));
-          src[2] = *reinterpret_cast<const int32_t*>(data + vgetq_lane_s32(offsets, 2));
-          src[3] = *reinterpret_cast<const int32_t*>(data + vgetq_lane_s32(offsets, 3));
+          src[0] = *reinterpret_cast<const int32_t*>(
+              data + vgetq_lane_s32(offsets, 0));
+          src[1] = *reinterpret_cast<const int32_t*>(
+              data + vgetq_lane_s32(offsets, 1));
+          src[2] = *reinterpret_cast<const int32_t*>(
+              data + vgetq_lane_s32(offsets, 2));
+          src[3] = *reinterpret_cast<const int32_t*>(
+              data + vgetq_lane_s32(offsets, 3));
           for (int32_t j = 0; j < 4; ++j) {
             char* dst = chunkBuf + (i + j) * totalRowSize + colOffset;
             dst[0] = 1;
@@ -846,10 +848,14 @@ inline void fillChunkColumnIdentity(
           int32x4_t rows = vld1q_s32(sel + i);
           int32x4_t offsets = vshlq_n_s32(rows, 3);
           int64_t src[4];
-          src[0] = *reinterpret_cast<const int64_t*>(data + vgetq_lane_s32(offsets, 0));
-          src[1] = *reinterpret_cast<const int64_t*>(data + vgetq_lane_s32(offsets, 1));
-          src[2] = *reinterpret_cast<const int64_t*>(data + vgetq_lane_s32(offsets, 2));
-          src[3] = *reinterpret_cast<const int64_t*>(data + vgetq_lane_s32(offsets, 3));
+          src[0] = *reinterpret_cast<const int64_t*>(
+              data + vgetq_lane_s32(offsets, 0));
+          src[1] = *reinterpret_cast<const int64_t*>(
+              data + vgetq_lane_s32(offsets, 1));
+          src[2] = *reinterpret_cast<const int64_t*>(
+              data + vgetq_lane_s32(offsets, 2));
+          src[3] = *reinterpret_cast<const int64_t*>(
+              data + vgetq_lane_s32(offsets, 3));
           for (int32_t j = 0; j < 4; ++j) {
             char* dst = chunkBuf + (i + j) * totalRowSize + colOffset;
             dst[0] = 1;
@@ -870,10 +876,7 @@ inline void fillChunkColumnIdentity(
       auto row = selected[chunkStart + i];
       char* dst = chunkBuf + i * totalRowSize + colOffset;
       dst[0] = 1;
-      memcpy(
-          dst + 1,
-          data + static_cast<int64_t>(row) * elemSize,
-          elemSize);
+      memcpy(dst + 1, data + static_cast<int64_t>(row) * elemSize, elemSize);
     }
   }
 }
@@ -923,10 +926,14 @@ inline void fillChunkColumnAnyMapping(
             int32x4_t rows = vld1q_s32(sel + i);
             int32x4_t offsets = vshlq_n_s32(rows, 2);
             int32_t src[4];
-            src[0] = *reinterpret_cast<const int32_t*>(data + vgetq_lane_s32(offsets, 0));
-            src[1] = *reinterpret_cast<const int32_t*>(data + vgetq_lane_s32(offsets, 1));
-            src[2] = *reinterpret_cast<const int32_t*>(data + vgetq_lane_s32(offsets, 2));
-            src[3] = *reinterpret_cast<const int32_t*>(data + vgetq_lane_s32(offsets, 3));
+            src[0] = *reinterpret_cast<const int32_t*>(
+                data + vgetq_lane_s32(offsets, 0));
+            src[1] = *reinterpret_cast<const int32_t*>(
+                data + vgetq_lane_s32(offsets, 1));
+            src[2] = *reinterpret_cast<const int32_t*>(
+                data + vgetq_lane_s32(offsets, 2));
+            src[3] = *reinterpret_cast<const int32_t*>(
+                data + vgetq_lane_s32(offsets, 3));
             for (int32_t j = 0; j < 4; ++j) {
               char* dst = chunkBuf + (i + j) * totalRowSize + colOffset;
               dst[0] = 1;
@@ -939,10 +946,14 @@ inline void fillChunkColumnAnyMapping(
             int32x4_t rows = vld1q_s32(sel + i);
             int32x4_t offsets = vshlq_n_s32(rows, 3);
             int64_t src[4];
-            src[0] = *reinterpret_cast<const int64_t*>(data + vgetq_lane_s32(offsets, 0));
-            src[1] = *reinterpret_cast<const int64_t*>(data + vgetq_lane_s32(offsets, 1));
-            src[2] = *reinterpret_cast<const int64_t*>(data + vgetq_lane_s32(offsets, 2));
-            src[3] = *reinterpret_cast<const int64_t*>(data + vgetq_lane_s32(offsets, 3));
+            src[0] = *reinterpret_cast<const int64_t*>(
+                data + vgetq_lane_s32(offsets, 0));
+            src[1] = *reinterpret_cast<const int64_t*>(
+                data + vgetq_lane_s32(offsets, 1));
+            src[2] = *reinterpret_cast<const int64_t*>(
+                data + vgetq_lane_s32(offsets, 2));
+            src[3] = *reinterpret_cast<const int64_t*>(
+                data + vgetq_lane_s32(offsets, 3));
             for (int32_t j = 0; j < 4; ++j) {
               char* dst = chunkBuf + (i + j) * totalRowSize + colOffset;
               dst[0] = 1;
@@ -954,7 +965,8 @@ inline void fillChunkColumnAnyMapping(
           auto row = sel[i];
           char* dst = chunkBuf + i * totalRowSize + colOffset;
           dst[0] = 1;
-          memcpy(dst + 1, data + static_cast<int64_t>(row) * elemSize, elemSize);
+          memcpy(
+              dst + 1, data + static_cast<int64_t>(row) * elemSize, elemSize);
         }
         return;
       }
@@ -963,10 +975,7 @@ inline void fillChunkColumnAnyMapping(
         auto row = selected[chunkStart + i];
         char* dst = chunkBuf + i * totalRowSize + colOffset;
         dst[0] = 1;
-        memcpy(
-            dst + 1,
-            data + static_cast<int64_t>(row) * elemSize,
-            elemSize);
+        memcpy(dst + 1, data + static_cast<int64_t>(row) * elemSize, elemSize);
       }
     } else {
       // Dictionary mapping, no nulls.
@@ -975,10 +984,7 @@ inline void fillChunkColumnAnyMapping(
         auto idx = indices[row];
         char* dst = chunkBuf + i * totalRowSize + colOffset;
         dst[0] = 1;
-        memcpy(
-            dst + 1,
-            data + static_cast<int64_t>(idx) * elemSize,
-            elemSize);
+        memcpy(dst + 1, data + static_cast<int64_t>(idx) * elemSize, elemSize);
       }
     }
   } else if (col.nullMode == 1) {
@@ -992,10 +998,7 @@ inline void fillChunkColumnAnyMapping(
         memset(dst + 1, 0, elemSize);
       } else {
         dst[0] = 1;
-        memcpy(
-            dst + 1,
-            data + static_cast<int64_t>(idx) * elemSize,
-            elemSize);
+        memcpy(dst + 1, data + static_cast<int64_t>(idx) * elemSize, elemSize);
       }
     }
   } else {
@@ -1009,10 +1012,7 @@ inline void fillChunkColumnAnyMapping(
         memset(dst + 1, 0, elemSize);
       } else {
         dst[0] = 1;
-        memcpy(
-            dst + 1,
-            data + static_cast<int64_t>(idx) * elemSize,
-            elemSize);
+        memcpy(dst + 1, data + static_cast<int64_t>(idx) * elemSize, elemSize);
       }
     }
   }
@@ -1056,8 +1056,7 @@ void xxhashAllFixedIdentity(
 
   for (vector_size_t chunkStart = 0; chunkStart < numSelected;
        chunkStart += chunkRows) {
-    int32_t chunkSize =
-        std::min<int32_t>(chunkRows, numSelected - chunkStart);
+    int32_t chunkSize = std::min<int32_t>(chunkRows, numSelected - chunkStart);
 
     for (int32_t c = 0; c < numCols; ++c) {
       fillChunkColumnIdentity(
@@ -1071,8 +1070,12 @@ void xxhashAllFixedIdentity(
     }
 
     hashChunkRows(
-        selected.data(), chunkStart, chunkSize,
-        chunkBuf.data(), totalRowSize, hashes.data());
+        selected.data(),
+        chunkStart,
+        chunkSize,
+        chunkBuf.data(),
+        totalRowSize,
+        hashes.data());
   }
 }
 
@@ -1101,8 +1104,7 @@ void xxhashAllFixedAnyMapping(
 
   for (vector_size_t chunkStart = 0; chunkStart < numSelected;
        chunkStart += chunkRows) {
-    int32_t chunkSize =
-        std::min<int32_t>(chunkRows, numSelected - chunkStart);
+    int32_t chunkSize = std::min<int32_t>(chunkRows, numSelected - chunkStart);
 
     for (int32_t c = 0; c < numCols; ++c) {
       fillChunkColumnAnyMapping(
@@ -1116,8 +1118,12 @@ void xxhashAllFixedAnyMapping(
     }
 
     hashChunkRows(
-        selected.data(), chunkStart, chunkSize,
-        chunkBuf.data(), totalRowSize, hashes.data());
+        selected.data(),
+        chunkStart,
+        chunkSize,
+        chunkBuf.data(),
+        totalRowSize,
+        hashes.data());
   }
 }
 
@@ -1152,8 +1158,7 @@ void xxhashMixedColumns(
 
   for (vector_size_t chunkStart = 0; chunkStart < numSelected;
        chunkStart += chunkRows) {
-    int32_t chunkSize =
-        std::min<int32_t>(chunkRows, numSelected - chunkStart);
+    int32_t chunkSize = std::min<int32_t>(chunkRows, numSelected - chunkStart);
     const vector_size_t* const chunkRowsPtr = selected.data() + chunkStart;
 
     // Phase 1: column-major — per-column type-specialized batch hash.
@@ -1163,7 +1168,8 @@ void xxhashMixedColumns(
 
       if (col.isConstant) {
         // Constant column: all rows get the same hash.
-        uint64_t constHash = col.constantIsNull ? kNullColumnHash
+        uint64_t constHash = col.constantIsNull
+            ? kNullColumnHash
             : (col.colType == 0
                    ? XXH3_64bits(
                          col.rawData +
@@ -1233,9 +1239,8 @@ void xxhashMixedColumns(
             if (col.colType == 2) {
               auto* base = col.decoded->base();
               for (int32_t i = 0; i < chunkSize; ++i) {
-                out[i * numCols] = preNull[i]
-                    ? kNullColumnHash
-                    : base->hashValueAt(preIdx[i]);
+                out[i * numCols] =
+                    preNull[i] ? kNullColumnHash : base->hashValueAt(preIdx[i]);
               }
             } else {
               auto* strViews = reinterpret_cast<const StringView*>(col.rawData);
@@ -1260,7 +1265,8 @@ void xxhashMixedColumns(
           if (col.colType == 0) {
             for (int32_t i = 0; i < chunkSize; ++i) {
               out[i * numCols] = XXH3_64bits(
-                  col.rawData + static_cast<int64_t>(preIdx[i]) * col.elementSize,
+                  col.rawData +
+                      static_cast<int64_t>(preIdx[i]) * col.elementSize,
                   col.elementSize);
             }
           } else if (col.colType == 2) {
@@ -1296,9 +1302,8 @@ void xxhashMixedColumns(
           } else if (col.colType == 2) {
             auto* base = col.decoded->base();
             for (int32_t i = 0; i < chunkSize; ++i) {
-              out[i * numCols] = preNull[i]
-                  ? kNullColumnHash
-                  : base->hashValueAt(preIdx[i]);
+              out[i * numCols] =
+                  preNull[i] ? kNullColumnHash : base->hashValueAt(preIdx[i]);
             }
           } else {
             auto* strViews = reinterpret_cast<const StringView*>(col.rawData);
@@ -1317,8 +1322,8 @@ void xxhashMixedColumns(
 
     // Phase 2: combine per-column hashes into final hash per row.
     for (int32_t i = 0; i < chunkSize; ++i) {
-      hashes[selected[chunkStart + i]] = XXH3_64bits(
-          &perColHashes[i * numCols], numCols * sizeof(uint64_t));
+      hashes[selected[chunkStart + i]] =
+          XXH3_64bits(&perColHashes[i * numCols], numCols * sizeof(uint64_t));
     }
   }
 }
@@ -1329,14 +1334,10 @@ void computeXXHashFromDecodedVectors(
     raw_vector<uint64_t>& hashes) {
   auto build = buildXXHashColumnInfos(hashers);
 
-  if (build.allFixedIdentity &&
-      build.totalFixedBytes <= kXXHashInlineBufSize) {
-    xxhashAllFixedIdentity(
-        build.cols, rows, build.totalFixedBytes, hashes);
-  } else if (build.allFixed &&
-             build.totalFixedBytes <= kXXHashInlineBufSize) {
-    xxhashAllFixedAnyMapping(
-        build.cols, rows, build.totalFixedBytes, hashes);
+  if (build.allFixedIdentity && build.totalFixedBytes <= kXXHashInlineBufSize) {
+    xxhashAllFixedIdentity(build.cols, rows, build.totalFixedBytes, hashes);
+  } else if (build.allFixed && build.totalFixedBytes <= kXXHashInlineBufSize) {
+    xxhashAllFixedAnyMapping(build.cols, rows, build.totalFixedBytes, hashes);
   } else {
     xxhashMixedColumns(build.cols, rows, hashes);
   }
@@ -1371,11 +1372,11 @@ inline XXHashRowColBuildResult buildXXHashRowColInfos(
     auto typeKind = rowContainer->columnTypes()[i]->kind();
     bool isVarLen =
         (typeKind == TypeKind::VARCHAR || typeKind == TypeKind::VARBINARY);
-    bool isComplex = (typeKind == TypeKind::ROW || typeKind == TypeKind::ARRAY ||
-                      typeKind == TypeKind::MAP);
+    bool isComplex =
+        (typeKind == TypeKind::ROW || typeKind == TypeKind::ARRAY ||
+         typeKind == TypeKind::MAP);
     result.infos[i].colType = isComplex ? 2 : (isVarLen ? 1 : 0);
-    result.infos[i].elementSize =
-        (isVarLen || isComplex)
+    result.infos[i].elementSize = (isVarLen || isComplex)
         ? 0
         : rowContainer->columnTypes()[i]->cppSizeInBytes();
     result.infos[i].offset = column.offset();
@@ -1441,8 +1442,7 @@ void xxhashRowKeysBatch(
       } else if (ci.colType == 0) {
         perColHashes[c] = XXH3_64bits(row + ci.offset, ci.elementSize);
       } else if (ci.colType == 2) {
-        auto* view =
-            reinterpret_cast<const std::string_view*>(row + ci.offset);
+        auto* view = reinterpret_cast<const std::string_view*>(row + ci.offset);
         auto stream = HashStringAllocator::prepareRead(
             HashStringAllocator::headerOf(view->data()));
         perColHashes[c] = ContainerRowSerde::hash(*stream, ci.type);
@@ -1497,13 +1497,12 @@ void HashTable<ignoreNullKeys>::groupProbe(
   const int32_t numProbes = lookup.rows.size();
   const auto* rows = lookup.rows.data();
   const auto* hashes = lookup.hashes.data();
- 
+
   // Contiguous probe rows: {rowStart, rowStart+1, ..., rowStart+numProbes-1}.
   // populateLookupRows enumerates selected rows in ascending order; if first
   // and last differ by numProbes-1, all rows are consecutive (no gaps).
   const bool isContiguousRowRange =
-      numProbes > 0 &&
-      rows[numProbes - 1] - rows[0] == numProbes - 1;
+      numProbes > 0 && rows[numProbes - 1] - rows[0] == numProbes - 1;
   const int32_t rowStart = isContiguousRowRange ? rows[0] : 0;
 
   ProbeState bufA[kBatchWidth];
@@ -1526,13 +1525,13 @@ void HashTable<ignoreNullKeys>::groupProbe(
     // Seed pipeline: prefetch batch 0.
     prefetchBatch(cur, probeIndex);
 
-    for (; probeIndex + kBatchWidth <= numProbes;
-        probeIndex += kBatchWidth) {
+    for (; probeIndex + kBatchWidth <= numProbes; probeIndex += kBatchWidth) {
       // Scheme D: prefetch hashes for a future batch.
       if (probeIndex + kBatchWidth + kHashPrefetchAhead < numProbes) {
         for (int32_t p = 0; p < kBatchWidth; p += 2) {
-          __builtin_prefetch(&hashes[rowStart + probeIndex + kBatchWidth +
-              kHashPrefetchAhead + p]);
+          __builtin_prefetch(&hashes
+                                 [rowStart + probeIndex + kBatchWidth +
+                                  kHashPrefetchAhead + p]);
         }
       }
 
@@ -1574,8 +1573,7 @@ void HashTable<ignoreNullKeys>::groupProbe(
     // Seed pipeline: prefetch batch 0.
     prefetchBatch(cur, probeIndex);
 
-    for (; probeIndex + kBatchWidth <= numProbes;
-        probeIndex += kBatchWidth) {
+    for (; probeIndex + kBatchWidth <= numProbes; probeIndex += kBatchWidth) {
       // Scheme D: prefetch hashes for a future batch via rows indirection.
       if (probeIndex + kBatchWidth + kHashPrefetchAhead < numProbes) {
         for (int32_t p = 0; p < kBatchWidth; p += 2) {
@@ -1677,17 +1675,16 @@ void vBatchEquals(
   for (int32_t i = mismatchNum; i < n;) {
     auto pg = svwhilelt_b64_s64(i, n);
     const int32_t activeCount = std::min<int32_t>(lanes, n - i);
-    auto inputIndices = svld1uw_u64(
-        pg, reinterpret_cast<const uint32_t*>(indices.data() + i));
+    auto inputIndices =
+        svld1uw_u64(pg, reinterpret_cast<const uint32_t*>(indices.data() + i));
 
     // The collision queue is sparse and may have been partitioned by an earlier
     // key column. Both rows and decoded values must use its input row numbers.
-    auto nullOffsets = svlsl_n_u64_x(
-        pg, svlsr_n_u64_x(pg, inputIndices, 6), 3);
+    auto nullOffsets = svlsl_n_u64_x(pg, svlsr_n_u64_x(pg, inputIndices, 6), 3);
     auto nullWords = svld1_gather_offset_u64(
         pg, nullOffsets, reinterpret_cast<uint64_t>(decoded.nullBits()));
-    auto nullMasks = svlsl_u64_x(
-        pg, svdup_n_u64(1), svand_n_u64_x(pg, inputIndices, 63));
+    auto nullMasks =
+        svlsl_u64_x(pg, svdup_n_u64(1), svand_n_u64_x(pg, inputIndices, 63));
     auto decodedIsNull =
         svcmpeq_n_u64(pg, svand_u64_x(pg, nullWords, nullMasks), 0);
     auto rowPointers = svld1_gather_offset_u64(
@@ -1699,8 +1696,7 @@ void vBatchEquals(
     auto rowIsNull = svcmpne_n_u64(
         pg, svand_n_u64_x(pg, rowNullBytes, column.nullMask()), 0);
     auto bothNull = svand_b_z(pg, rowIsNull, decodedIsNull);
-    auto valueLanes =
-        svnot_b_z(pg, svorr_b_z(pg, rowIsNull, decodedIsNull));
+    auto valueLanes = svnot_b_z(pg, svorr_b_z(pg, rowIsNull, decodedIsNull));
 
     // Dictionary NULL rows may have unusable base indices. Do not load their
     // indices or values. Extra NULL bits themselves use top-level row numbers.
@@ -1716,8 +1712,7 @@ void vBatchEquals(
         valueLanes,
         svmul_n_u64_x(valueLanes, valueIndices, sizeof(T)),
         reinterpret_cast<uint64_t>(decoded.data<T>()));
-    auto rowAddresses =
-        svadd_n_u64_x(valueLanes, rowPointers, column.offset());
+    auto rowAddresses = svadd_n_u64_x(valueLanes, rowPointers, column.offset());
     svint64_t rowValues;
     svint64_t decodedValues;
     if constexpr (sizeof(T) == 1) {
@@ -2025,10 +2020,10 @@ void HashTable<false>::groupTaperFlatProbe(
     HashLookup& lookup,
     AggregateClass& aggregate,
     DecodedVector& aggVector) {
-  constexpr auto kKeyIsConst = KeyLayout == DVecLayout::kConst ||
-      KeyLayout == DVecLayout::kConstNull;
-  constexpr auto kAggIsConst = AggLayout == DVecLayout::kConst ||
-      AggLayout == DVecLayout::kConstNull;
+  constexpr auto kKeyIsConst =
+      KeyLayout == DVecLayout::kConst || KeyLayout == DVecLayout::kConstNull;
+  constexpr auto kAggIsConst =
+      AggLayout == DVecLayout::kConst || AggLayout == DVecLayout::kConstNull;
   if constexpr (kKeyIsConst && kAggIsConst) {
     groupTaperFlatProbeConstKeyConstAgg(lookup, aggregate, aggVector);
     return;
@@ -2113,13 +2108,17 @@ void HashTable<ignoreNullKeys>::groupProbe(
     return;
   }
   VELOX_CHECK_EQ(hashMode_, HashMode::kTaperFlat);
-  VELOX_CHECK_EQ(aggVectors.size(), 1, "Taper flat only supports single vector");
+  VELOX_CHECK_EQ(
+      aggVectors.size(), 1, "Taper flat only supports single vector");
 
   auto numHashers = lookup.hashers.size();
   VELOX_CHECK_EQ(numHashers, 1, "Taper flat only supports single hasher");
 
   if (!taperTableWrapper_.initialized()) {
-    checkSize(lookup.rows.size(), false, BaseHashTable::kNoSpillInputStartPartitionBit);
+    checkSize(
+        lookup.rows.size(),
+        false,
+        BaseHashTable::kNoSpillInputStartPartitionBit);
   }
 
   aggVector_.decode(*aggVectors[0], aggRows);
@@ -2133,11 +2132,11 @@ void HashTable<ignoreNullKeys>::groupProbe(
           [&](auto& aggFuncRef) {
             using AggregateType = std::decay_t<decltype(aggFuncRef.get())>;
 
-#define DISPATCH(...)                                                    \
-            if constexpr (std::is_same_v<__VA_ARGS__, AggregateType>) {  \
-              groupTaperFlatProbe(lookup, aggFuncRef.get(), aggVector_); \
-              return;                                                    \
-            }
+#define DISPATCH(...)                                          \
+  if constexpr (std::is_same_v<__VA_ARGS__, AggregateType>) {  \
+    groupTaperFlatProbe(lookup, aggFuncRef.get(), aggVector_); \
+    return;                                                    \
+  }
 
             FOREACH_FLAT_COMPATIBLE_AGGREGATE_CLASS(DISPATCH)
 #undef DISPATCH
@@ -2358,8 +2357,7 @@ void HashTable<ignoreNullKeys>::joinNormalizedKeyProbe(HashLookup& lookup) {
   std::vector<CollisionEntry> collisionQueue;
 
   auto processEntry = [&](ProbeState& s) {
-    if (s.group_ &&
-        RowContainer::normalizedKey(s.group_) == keys[s.row_]) {
+    if (s.group_ && RowContainer::normalizedKey(s.group_) == keys[s.row_]) {
       incrementHits();
       hits[s.row_] = s.group_;
       return;
@@ -2375,8 +2373,7 @@ void HashTable<ignoreNullKeys>::joinNormalizedKeyProbe(HashLookup& lookup) {
     if (simd::toBitMask(s.tagsInTable_ == kEmptyGroup)) {
       hits[s.row_] = nullptr;
     } else {
-      collisionQueue.push_back(
-          {s.bucketOffset_, s.wantedTags_, s.row_});
+      collisionQueue.push_back({s.bucketOffset_, s.wantedTags_, s.row_});
     }
   };
 
@@ -2535,8 +2532,7 @@ bool HashTable<ignoreNullKeys>::hashRows(
   if (hashMode_ == HashMode::kHash) {
     auto numKeys = static_cast<int32_t>(hashers_.size());
     auto build = buildXXHashRowColInfos(rows_.get(), numKeys);
-    xxhashRowKeysBatch(
-        rows.data(), rows.size(), build, hashes.data());
+    xxhashRowKeysBatch(rows.data(), rows.size(), build, hashes.data());
     return true;
   }
 
@@ -2673,11 +2669,12 @@ void HashTable<ignoreNullKeys>::parallelJoinBuild() {
   // The parallel table partitioning step.
   for (auto i = 0; i < numPartitions; ++i) {
     auto* table = getTable(i);
-    partitionSteps.push_back(std::make_shared<AsyncSource<bool>>(
-        [this, table, rawRowPartitions = rowPartitions[i].get()]() {
-          partitionRows(*table, *rawRowPartitions);
-          return std::make_unique<bool>(true);
-        }));
+    partitionSteps.push_back(
+        std::make_shared<AsyncSource<bool>>(
+            [this, table, rawRowPartitions = rowPartitions[i].get()]() {
+              partitionRows(*table, *rawRowPartitions);
+              return std::make_unique<bool>(true);
+            }));
     VELOX_CHECK(!partitionSteps.empty());
     buildExecutor_->add([driverCtx, step = partitionSteps.back()]() {
       ScopedDriverThreadContext scopedDriverThreadContext(driverCtx);
@@ -2700,11 +2697,12 @@ void HashTable<ignoreNullKeys>::parallelJoinBuild() {
   }
   std::vector<std::vector<char*>> overflowPerPartition(numPartitions);
   for (auto i = 0; i < numPartitions; ++i) {
-    buildSteps.push_back(std::make_shared<AsyncSource<bool>>(
-        [this, i, &overflowPerPartition, &rowPartitions]() {
-          buildJoinPartition(i, rowPartitions, overflowPerPartition[i]);
-          return std::make_unique<bool>(true);
-        }));
+    buildSteps.push_back(
+        std::make_shared<AsyncSource<bool>>(
+            [this, i, &overflowPerPartition, &rowPartitions]() {
+              buildJoinPartition(i, rowPartitions, overflowPerPartition[i]);
+              return std::make_unique<bool>(true);
+            }));
     VELOX_CHECK(!buildSteps.empty());
     buildExecutor_->add([driverCtx, step = buildSteps.back()]() {
       ScopedDriverThreadContext scopedDriverThreadContext(driverCtx);
@@ -3110,16 +3108,16 @@ FOLLY_ALWAYS_INLINE void HashTable<ignoreNullKeys>::insertForJoinWithPrefetch(
   auto keysMatch = [&](char* group, char* inserted) -> bool {
     if constexpr (isNormailizedKeyMode) {
       return RowContainer::normalizedKey(group) ==
-             RowContainer::normalizedKey(inserted);
+          RowContainer::normalizedKey(inserted);
     } else {
       return compareKeys(group, inserted);
     }
   };
 
   auto processEntry = [&](ProbeState& s,
-                            char* inserted,
-                            uint64_t hash,
-                            char* skipGroup = nullptr) {
+                          char* inserted,
+                          uint64_t hash,
+                          char* skipGroup = nullptr) {
     if (s.group_ && keysMatch(s.group_, inserted)) {
       if (nextOffset_) {
         pushNext(rows, s.group_, inserted, allocator);
@@ -3214,8 +3212,7 @@ void HashTable<ignoreNullKeys>::processProbeCollisions(
           states[i].hits_ =
               simd::toBitMask(states[i].tagsInTable_ == entry.wantedTags_) &
               ProbeState::kFullMask;
-          hits[entry.row_] =
-              states[i].joinNormalizedKeyFullProbe(*this, keys);
+          hits[entry.row_] = states[i].joinNormalizedKeyFullProbe(*this, keys);
         }
         continue;
       }
@@ -3234,8 +3231,7 @@ void HashTable<ignoreNullKeys>::processProbeCollisions(
         auto& entry = collisionQueue[idx + i];
         tagsTable[i] = BaseHashTable::loadTags(
             reinterpret_cast<uint8_t*>(table_), entry.bucketOffset_);
-        hitMasks[i] =
-            simd::toBitMask(tagsTable[i] == entry.wantedTags_) &
+        hitMasks[i] = simd::toBitMask(tagsTable[i] == entry.wantedTags_) &
             ProbeState::kFullMask;
         if (hitMasks[i]) {
           uint16_t tmp = hitMasks[i];
@@ -3318,8 +3314,7 @@ void HashTable<ignoreNullKeys>::processInsertCollisions(
           s.bucketOffset_ = entry.bucketOffset_;
           s.wantedTags_ = entry.wantedTags_;
           s.tagsInTable_ = loadTags(entry.bucketOffset_);
-          s.hits_ =
-              simd::toBitMask(s.tagsInTable_ == entry.wantedTags_) &
+          s.hits_ = simd::toBitMask(s.tagsInTable_ == entry.wantedTags_) &
               ProbeState::kFullMask;
           s.group_ = nullptr;
           s.indexInTags_ = ProbeState::kNotSet;
@@ -3348,8 +3343,7 @@ void HashTable<ignoreNullKeys>::processInsertCollisions(
         auto& entry = collisionQueue[idx + j];
         tagsTable[j] = BaseHashTable::loadTags(
             reinterpret_cast<uint8_t*>(table_), entry.bucketOffset_);
-        hitMasks[j] =
-            simd::toBitMask(tagsTable[j] == entry.wantedTags_) &
+        hitMasks[j] = simd::toBitMask(tagsTable[j] == entry.wantedTags_) &
             ProbeState::kFullMask;
         if (hitMasks[j]) {
           uint16_t tmp = hitMasks[j];
@@ -3371,13 +3365,12 @@ void HashTable<ignoreNullKeys>::processInsertCollisions(
         }
         if (bucketModified) {
           tagsTable[j] = loadTags(entry.bucketOffset_);
-          hitMasks[j] =
-              simd::toBitMask(tagsTable[j] == entry.wantedTags_) &
+          hitMasks[j] = simd::toBitMask(tagsTable[j] == entry.wantedTags_) &
               ProbeState::kFullMask;
         }
 
-        uint16_t empty =
-            simd::toBitMask(tagsTable[j] == kEmptyGroup) & ProbeState::kFullMask;
+        uint16_t empty = simd::toBitMask(tagsTable[j] == kEmptyGroup) &
+            ProbeState::kFullMask;
         if (!hitMasks[j] && empty) {
           auto pos = bits::getAndClearLastSetBit(empty);
           auto slotIndex = entry.bucketOffset_ + pos;
@@ -3984,8 +3977,9 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
   buildExecutor_ = executor;
   otherTables_.reserve(tables.size());
   for (auto& table : tables) {
-    otherTables_.emplace_back(std::unique_ptr<HashTable<ignoreNullKeys>>(
-        dynamic_cast<HashTable<ignoreNullKeys>*>(table.release())));
+    otherTables_.emplace_back(
+        std::unique_ptr<HashTable<ignoreNullKeys>>(
+            dynamic_cast<HashTable<ignoreNullKeys>*>(table.release())));
   }
 
   // If there are multiple tables, we need to merge the 'columnHasNulls' flags
@@ -4264,17 +4258,16 @@ int32_t HashTable<false>::listNullKeyRows(
       auto typeKind = hashers_[0]->typeKind();
       bool isVarLen =
           (typeKind == TypeKind::VARCHAR || typeKind == TypeKind::VARBINARY);
-      bool isComplex = (typeKind == TypeKind::ROW ||
-                        typeKind == TypeKind::ARRAY ||
-                        typeKind == TypeKind::MAP);
+      bool isComplex =
+          (typeKind == TypeKind::ROW || typeKind == TypeKind::ARRAY ||
+           typeKind == TypeKind::MAP);
       uint64_t nullHash;
       if (!isVarLen && !isComplex) {
         int32_t elemSize = hashers_[0]->type()->cppSizeInBytes();
         char nullBuf[17] = {0};
         nullHash = XXH3_64bits(nullBuf, 1 + elemSize);
       } else {
-        nullHash =
-            XXH3_64bits(&kNullColumnHash, sizeof(kNullColumnHash));
+        nullHash = XXH3_64bits(&kNullColumnHash, sizeof(kNullColumnHash));
       }
       lookup.hashes.push_back(nullHash);
     } else if (hashMode_ == HashMode::kTaperHash) {
@@ -4329,8 +4322,7 @@ void HashTable<ignoreNullKeys>::erase(folly::Range<char**> rows) {
   if (hashMode_ == HashMode::kHash) {
     auto numKeys = static_cast<int32_t>(hashers_.size());
     auto build = buildXXHashRowColInfos(rows_.get(), numKeys);
-    xxhashRowKeysBatch(
-        rows.data(), numRows, build, hashes.data());
+    xxhashRowKeysBatch(rows.data(), numRows, build, hashes.data());
   } else if (hashMode_ == HashMode::kTaperHash) {
     for (int32_t i = 0; i < hashers_.size(); ++i) {
       rows_->hash(i, rows, i > 0, hashes.data());

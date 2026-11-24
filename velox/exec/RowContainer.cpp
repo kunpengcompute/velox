@@ -49,8 +49,7 @@ static int32_t typeKindSize(TypeKind kind) {
 __attribute__((__no_sanitize__("thread")))
 #endif
 #endif
-inline void
-setBit(char* bits, uint32_t idx) {
+inline void setBit(char* bits, uint32_t idx) {
   auto bitsAs8Bit = reinterpret_cast<uint8_t*>(bits);
   bitsAs8Bit[idx / 8] |= (1 << (idx % 8));
 }
@@ -659,12 +658,13 @@ void RowContainer::recomputeColumnStats() const {
   // Use originalNormalizedKeySize_ (not normalizedKeySize_, which may be 0
   // after disableNormalizedKeys()): the already-allocated early rows were
   // sized with the original value.
-  int32_t curRowSize =
-      fixedRowSize_ + (numRowsWithNormalizedKey_ > 0 ? originalNormalizedKeySize_ : 0);
+  int32_t curRowSize = fixedRowSize_ +
+      (numRowsWithNormalizedKey_ > 0 ? originalNormalizedKeySize_ : 0);
   int64_t normalizedKeysLeft = numRowsWithNormalizedKey_;
   for (auto i = 0; i < numAllocations; ++i) {
     auto range = rows_.rangeAt(i);
-    auto* data = range.data() + memory::alignmentPadding(range.data(), alignment_);
+    auto* data =
+        range.data() + memory::alignmentPadding(range.data(), alignment_);
     auto limit = range.size() -
         (reinterpret_cast<uintptr_t>(data) -
          reinterpret_cast<uintptr_t>(range.data()));
@@ -1031,7 +1031,8 @@ void RowContainer::extractStringsBatch(
   // mutableNulls(setNotNull=false) is not initialized, so every index would
   // otherwise need an explicit setNull(false). With this single word-at-a-time
   // fill, only null rows need a setNull(true) call inside the loop.
-  bits::fillBits(rawNulls, resultOffset, resultOffset + numRows, bits::kNotNull);
+  bits::fillBits(
+      rawNulls, resultOffset, resultOffset + numRows, bits::kNotNull);
 
 #if defined(__ARM_NEON)
   // ---- NEON fast path: batch 4 rows at a time ----
@@ -1043,7 +1044,7 @@ void RowContainer::extractStringsBatch(
 
   // Phase 1a: batched pre-scan (4 rows per iteration)
   for (int32_t i = neonStart; i < neonEnd; i += kNeonStride) {
-    const char* row0, *row1, *row2, *row3;
+    const char *row0, *row1, *row2, *row3;
     if (useRowNumbers) {
       row0 = rowNumbers[i + 0] >= 0 ? rows[rowNumbers[i + 0]] : nullptr;
       row1 = rowNumbers[i + 1] >= 0 ? rows[rowNumbers[i + 1]] : nullptr;
@@ -1059,14 +1060,13 @@ void RowContainer::extractStringsBatch(
     uint8_t nullBits = 0;
     if (hasNulls) {
       nullBits = ((row0 ? (row0[nullByte] & nullMask) : nullMask) ? 1 : 0) |
-                 ((row1 ? (row1[nullByte] & nullMask) : nullMask) ? 2 : 0) |
-                 ((row2 ? (row2[nullByte] & nullMask) : nullMask) ? 4 : 0) |
-                 ((row3 ? (row3[nullByte] & nullMask) : nullMask) ? 8 : 0);
+          ((row1 ? (row1[nullByte] & nullMask) : nullMask) ? 2 : 0) |
+          ((row2 ? (row2[nullByte] & nullMask) : nullMask) ? 4 : 0) |
+          ((row3 ? (row3[nullByte] & nullMask) : nullMask) ? 8 : 0);
     }
     uint8_t ptrNullBits = ((row0 == nullptr) ? 1 : 0) |
-                          ((row1 == nullptr) ? 2 : 0) |
-                          ((row2 == nullptr) ? 4 : 0) |
-                          ((row3 == nullptr) ? 8 : 0);
+        ((row1 == nullptr) ? 2 : 0) | ((row2 == nullptr) ? 4 : 0) |
+        ((row3 == nullptr) ? 8 : 0);
     uint8_t combinedNull = ptrNullBits | (hasNulls ? nullBits : 0);
 
     uint32_t sizes[4];
@@ -1077,7 +1077,10 @@ void RowContainer::extractStringsBatch(
         sizes[k] = 0;
         meta[i + k] = {nullptr, 0, false};
       } else {
-        const char* r = (k == 0) ? row0 : (k == 1) ? row1 : (k == 2) ? row2 : row3;
+        const char* r = (k == 0) ? row0
+            : (k == 1)           ? row1
+            : (k == 2)           ? row2
+                                 : row3;
         auto value = valueAt<StringView>(r, offset);
         if (value.isInline()) {
           rawValues[ri] = value;
@@ -1086,15 +1089,16 @@ void RowContainer::extractStringsBatch(
         } else {
           sizes[k] = static_cast<uint32_t>(value.size());
           auto* header = reinterpret_cast<const HashStringAllocator::Header*>(
-              value.data()) - 1;
+                             value.data()) -
+              1;
           bool isMultiPiece =
               header->isContinued() || header->size() < value.size();
           if (FOLLY_UNLIKELY(isMultiPiece)) {
-            meta[i + k] = {value.data(), static_cast<uint32_t>(value.size()),
-                           true};
+            meta[i + k] = {
+                value.data(), static_cast<uint32_t>(value.size()), true};
           } else {
-            meta[i + k] = {value.data(), static_cast<uint32_t>(value.size()),
-                           false};
+            meta[i + k] = {
+                value.data(), static_cast<uint32_t>(value.size()), false};
           }
           __builtin_prefetch(value.data());
         }
@@ -1125,8 +1129,9 @@ void RowContainer::extractStringsBatch(
         rawValues[resultIndex] = value;
         meta[i] = {nullptr, 0, false};
       } else {
-        auto* header = reinterpret_cast<const HashStringAllocator::Header*>(
-            value.data()) - 1;
+        auto* header =
+            reinterpret_cast<const HashStringAllocator::Header*>(value.data()) -
+            1;
         bool isMultiPiece =
             header->isContinued() || header->size() < value.size();
         if (FOLLY_UNLIKELY(isMultiPiece)) {
@@ -1162,8 +1167,9 @@ void RowContainer::extractStringsBatch(
         rawValues[resultIndex] = value;
         meta[i] = {nullptr, 0, false};
       } else {
-        auto* header = reinterpret_cast<const HashStringAllocator::Header*>(
-            value.data()) - 1;
+        auto* header =
+            reinterpret_cast<const HashStringAllocator::Header*>(value.data()) -
+            1;
         bool isMultiPiece =
             header->isContinued() || header->size() < value.size();
         if (FOLLY_UNLIKELY(isMultiPiece)) {
@@ -1201,12 +1207,15 @@ void RowContainer::extractStringsBatch(
         stream->readBytes(dst, size);
       } else if (size <= 16 && bufferOffset + 16 <= totalBytes) {
         // Single 128-bit load/store covers up to 16 bytes.
-        uint8x16_t chunk = vld1q_u8(reinterpret_cast<const uint8_t*>(meta[i].data));
+        uint8x16_t chunk =
+            vld1q_u8(reinterpret_cast<const uint8_t*>(meta[i].data));
         vst1q_u8(reinterpret_cast<uint8_t*>(dst), chunk);
       } else if (size <= 32 && bufferOffset + 32 <= totalBytes) {
         // Two 128-bit load/stores cover 17-32 bytes.
-        uint8x16_t lo = vld1q_u8(reinterpret_cast<const uint8_t*>(meta[i].data));
-        uint8x16_t hi = vld1q_u8(reinterpret_cast<const uint8_t*>(meta[i].data + 16));
+        uint8x16_t lo =
+            vld1q_u8(reinterpret_cast<const uint8_t*>(meta[i].data));
+        uint8x16_t hi =
+            vld1q_u8(reinterpret_cast<const uint8_t*>(meta[i].data + 16));
         vst1q_u8(reinterpret_cast<uint8_t*>(dst), lo);
         vst1q_u8(reinterpret_cast<uint8_t*>(dst + 16), hi);
       } else {
@@ -1755,15 +1764,15 @@ bool RowComparator::operator()(
   return false;
 }
 
-#define INSTANTIATE_STORE_COMPLEX(LAYOUT)                         \
-  template void RowContainer::storeComplexType<LAYOUT>(             \
-      const DecodedVector&,                                         \
-      vector_size_t,                                                \
-      bool,                                                         \
-      char*,                                                        \
-      int32_t,                                                      \
-      int32_t,                                                      \
-      uint8_t,                                                      \
+#define INSTANTIATE_STORE_COMPLEX(LAYOUT)               \
+  template void RowContainer::storeComplexType<LAYOUT>( \
+      const DecodedVector&,                             \
+      vector_size_t,                                    \
+      bool,                                             \
+      char*,                                            \
+      int32_t,                                          \
+      int32_t,                                          \
+      uint8_t,                                          \
       int32_t);
 
 FOREACH_VALID_LAYOUT(INSTANTIATE_STORE_COMPLEX)

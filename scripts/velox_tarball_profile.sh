@@ -1,3 +1,17 @@
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# shellcheck shell=bash
+
 # 设置本地依赖路径
 export VELOX_TARBALL_DIR="${VELOX_TARBALL_DIR:-/home/tarballs}"
 ## VELOX SETUP依赖
@@ -18,29 +32,41 @@ export VELOX_SETUP_STEMMER_URL="file://${VELOX_TARBALL_DIR}/libstemmer_c-2.2.0.t
 export VELOX_SETUP_WANGLE_URL="file://${VELOX_TARBALL_DIR}/wangle-2024.07.01.00.tar.gz"
 ## VELOX CMAKE依赖
 export VELOX_PROTOBUF_URL="file://${VELOX_TARBALL_DIR}/protobuf-all-21.8.tar.gz"
-export VELOX_PROTOBUF_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/protobuf-all-21.8.tar.gz" | awk '{print $1}')"
+VELOX_PROTOBUF_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/protobuf-all-21.8.tar.gz" | awk '{print $1}')"
+export VELOX_PROTOBUF_SHA256
 export VELOX_SIMDJSON_URL="file://${VELOX_TARBALL_DIR}/simdjson-3.9.3.tar.gz"
-export VELOX_SIMDJSON_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/simdjson-3.9.3.tar.gz" | awk '{print $1}')"
+VELOX_SIMDJSON_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/simdjson-3.9.3.tar.gz" | awk '{print $1}')"
+export VELOX_SIMDJSON_SHA256
 export VELOX_STEMMER_URL="file://${VELOX_TARBALL_DIR}/libstemmer_c-2.2.0.tar.gz"
-export VELOX_STEMMER_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/libstemmer_c-2.2.0.tar.gz" | awk '{print $1}')"
+VELOX_STEMMER_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/libstemmer_c-2.2.0.tar.gz" | awk '{print $1}')"
+export VELOX_STEMMER_SHA256
 export VELOX_XSIMD_URL="file://${VELOX_TARBALL_DIR}/xsimd-10.0.0.tar.gz"
-export VELOX_XSIMD_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/xsimd-10.0.0.tar.gz" | awk '{print $1}')"
+VELOX_XSIMD_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/xsimd-10.0.0.tar.gz" | awk '{print $1}')"
+export VELOX_XSIMD_SHA256
 export VELOX_ARROW_URL="file://${VELOX_TARBALL_DIR}/apache-arrow-15.0.0.tar.gz"
-export VELOX_ARROW_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/apache-arrow-15.0.0.tar.gz" | awk '{print $1}')"
+VELOX_ARROW_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/apache-arrow-15.0.0.tar.gz" | awk '{print $1}')"
+export VELOX_ARROW_SHA256
 export VELOX_GRPC_URL="file://${VELOX_TARBALL_DIR}/grpc-1.48.1.tar.gz"
-export VELOX_GRPC_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/grpc-1.48.1.tar.gz" | awk '{print $1}')"
+VELOX_GRPC_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/grpc-1.48.1.tar.gz" | awk '{print $1}')"
+export VELOX_GRPC_SHA256
 export VELOX_GTEST_URL="file://${VELOX_TARBALL_DIR}/googletest-1.13.0.tar.gz"
-export VELOX_GTEST_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/googletest-1.13.0.tar.gz" | awk '{print $1}')"
+VELOX_GTEST_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/googletest-1.13.0.tar.gz" | awk '{print $1}')"
+export VELOX_GTEST_SHA256
 export VELOX_CPR_URL="file://${VELOX_TARBALL_DIR}/cpr-1.10.5.tar.gz"
-export VELOX_CPR_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/cpr-1.10.5.tar.gz" | awk '{print $1}')"
+VELOX_CPR_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/cpr-1.10.5.tar.gz" | awk '{print $1}')"
+export VELOX_CPR_SHA256
 export VELOX_CURL_URL="file://${VELOX_TARBALL_DIR}/curl-8.4.0.tar.xz"
-export VELOX_CURL_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/curl-8.4.0.tar.xz" | awk '{print $1}')"
+VELOX_CURL_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/curl-8.4.0.tar.xz" | awk '{print $1}')"
+export VELOX_CURL_SHA256
 export VELOX_DUCKDB_URL="file://${VELOX_TARBALL_DIR}/duckdb-0.8.1.tar.gz"
-export VELOX_DUCKDB_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/duckdb-0.8.1.tar.gz" | awk '{print $1}')"
+VELOX_DUCKDB_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/duckdb-0.8.1.tar.gz" | awk '{print $1}')"
+export VELOX_DUCKDB_SHA256
 export VELOX_CARES_URL="file://${VELOX_TARBALL_DIR}/c-ares-cares-1_13_0.tar.gz"
-export VELOX_CARES_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/c-ares-cares-1_13_0.tar.gz" | awk '{print $1}')"
+VELOX_CARES_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/c-ares-cares-1_13_0.tar.gz" | awk '{print $1}')"
+export VELOX_CARES_SHA256
 export VELOX_SPARK_URL="file://${VELOX_TARBALL_DIR}/spark-3.5.1.tar.gz"
-export VELOX_SPARK_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/spark-3.5.1.tar.gz" | awk '{print $1}')"
+VELOX_SPARK_SHA256="$(sha256sum "${VELOX_TARBALL_DIR}/spark-3.5.1.tar.gz" | awk '{print $1}')"
+export VELOX_SPARK_SHA256
 ## VELOX ARROW依赖
 export ARROW_ZSTD_URL="file://${VELOX_TARBALL_DIR}/zstd-1.5.5.tar.gz"
 export ARROW_SNAPPY_URL="file://${VELOX_TARBALL_DIR}/snappy-1.1.10.tar.gz"

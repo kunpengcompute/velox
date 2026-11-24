@@ -30,9 +30,8 @@ class DecimalSumAggregate {
  public:
   using InputType = Row<TInputType>;
 
-  using IntermediateType =
-      Row</*sum*/ TSumType,
-          /*isEmpty*/ bool>;
+  using IntermediateType = Row</*sum*/ TSumType,
+                               /*isEmpty*/ bool>;
 
   using OutputType = TSumType;
 
@@ -188,8 +187,9 @@ class OptimizedSparkDecimalSumAggregate
           DecimalSumAggregate<TInputType, TSumType, ResultPrecision>> {
   using Base = exec::SimpleAggregateAdapter<
       DecimalSumAggregate<TInputType, TSumType, ResultPrecision>>;
-  using AccumulatorType = typename DecimalSumAggregate<
-      TInputType, TSumType, ResultPrecision>::AccumulatorType;
+  using AccumulatorType =
+      typename DecimalSumAggregate<TInputType, TSumType, ResultPrecision>::
+          AccumulatorType;
 
  public:
   explicit OptimizedSparkDecimalSumAggregate(TypePtr resultType)
@@ -281,9 +281,8 @@ class OptimizedSparkDecimalSumAggregate
         char* g2 = groups[rows[i + 2]];
         char* g3 = groups[rows[i + 3]];
 
-        const bool hasAlias =
-            (g0 == g1) || (g0 == g2) || (g0 == g3) || (g1 == g2) ||
-            (g1 == g3) || (g2 == g3);
+        const bool hasAlias = (g0 == g1) || (g0 == g2) || (g0 == g3) ||
+            (g1 == g2) || (g1 == g3) || (g2 == g3);
 
         if (hasAlias) {
           for (int j = 0; j < 4; ++j) {
@@ -314,16 +313,18 @@ class OptimizedSparkDecimalSumAggregate
                 1)) {
           int128_t r0, r1, r2, r3;
           acc0->overflow += DecimalUtil::addWithOverflow(
-              r0, static_cast<int128_t>(getValue(rows[i])),
-              acc0->sum.value());
+              r0, static_cast<int128_t>(getValue(rows[i])), acc0->sum.value());
           acc1->overflow += DecimalUtil::addWithOverflow(
-              r1, static_cast<int128_t>(getValue(rows[i + 1])),
+              r1,
+              static_cast<int128_t>(getValue(rows[i + 1])),
               acc1->sum.value());
           acc2->overflow += DecimalUtil::addWithOverflow(
-              r2, static_cast<int128_t>(getValue(rows[i + 2])),
+              r2,
+              static_cast<int128_t>(getValue(rows[i + 2])),
               acc2->sum.value());
           acc3->overflow += DecimalUtil::addWithOverflow(
-              r3, static_cast<int128_t>(getValue(rows[i + 3])),
+              r3,
+              static_cast<int128_t>(getValue(rows[i + 3])),
               acc3->sum.value());
           acc0->sum = r0;
           acc1->sum = r1;
@@ -338,8 +339,7 @@ class OptimizedSparkDecimalSumAggregate
             if (acc->sum.has_value()) {
               int128_t r;
               acc->overflow += DecimalUtil::addWithOverflow(
-                  r, static_cast<int128_t>(getValue(row)),
-                  acc->sum.value());
+                  r, static_cast<int128_t>(getValue(row)), acc->sum.value());
               acc->sum = r;
               acc->isEmpty = false;
             }
@@ -364,7 +364,8 @@ class OptimizedSparkDecimalSumAggregate
         if (__builtin_expect(acc->sum.has_value(), 1)) {
           int128_t result;
           acc->overflow += DecimalUtil::addWithOverflow(
-              result, static_cast<int128_t>(getValue(rows[i])),
+              result,
+              static_cast<int128_t>(getValue(rows[i])),
               acc->sum.value());
           acc->sum = result;
           acc->isEmpty = false;
