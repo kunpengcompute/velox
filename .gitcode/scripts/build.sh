@@ -86,10 +86,80 @@ function BoostKit_velox_Version_info() {
   echo "Component Version: ${velox_Version}" >>version.txt
 }
 
+function dependencies_lib_dopackage_openEuler22.03() {
+  mkdir -p ${VELOX_HOME}/Dependency_library_velox/Dependency_library_openEuler22.03
+  pushd ${VELOX_HOME}/Dependency_library_velox/Dependency_library_openEuler22.03
+  cp -f /usr/local/lib/libboost_atomic.so.1.84.0 ./libboost_atomic.so.1.84.0
+  cp -f /usr/local/lib/libboost_context.so.1.84.0 ./libboost_context.so.1.84.0
+  cp -f /usr/local/lib/libboost_filesystem.so.1.84.0 ./libboost_filesystem.so.1.84.0
+  cp -f /usr/local/lib/libboost_program_options.so.1.84.0 ./libboost_program_options.so.1.84.0
+  cp -f /usr/local/lib/libboost_regex.so.1.84.0 ./libboost_regex.so.1.84.0
+  cp -f /usr/local/lib/libboost_system.so.1.84.0 ./libboost_system.so.1.84.0
+  cp -f /usr/local/lib/libboost_thread.so.1.84.0 ./libboost_thread.so.1.84.0
+  cp -f /usr/lib64/libcrypto.so.1.1.1wa ./libcrypto.so.1.1
+  cp -f /usr/lib64/libdouble-conversion.so.3.1.5 ./libdouble-conversion.so.3
+  cp -f /usr/lib64/libdwarf.so.0.9.1 ./libdwarf.so.0
+  cp -f /usr/lib64/libevent-2.1.so.7.0.1 ./libevent-2.1.so.7
+  cp -f /opt/openEuler/gcc-toolset-12/root/usr/lib64/libgcc_s-12.so.1 ./libgcc_s.so.1
+  cp -f /usr/local/lib64/libgflags.so.2.2.2 ./libgflags.so.2.2
+  cp -f /usr/local/lib64/libglog.so.0.6.0 ./libglog.so.1
+  cp -f /usr/lib64/libicudata.so.72.1 ./libicudata.so.72
+  cp -f /usr/lib64/libicui18n.so.72.1 ./libicui18n.so.72
+  cp -f /usr/lib64/libicuuc.so.72.1 ./libicuuc.so.72
+  cp -f /usr/lib64/liblz4.so.1.9.3 ./liblz4.so.1
+  cp -f /usr/lib64/liblzma.so.5.2.5 ./liblzma.so.5
+  cp -f /usr/lib64/libre2.so.9.0.0 ./libre2.so.9
+  cp -f /usr/lib64/libsodium.so.23.3.0 ./libsodium.so.23
+  cp -f /usr/lib64/libssl.so.1.1.1wa ./libssl.so.1.1
+  cp -f /opt/openEuler/gcc-toolset-12/root/usr/lib64/libstdc++.so.6.0.30 ./libstdc++.so.6
+  cp -f /usr/lib64/libz.so.1.2.11 ./libz.so.1
+  cp -f /usr/lib64/libzstd.so.1.5.0 ./libzstd.so.1
+  popd
+  pushd ${VELOX_HOME} && zip -r Dependency_library_velox.zip Dependency_library_velox && popd
+}
+
+function dependencies_lib_dopackage_openEuler24.03() {
+  mkdir -p ${VELOX_HOME}/Dependency_library_velox/Dependency_library_openEuler24.03
+  pushd ${VELOX_HOME}/Dependency_library_velox/Dependency_library_openEuler24.03
+  cp -f /usr/lib64/libcrypto.so.3.0.12 ./libcrypto.so.3
+  cp -f /usr/lib64/libicudata.so.74.1 ./libicudata.so.74
+  cp -f /usr/lib64/libicuuc.so.74.1 ./libicuuc.so.74
+  cp -f /usr/lib64/libicui18n.so.74.1 ./libicui18n.so.74
+  cp -f /usr/lib64/liblz4.so.1.9.4 ./liblz4.so.1
+  cp -f /usr/lib64/liblzma.so.5.4.7 ./liblzma.so.5
+  cp -f /usr/lib64/libre2.so.11.0.0 ./libre2.so.11
+  cp -f /usr/lib64/libsodium.so.26.1.0 ./libsodium.so.26
+  cp -f /usr/lib64/libssl.so.3.0.12 ./libssl.so.3
+  cp -f /usr/lib64/libz.so.1.2.13 ./libz.so.1
+  cp -f /usr/lib64/libzstd.so.1.5.5 ./libzstd.so.1
+  cp -f /usr/lib64/libstdc++.so.6.0.30 ./libstdc++.so.6
+  cp -f /usr/lib64/libgcc_s-12.so.1 ./libgcc_s.so.1
+  cp -f /usr/local/lib/libboost_atomic.so.1.84.0 ./libboost_atomic.so.1.84.0
+  cp -f /usr/local/lib/libboost_context.so.1.84.0 ./libboost_context.so.1.84.0
+  cp -f /usr/local/lib/libboost_filesystem.so.1.84.0 ./libboost_filesystem.so.1.84.0
+  cp -f /usr/local/lib/libboost_program_options.so.1.84.0 ./libboost_program_options.so.1.84.0
+  cp -f /usr/local/lib/libboost_regex.so.1.84.0 ./libboost_regex.so.1.84.0
+  cp -f /usr/local/lib/libboost_system.so.1.84.0 ./libboost_system.so.1.84.0
+  cp -f /usr/local/lib/libboost_thread.so.1.84.0 ./libboost_thread.so.1.84.0
+  cp -f /usr/lib64/libdouble-conversion.so.3.1.5 ./libdouble-conversion.so.3
+  cp -f /usr/lib64/libdwarf.so.0.9.1 ./libdwarf.so.0
+  cp -f /usr/lib64/libevent-2.1.so.7.0.1 ./libevent-2.1.so.7
+  cp -f /usr/local/lib64/libgflags.so.2.2.2 ./libgflags.so.2.2
+  cp -f /usr/local/lib64/libglog.so.0.6.0 ./libglog.so.1
+  popd
+  pushd ${VELOX_HOME} && zip -r Dependency_library_velox.zip Dependency_library_velox && popd
+}
+
 function package_velox() {
   local pkg="boostkit-omniruntime-velox_${velox_Version}"
   local agentpath="${WORKSPACE}/output/${module}"
   mkdir -p "${agentpath}"
+
+  ID=openEuler
+  VERSION_ID=$(awk '{print $3}' /etc/openEuler-release)
+  dependencies_lib_dopackage_${ID}${VERSION_ID}
+  cp -f ${VELOX_HOME}/Dependency_library_velox.zip "${agentpath}/"
+
   BoostKit_velox_Version_info
   cd "${VELOX_HOME}"
   zip -r "${pkg}.zip" _build version.txt
@@ -97,6 +167,8 @@ function package_velox() {
 
   cd "${agentpath}"
   sha256sum ${pkg}.zip >${pkg}.zip.sha256sum
+  sha256sum Dependency_library_velox.zip >Dependency_library_velox.zip.sha256sum
+  python3 "${VELOX_HOME}/.gitcode/scripts/collect_software_info.py" "${WORKSPACE}" Dependency_library_velox.zip
   python3 "${VELOX_HOME}/.gitcode/scripts/collect_software_info.py" "${WORKSPACE}" "${pkg}.zip"
 }
 
@@ -110,9 +182,6 @@ ut)
   ut_velox
   ;;
 package)
-  : "${Product_Version:?版本构建需由工作流传入 Product_Version}"
-  : "${velox_Version:?请在 build.ini 的 [build] 段配置 velox_Version}"
-  : "${module:?版本构建需由工作流注入 module}"
   prepare
   build_velox
   package_velox
