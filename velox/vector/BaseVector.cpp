@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+
 #include "velox/vector/BaseVector.h"
 #include "velox/type/StringView.h"
 #include "velox/type/Type.h"
@@ -1001,6 +1003,138 @@ std::string printIndices(
   return out.str();
 }
 
+namespace {
+#ifdef __ARM_FEATURE_SVE
+
+void sveGatherTransposeIndices(
+    const vector_size_t* base,
+    const vector_size_t* indices,
+    vector_size_t* result,
+    int32_t size) {
+  static_assert(sizeof(vector_size_t) == sizeof(int32_t));
+  const int32_t* base32 = reinterpret_cast<const int32_t*>(base);
+  const int32_t* indices32 = reinterpret_cast<const int32_t*>(indices);
+  int32_t* result32 = reinterpret_cast<int32_t*>(result);
+
+  const int32_t vl = svcntw();
+  int32_t i = 0;
+  for (; i + vl <= size; i += vl) {
+    svbool_t pg = svptrue_b32();
+    svint32_t idx = svld1_s32(pg, indices32 + i);
+    svint32_t gathered = svld1_gather_s32index_s32(pg, base32, idx);
+    svst1_s32(pg, result32 + i, gathered);
+  }
+  if (i < size) {
+    svbool_t pg = svwhilelt_b32(i, size);
+    svint32_t idx = svld1_s32(pg, indices32 + i);
+    svint32_t gathered = svld1_gather_s32index_s32(pg, base32, idx);
+    svst1_s32(pg, result32 + i, gathered);
+  }
+}
+
+uint8_t sveGather8NullBits(
+    const uint64_t* baseNulls,
+    svint32_t indices,
+    svbool_t pg,
+    int32_t numIndices) {
+  const auto* baseWords = reinterpret_cast<const int32_t*>(baseNulls);
+  svint32_t wordIndex = svreinterpret_s32(
+      svlsr_n_u32_x(pg, svreinterpret_u32(indices), 5));
+  svint32_t data = svld1_gather_s32index_s32(pg, baseWords, wordIndex);
+
+  alignas(16) int32_t idxBuf[8] = {};
+  alignas(16) int32_t dataBuf[8] = {};
+  const int32_t n = std::min(numIndices, 8);
+  svst1_s32(svwhilelt_b32(0, n), idxBuf, indices);
+  svst1_s32(svwhilelt_b32(0, n), dataBuf, data);
+
+  uint8_t ans = 0;
+  for (int32_t j = 0; j < n; ++j) {
+    // dataBuf[j] is a 32-bit word gathered at word index idxBuf[j] >> 5, so the
+    // bit position within that word is idxBuf[j] & 31 (not & 7, which would
+    // only address the low 8 bits of the word).
+    if ((dataBuf[j] & (1 << (idxBuf[j] & 31))) != 0) {
+      ans |= (1 << j);
+    }
+  }
+  return ans;
+}
+
+svint32_t sveMaskIndicesWithNullByte(
+    svint32_t indices,
+    svbool_t pg,
+    uint8_t notNullByte,
+    int32_t numIndices) {
+  alignas(16) int32_t idxBuf[8] = {};
+  const int32_t n = std::min(numIndices, 8);
+  svst1_s32(svwhilelt_b32(0, n), idxBuf, indices);
+  for (int32_t j = 0; j < n; ++j) {
+    if ((notNullByte & (1 << j)) == 0) {
+      idxBuf[j] = 0;
+    }
+  }
+  return svld1_s32(pg, idxBuf);
+}
+
+void sveTransposeIndicesWithNulls(
+    const vector_size_t* baseIndices,
+    const uint64_t* baseNulls,
+    vector_size_t wrapSize,
+    const vector_size_t* wrapIndices,
+    const uint64_t* wrapNulls,
+    vector_size_t* resultIndices,
+    uint64_t* resultNulls) {
+  static_assert(sizeof(vector_size_t) == sizeof(int32_t));
+  constexpr int32_t kBatch = 8;
+
+  if (svcntw() < kBatch) {
+    for (vector_size_t i = 0; i < wrapSize; ++i) {
+      const bool wrapNull = wrapNulls && bits::isBitNull(wrapNulls, i);
+      vector_size_t index = wrapNull ? 0 : wrapIndices[i];
+      bool isNull = wrapNull;
+      if (!isNull && baseNulls && bits::isBitNull(baseNulls, index)) {
+        isNull = true;
+      }
+      resultIndices[i] = baseIndices[index];
+      if (resultNulls) {
+        bits::setNull(resultNulls, i, isNull);
+      }
+    }
+    return;
+  }
+
+  const auto* base32 = reinterpret_cast<const int32_t*>(baseIndices);
+  const auto* wrap32 = reinterpret_cast<const int32_t*>(wrapIndices);
+  auto* result32 = reinterpret_cast<int32_t*>(resultIndices);
+
+  for (int32_t i = 0; i < wrapSize; i += kBatch) {
+    const int32_t batchSize = std::min(kBatch, wrapSize - i);
+    svbool_t pg = svwhilelt_b32(0, batchSize);
+
+    svint32_t indexBatch = svld1_s32(pg, wrap32 + i);
+    uint8_t notNullByte =
+        batchSize < kBatch ? bits::lowMask(batchSize) : 0xff;
+    if (wrapNulls) {
+      notNullByte &= reinterpret_cast<const uint8_t*>(wrapNulls)[i / 8];
+    }
+    if (notNullByte != 0xff) {
+      indexBatch =
+          sveMaskIndicesWithNullByte(indexBatch, pg, notNullByte, batchSize);
+    }
+    if (baseNulls) {
+      notNullByte &= sveGather8NullBits(baseNulls, indexBatch, pg, batchSize);
+    }
+    if (resultNulls) {
+      reinterpret_cast<uint8_t*>(resultNulls)[i / 8] = notNullByte;
+    }
+    svint32_t gathered = svld1_gather_s32index_s32(pg, base32, indexBatch);
+    svst1_s32(pg, result32 + i, gathered);
+  }
+}
+
+#endif // __ARM_FEATURE_SVE
+} // namespace
+
 // static
 void BaseVector::transposeIndices(
     const vector_size_t* baseIndices,
@@ -1008,39 +1142,8 @@ void BaseVector::transposeIndices(
     const vector_size_t* wrapIndices,
     vector_size_t* resultIndices) {
 #if defined(__ARM_FEATURE_SVE)
-  // Use SVE svld1_gather for efficient indexed access
-  static_assert(sizeof(vector_size_t) == sizeof(int32_t), "SVE implementation assumes vector_size_t is 32-bit");
-  int32_t i = 0;
-  
-  // Main loop: process full vectors
-  int32_t svSize = svcntw();
-  for (; i + svSize <= wrapSize; i += svSize) {
-    // No need for svwhilelt here - full vector
-    svbool_t pg = svptrue_b32();
-    
-    // Load wrap indices
-    svint32_t indices = svld1_s32(pg, wrapIndices + i);
-    
-    // Gather from baseIndices using wrapIndices
-    svint32_t gathered = svld1_gather_s32index_s32(pg, baseIndices, indices);
-    
-    // Store results
-    svst1_s32(pg, resultIndices + i, gathered);
-  }
-  
-  // Tail handling: process remaining elements
-  if (i < wrapSize) {
-    svbool_t pg = svwhilelt_b32(i, wrapSize);
-    
-    // Load wrap indices
-    svint32_t indices = svld1_s32(pg, wrapIndices + i);
-    
-    // Gather from baseIndices using wrapIndices
-    svint32_t gathered = svld1_gather_s32index_s32(pg, baseIndices, indices);
-    
-    // Store results
-    svst1_s32(pg, resultIndices + i, gathered);
-  }
+  sveGatherTransposeIndices(
+      baseIndices, wrapIndices, resultIndices, wrapSize);
 #elif XSIMD_WITH_AVX2
 
   constexpr int32_t kBatch = xsimd::batch<int32_t>::size;
@@ -1075,62 +1178,14 @@ void BaseVector::transposeIndicesWithNulls(
     vector_size_t* resultIndices,
     uint64_t* resultNulls) {
 #if defined(__ARM_FEATURE_SVE)
-  // Use SVE for efficient indexed access with predication
-  static_assert(sizeof(vector_size_t) == sizeof(int32_t), "SVE implementation assumes vector_size_t is 32-bit");
-  int32_t i = 0;
-  
-  // Main loop: process full vectors
-  int32_t svSize = svcntw();
-  for (; i + svSize <= wrapSize; i += svSize) {
-    // No need for svwhilelt here - full vector
-    svbool_t pg = svptrue_b32();
-    
-    // Load wrap indices
-    svint32_t indices = svld1_s32(pg, wrapIndices + i);
-    
-    // Gather from baseIndices
-    svint32_t gathered = svld1_gather_s32index_s32(pg, baseIndices, indices);
-    
-    // Store results
-    svst1_s32(pg, resultIndices + i, gathered);
-  }
-  
-  // Tail handling: process remaining elements
-  if (i < wrapSize) {
-    svbool_t pg = svwhilelt_b32(i, wrapSize);
-    
-    // Load wrap indices
-    svint32_t indices = svld1_s32(pg, wrapIndices + i);
-    
-    // Gather from baseIndices
-    svint32_t gathered = svld1_gather_s32index_s32(pg, baseIndices, indices);
-    
-    // Store results
-    svst1_s32(pg, resultIndices + i, gathered);
-  }
-  
-  // Handle nulls separately (simplified for initial SVE support)
-  if (wrapNulls || baseNulls) {
-    for (auto i = 0; i < wrapSize; ++i) {
-      bool isNull = false;
-      if (wrapNulls && bits::isBitNull(wrapNulls, i)) {
-        isNull = true;
-      }
-      if (!isNull) {
-        vector_size_t index = wrapIndices[i];
-        if (baseNulls && bits::isBitNull(baseNulls, index)) {
-          isNull = true;
-        }
-        // Fix: write baseIndices[index] instead of index
-        resultIndices[i] = baseIndices[index];
-      } else {
-        resultIndices[i] = 0;
-      }
-      if (resultNulls) {
-        bits::setNull(resultNulls, i, isNull);
-      }
-    }
-  }
+  sveTransposeIndicesWithNulls(
+      baseIndices,
+      baseNulls,
+      wrapSize,
+      wrapIndices,
+      wrapNulls,
+      resultIndices,
+      resultNulls);
 #elif XSIMD_WITH_AVX2
 
   constexpr int32_t kBatch = xsimd::batch<int32_t>::size;
