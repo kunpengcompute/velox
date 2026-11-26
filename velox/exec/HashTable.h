@@ -53,15 +53,36 @@ struct TableInsertPartitionInfo {
   }
 };
 
+/// Hot entry — 32B, 4 entries exactly fill a 128B CacheLine for AoS layout.
+/// Stores fields accessed frequently by the 8-way batched probe pipeline.
+struct HotEntry {
+  uint64_t hash{0};       // 8B — hash value (was lookup.hashes[row])
+  char* hit{nullptr};     // 8B — hit row pointer (was lookup.hits[row])
+  int32_t row{-1};        // 4B — row number
+  uint8_t tag{0};         // 1B — precomputed F14 tag
+  uint8_t _pad[3];        // 3B — align to 24B
+  int64_t _padding{0};    // 8B — pad to 32B (4 entries / 128B CacheLine)
+};
+static_assert(sizeof(HotEntry) == 32, "HotEntry must be 32B for 4-per-CacheLine layout");
+
+/// Returns true if the AoS hot/cold separation layout (HashLookup::hotEntries)
+/// is enabled. Process-wide; resolved once from VELOX_HASH_LOOKUP_LAYOUT
+/// (aos|soa|auto). When false, the original SoA layout is used and hotEntries
+/// is left unallocated.
+bool hashLookupAosEnabled();
+
 /// Contains input and output parameters for groupProbe and joinProbe APIs.
 struct HashLookup {
   explicit HashLookup(const std::vector<std::unique_ptr<VectorHasher>>& h)
       : hashers(h) {}
 
   void reset(vector_size_t size) {
+    if (hashLookupAosEnabled()) {
+      hotEntries.resize(size);
+    }
+    hits.resize(size);
     rows.resize(size);
     hashes.resize(size);
-    hits.resize(size);
     newGroups.clear();
   }
 
@@ -71,22 +92,23 @@ struct HashLookup {
   /// Scratch memory used to call VectorHasher::lookupValueIds.
   VectorHasher::ScratchMemory scratchMemory;
 
+  /// AoS hot region: Array-of-Structs layout for frequently accessed fields.
+  /// Index is the row number.
+  raw_vector<HotEntry> hotEntries;
+
+  /// Parallel view into hotEntries[].hit for APIs that require char** (e.g.
+  /// aggregate initializeNewGroups). Kept in sync with hotEntries[].hit.
+  raw_vector<char*> hits;
+
   /// Input to groupProbe and joinProbe APIs.
 
   /// Set of row numbers of row to probe.
   raw_vector<vector_size_t> rows;
 
-  /// Hashes or value IDs for rows in 'rows'. Not aligned with 'rows'. Index is
-  /// the row number.
+  /// Hash computation buffer (used by computeXXHashFromDecodedVectors etc.).
+  /// After prepareForGroupProbe, values are also populated in hotEntries[].hash.
+  /// Index is the row number.
   raw_vector<uint64_t> hashes;
-
-  /// Results of groupProbe and joinProbe APIs.
-
-  /// Contains one entry for each row in 'rows'. Index is the row number.
-  /// For groupProbe, a pointer to an existing or new row with matching grouping
-  /// keys. For joinProbe, a pointer to the first row with matching keys or null
-  /// if no match.
-  raw_vector<char*> hits;
 
   /// For groupProbe, row numbers for which a new entry was inserted (didn't
   /// exist before the groupProbe). Empty for joinProbe.
@@ -163,6 +185,11 @@ class BaseHashTable {
       return !rows || lastRowIndex == rows->size();
     }
 
+    /// Returns the hit pointer for the given row number.
+    char* hitAt(vector_size_t row) const {
+      return (*hits)[row];
+    }
+
     /// The row size estimation of the projected output columns, if applicable.
     const std::optional<uint64_t> estimatedRowSize;
     /// The indexes of the build side projected columns that are variable sized.
@@ -208,10 +235,11 @@ class BaseHashTable {
   virtual HashStringAllocator* stringAllocator() = 0;
 
   /// Populates 'hashes' and 'rows' fields in 'lookup' in preparation for
-  /// 'groupProbe' call. Rehashes the table if necessary. Uses lookup.hashes to
-  /// decode grouping keys from 'input'. If 'ignoreNullKeys' is true, updates
-  /// 'rows' to remove entries with null grouping keys. After this call, 'rows'
-  /// may have no entries selected.
+  /// 'groupProbe' call. Also populates 'hotEntries' with hash and tag values.
+  /// Rehashes the table if necessary. Uses lookup.hashes to decode grouping
+  /// keys from 'input'. If 'ignoreNullKeys' is true, updates 'rows' to remove
+  /// entries with null grouping keys. After this call, 'rows' may have no
+  /// entries selected.
   virtual void prepareForGroupProbe(
       HashLookup& lookup,
       const RowVectorPtr& input,
@@ -219,14 +247,14 @@ class BaseHashTable {
       int8_t spillInputStartPartitionBit) = 0;
 
   /// Finds or creates a group for each key in 'lookup'. The keys are
-  /// returned in 'lookup.hits'.
+  /// returned in 'lookup.hotEntries[].hit'.
   virtual void groupProbe(
       HashLookup& lookup,
       int8_t spillInputStartPartitionBit) = 0;
 
   /// Returns the first hit for each key in 'lookup'. The keys are in
-  /// 'lookup.hits' with a nullptr representing a miss. This is for use in hash
-  /// join probe. Use listJoinResults to iterate over the results.
+  /// 'lookup.hotEntries[].hit' with a nullptr representing a miss. This is for
+  /// use in hash join probe. Use listJoinResults to iterate over the results.
   virtual void joinProbe(HashLookup& lookup) = 0;
 
   /// Populates 'hashes' and 'rows' fields in 'lookup' in preparation for

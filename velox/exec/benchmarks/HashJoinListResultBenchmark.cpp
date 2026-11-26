@@ -416,6 +416,16 @@ class HashTableListJoinResultBenchmark : public VectorTestBase {
     }
     lookup.rows.resize(rows.size());
     std::iota(lookup.rows.begin(), lookup.rows.end(), 0);
+    if (hashLookupAosEnabled()) {
+      // joinProbe reads lookup.hotEntries[row].hash in the AoS layout. This
+      // benchmark bypasses prepareForJoinProbe and fills lookup.hashes
+      // directly, so mirror the hashes into hotEntries to avoid reading
+      // uninitialized memory.
+      const auto numRows = rows.size();
+      for (auto r = 0; r < numRows; ++r) {
+        lookup.hotEntries[r].hash = lookup.hashes[r];
+      }
+    }
     topTable_->joinProbe(lookup);
   }
 

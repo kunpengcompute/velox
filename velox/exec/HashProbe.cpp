@@ -730,13 +730,22 @@ void HashProbe::addInput(RowVectorPtr input) {
   table_->prepareForJoinProbe(*lookup_.get(), input_, activeRows_, false);
 
   if (joinIncludesMissesFromLeft(joinType_)) {
-    // Make sure to allocate an entry in 'hits' for every input row to allow for
-    // including rows without a match in the output. Also, make sure to
-    // initialize all 'hits' to nullptr as HashTable::joinProbe will only
-    // process activeRows_.
-    auto& hits = lookup_->hits;
-    hits.resize(numInput);
-    std::fill(hits.data(), hits.data() + numInput, nullptr);
+    // Make sure to allocate an entry in 'hits' for every input row to
+    // allow for including rows without a match in the output. Also, make sure
+    // to initialize all 'hits' to nullptr as HashTable::joinProbe will only
+    // process activeRows_. When the AoS layout is enabled, 'hotEntries' is
+    // maintained in parallel.
+    const bool aosLayout = hashLookupAosEnabled();
+    if (aosLayout) {
+      lookup_->hotEntries.resize(numInput);
+    }
+    lookup_->hits.resize(numInput);
+    for (auto i = 0; i < numInput; ++i) {
+      if (aosLayout) {
+        lookup_->hotEntries[i].hit = nullptr;
+      }
+      lookup_->hits[i] = nullptr;
+    }
     if (!lookup_->rows.empty()) {
       table_->joinProbe(*lookup_);
     }
@@ -750,6 +759,9 @@ void HashProbe::addInput(RowVectorPtr input) {
     if (lookup_->rows.empty()) {
       input_ = nullptr;
       return;
+    }
+    if (hashLookupAosEnabled()) {
+      lookup_->hotEntries.resize(lookup_->rows.back() + 1);
     }
     lookup_->hits.resize(lookup_->rows.back() + 1);
     table_->joinProbe(*lookup_);
@@ -1647,10 +1659,8 @@ void HashProbe::ensureLoaded(column_index_t channel) {
       passingInputRows_.setAll();
     } else {
       passingInputRows_.clearAll();
-      auto hitsSize = lookup_->hits.size();
-      auto hits = lookup_->hits.data();
-      for (auto i = 0; i < hitsSize; ++i) {
-        if (hits[i]) {
+      for (auto i = 0; i < lookup_->hits.size(); ++i) {
+        if (lookup_->hits[i]) {
           passingInputRows_.setValid(i, true);
         }
       }
