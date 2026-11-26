@@ -16,6 +16,7 @@
 #include "velox/exec/TableScan.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/common/time/Timer.h"
+#include "velox/dwio/common/SparkDateTimeRebase.h"
 #include "velox/exec/Task.h"
 #include "velox/exec/TraceUtil.h"
 #include "velox/expression/Expr.h"
@@ -59,6 +60,17 @@ folly::dynamic TableScan::toJson() const {
   auto ret = SourceOperator::toJson();
   ret["status"] = curStatus_.load();
   return ret;
+}
+
+bool TableScan::canAddDynamicFilterOnChannel(
+    column_index_t outputChannel) const {
+  const auto* session =
+      driverCtx_->task->queryCtx()->connectorSessionProperties(
+          tableHandle_->connectorId());
+  return canAddDynamicFilter() &&
+      !(session &&
+        session->get<bool>(dwio::common::kSparkDateTimeRebaseEnabled, false) &&
+        dwio::common::isSparkRebaseType(*outputType_->childAt(outputChannel)));
 }
 
 bool TableScan::shouldYield(StopReason taskStopReason, size_t startTimeMs)

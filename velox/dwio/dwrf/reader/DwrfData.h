@@ -137,6 +137,19 @@ class DwrfParams : public dwio::common::FormatParams {
         type, stripeStreams_, streamLabels_, flatMapContext_);
   }
 
+  dwio::common::SparkDateTimeRebase sparkDateTimeRebase(
+      bool /*isInt96*/ = false) const override {
+    if (stripeStreams_.format() == DwrfFormat::kOrc &&
+        stripeStreams_.rowReaderOptions().sparkRebaseOptions()) {
+      return {
+          dwio::common::SparkRebaseMode::kLegacy,
+          {},
+          true,
+          stripeStreams_.orcUsesProlepticGregorian()};
+    }
+    return {};
+  }
+
   StripeStreams& stripeStreams() {
     return stripeStreams_;
   }

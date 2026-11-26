@@ -37,14 +37,23 @@ class ParquetParams : public dwio::common::FormatParams {
       dwio::common::ColumnReaderStatistics& stats,
       const FileMetaDataPtr metaData,
       const tz::TimeZone* sessionTimezone,
-      TimestampPrecision timestampPrecision)
+      TimestampPrecision timestampPrecision,
+      dwio::common::SparkDateTimeRebase dateTimeRebase = {},
+      dwio::common::SparkDateTimeRebase int96Rebase = {})
       : FormatParams(pool, stats),
         metaData_(metaData),
         sessionTimezone_(sessionTimezone),
-        timestampPrecision_(timestampPrecision) {}
+        timestampPrecision_(timestampPrecision),
+        dateTimeRebase_(std::move(dateTimeRebase)),
+        int96Rebase_(std::move(int96Rebase)) {}
   std::unique_ptr<dwio::common::FormatData> toFormatData(
       const std::shared_ptr<const dwio::common::TypeWithId>& type,
       const common::ScanSpec& scanSpec) override;
+
+  dwio::common::SparkDateTimeRebase sparkDateTimeRebase(
+      bool isInt96 = false) const override {
+    return isInt96 ? int96Rebase_ : dateTimeRebase_;
+  }
 
   TimestampPrecision timestampPrecision() const {
     return timestampPrecision_;
@@ -54,6 +63,8 @@ class ParquetParams : public dwio::common::FormatParams {
   const FileMetaDataPtr metaData_;
   const tz::TimeZone* sessionTimezone_;
   const TimestampPrecision timestampPrecision_;
+  const dwio::common::SparkDateTimeRebase dateTimeRebase_;
+  const dwio::common::SparkDateTimeRebase int96Rebase_;
 };
 
 /// Format-specific data created for each leaf column of a Parquet rowgroup.

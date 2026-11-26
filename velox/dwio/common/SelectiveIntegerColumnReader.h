@@ -33,13 +33,25 @@ class SelectiveIntegerColumnReader : public SelectiveColumnReader {
             requestedType,
             std::move(fileType),
             params,
-            scanSpec) {}
+            scanSpec),
+        dateRebase_(
+            requestedType->isDate() ? params.sparkDateTimeRebase()
+                                    : SparkDateTimeRebase{}) {}
 
   void getValues(const RowSet& rows, VectorPtr* result) override {
     getIntValues(rows, requestedType_, result);
+    if (dateRebase_.enabled()) {
+      dateRebase_.rebaseDates(*result);
+    }
+  }
+
+  bool needsSparkDateRebase() const override {
+    return dateRebase_.enabled();
   }
 
  protected:
+  const SparkDateTimeRebase dateRebase_;
+
   // Switches based on filter type between different readHelper instantiations.
   template <
       typename Reader,

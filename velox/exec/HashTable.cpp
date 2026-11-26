@@ -1876,10 +1876,15 @@ void HashTable<ignoreNullKeys>::groupTaperKeyProbe(HashLookup& lookup) {
   int32_t mismatchNum = 0;
   for (int i = 0; i < numHashers; ++i) {
     DecodedVector& decoded = hashers_[i]->decodedVector();
+    const auto kind = decoded.base()->typeKind();
+    if (UNLIKELY(kind == TypeKind::UNKNOWN)) {
+      // UNKNOWN keys are always null and cannot distinguish groups.
+      continue;
+    }
     VELOX_DYNAMIC_TEMPLATE_TYPE_DISPATCH(
         batchEqualsHelper,
         ignoreNullKeys,
-        decoded.base()->typeKind(),
+        kind,
         lookup.hits.data(),
         rows_->columnAt(i),
         decoded,

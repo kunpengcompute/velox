@@ -32,6 +32,7 @@
 #include "velox/dwio/common/FlushPolicy.h"
 #include "velox/dwio/common/InputStream.h"
 #include "velox/dwio/common/ScanSpec.h"
+#include "velox/dwio/common/SparkDateTimeRebase.h"
 #include "velox/dwio/common/UnitLoader.h"
 #include "velox/dwio/common/encryption/Encryption.h"
 #include "velox/type/Timestamp.h"
@@ -373,6 +374,14 @@ class RowReaderOptions {
     timestampPrecision_ = precision;
   }
 
+  void setSparkRebaseOptions(std::optional<SparkRebaseOptions> options) {
+    sparkRebaseOptions_ = options;
+  }
+
+  const std::optional<SparkRebaseOptions>& sparkRebaseOptions() const {
+    return sparkRebaseOptions_;
+  }
+
   const std::shared_ptr<FormatSpecificOptions>& formatSpecificOptions() const {
     return formatSpecificOptions_;
   }
@@ -425,6 +434,7 @@ class RowReaderOptions {
   std::shared_ptr<UnitLoaderFactory> unitLoaderFactory_;
 
   TimestampPrecision timestampPrecision_ = TimestampPrecision::kMilliseconds;
+  std::optional<SparkRebaseOptions> sparkRebaseOptions_;
 
   std::shared_ptr<FormatSpecificOptions> formatSpecificOptions_;
 };

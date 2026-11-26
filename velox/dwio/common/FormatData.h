@@ -19,6 +19,7 @@
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/common/PositionProvider.h"
 #include "velox/dwio/common/ScanSpec.h"
+#include "velox/dwio/common/SparkDateTimeRebase.h"
 #include "velox/dwio/common/Statistics.h"
 #include "velox/dwio/common/TypeWithId.h"
 #include "velox/type/Filter.h"
@@ -135,6 +136,11 @@ class FormatParams {
       : pool_(pool), stats_(stats) {}
 
   virtual ~FormatParams() = default;
+
+  virtual SparkDateTimeRebase sparkDateTimeRebase(
+      bool /*isInt96*/ = false) const {
+    return {};
+  }
 
   /// Makes format-specific structures for the column given by  'type'.
   /// 'scanSpec' is given as extra context.

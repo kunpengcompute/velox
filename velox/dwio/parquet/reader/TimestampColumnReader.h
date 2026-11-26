@@ -91,7 +91,9 @@ class TimestampColumnReader : public IntegerColumnReader {
       ParquetParams& params,
       common::ScanSpec& scanSpec)
       : IntegerColumnReader(requestedType, fileType, params, scanSpec),
-        requestedPrecision_(params.timestampPrecision()) {
+        requestedPrecision_(params.timestampPrecision()),
+        timestampRebase_(
+            params.sparkDateTimeRebase(std::is_same_v<T, int128_t>)) {
     if constexpr (std::is_same_v<T, int64_t>) {
       const auto typeWithId =
           std::static_pointer_cast<const ParquetTypeWithId>(fileType_);
@@ -152,6 +154,9 @@ class TimestampColumnReader : public IntegerColumnReader {
             toInt96Timestamp(encoded).toPrecision(requestedPrecision_);
       }
     }
+    if (timestampRebase_.enabled()) {
+      timestampRebase_.rebaseTimestamps(*result);
+    }
   }
 
   template <
@@ -199,6 +204,7 @@ class TimestampColumnReader : public IntegerColumnReader {
   // The requested precision can be specified from HiveConfig to read timestamp
   // from Parquet.
   const TimestampPrecision requestedPrecision_;
+  const dwio::common::SparkDateTimeRebase timestampRebase_;
 
   // The precision of int64_t timestamp in Parquet. Only set when T is int64_t.
   TimestampPrecision filePrecision_;

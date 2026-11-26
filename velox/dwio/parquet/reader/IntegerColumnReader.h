@@ -60,7 +60,7 @@ class IntegerColumnReader : public dwio::common::SelectiveIntegerColumnReader {
         !logicalType.value().INTEGER.isSigned) {
       getUnsignedIntValues(rows, requestedType_, result);
     } else {
-      getIntValues(rows, requestedType_, result);
+      SelectiveIntegerColumnReader::getValues(rows, result);
     }
   }
 

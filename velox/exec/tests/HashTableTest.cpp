@@ -133,8 +133,9 @@ class HashTableTest : public testing::TestWithParam<bool>,
       std::vector<RowVectorPtr> batches;
       std::vector<std::unique_ptr<VectorHasher>> keyHashers;
       for (auto channel = 0; channel < numKeys; ++channel) {
-        keyHashers.emplace_back(std::make_unique<VectorHasher>(
-            buildType->childAt(channel), channel));
+        keyHashers.emplace_back(
+            std::make_unique<VectorHasher>(
+                buildType->childAt(channel), channel));
       }
       auto table = HashTable<true>::createForJoin(
           std::move(keyHashers), dependentTypes, true, false, 1'000, pool());
@@ -432,8 +433,9 @@ class HashTableTest : public testing::TestWithParam<bool>,
       TypePtr buildType,
       std::vector<RowVectorPtr>& batches) {
     for (auto i = 0; i < numBatches; ++i) {
-      batches.push_back(std::static_pointer_cast<RowVector>(
-          makeVector(buildType, batchSize, sequence)));
+      batches.push_back(
+          std::static_pointer_cast<RowVector>(
+              makeVector(buildType, batchSize, sequence)));
       sequence += batchSize;
     }
   }
@@ -654,6 +656,37 @@ TEST_P(HashTableTest, clearBeforeInsert) {
       ASSERT_EQ(reinterpret_cast<uint64_t>(table->testingTable()), 0);
       ASSERT_EQ(table->capacity(), 0);
     }
+  }
+}
+
+TEST_P(HashTableTest, taperHashUnknownKey) {
+  std::vector<std::unique_ptr<VectorHasher>> hashers;
+  hashers.push_back(std::make_unique<VectorHasher>(UNKNOWN(), 0));
+  hashers.push_back(std::make_unique<VectorHasher>(BIGINT(), 1));
+  auto table = HashTable<false>::createForAggregation(
+      std::move(hashers), {}, pool(), /*enableTaper=*/true);
+  ASSERT_EQ(table->hashMode(), BaseHashTable::HashMode::kTaperHash);
+
+  auto input = makeRowVector({
+      BaseVector::createNullConstant(UNKNOWN(), 4, pool()),
+      makeFlatVector<int64_t>({11, 22, 11, 22}),
+  });
+  SelectivityVector rows(input->size());
+  HashLookup lookup(table->hashers());
+  constexpr auto kNoSpill = BaseHashTable::kNoSpillInputStartPartitionBit;
+  for (int batch = 0; batch < 2; ++batch) {
+    table->prepareForGroupProbe(lookup, input, rows, kNoSpill);
+    // Force both distinct BIGINT keys to reach candidate key comparison.
+    for (auto row : lookup.rows) {
+      lookup.hashes[row] = 0;
+    }
+    table->groupProbe(lookup, kNoSpill);
+
+    ASSERT_EQ(table->numDistinct(), 2);
+    ASSERT_EQ(lookup.newGroups.size(), batch == 0 ? 2 : 0);
+    ASSERT_EQ(lookup.hits[0], lookup.hits[2]);
+    ASSERT_EQ(lookup.hits[1], lookup.hits[3]);
+    ASSERT_NE(lookup.hits[0], lookup.hits[1]);
   }
 }
 
