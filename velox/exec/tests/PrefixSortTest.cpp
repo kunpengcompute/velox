@@ -14,9 +14,14 @@
  * limitations under the License.
  */
 
+#include <functional>
+#include <optional>
 #include <gtest/gtest.h>
 
+#include "velox/common/base/Exceptions.h"
+#include "velox/common/testutil/TestValue.h"
 #include "velox/exec/PrefixSort.h"
+#include "velox/exec/SpillRadixSort.h"
 #include "velox/exec/tests/utils/OperatorTestBase.h"
 
 namespace facebook::velox::exec::prefixsort::test {
@@ -93,6 +98,66 @@ class PrefixSortTest : public exec::test::OperatorTestBase {
     }
 
     velox::test::assertEqualVectors(actual, expectedResult);
+  }
+
+  void testSpillRadixSort(
+      const std::vector<CompareFlags>& compareFlags,
+      const RowVectorPtr& data) {
+    const auto numRows = data->size();
+    const auto expectedResult =
+        generateExpectedResult(compareFlags, numRows, data);
+
+    const auto rowType = asRowType(data->type());
+    const std::vector<TypePtr> keyTypes{
+        rowType->children().begin(),
+        rowType->children().begin() + compareFlags.size()};
+    const std::vector<TypePtr> payloadTypes{
+        rowType->children().begin() + compareFlags.size(),
+        rowType->children().end()};
+
+    RowContainer rowContainer(keyTypes, payloadTypes, pool_.get());
+    auto rows = storeRows(numRows, data, &rowContainer);
+    const auto sortPool = rootPool_->addLeafChild("spill-radix-sort");
+    const SpillRadixSortConfig config{
+        true,
+        0,
+        1024,
+        12,
+    };
+    ASSERT_TRUE(SpillRadixSort::canSort(
+        &rowContainer, compareFlags, rows.size(), config));
+    SpillRadixSort::sort(
+        &rowContainer, compareFlags, config, sortPool.get(), rows);
+
+    // Compare only the sort-key columns. Building a vector over the full
+    // row type would leave the trailing payload children populated with
+    // uninitialized buffer data, which mismatches the equally uninitialized
+    // payload in the expected vector.
+    std::vector<std::string> keyNames(
+        rowType->names().begin(),
+        rowType->names().begin() + compareFlags.size());
+    std::vector<TypePtr> keyTypesCopy = keyTypes;
+    const auto keyRowType = ROW(std::move(keyNames), std::move(keyTypesCopy));
+    const RowVectorPtr actual =
+        BaseVector::create<RowVector>(keyRowType, numRows, pool_.get());
+    for (int column = 0; column < compareFlags.size(); ++column) {
+      rowContainer.extractColumn(
+          rows.data(), numRows, column, actual->childAt(column));
+    }
+
+    std::vector<VectorPtr> expectedKeyChildren;
+    expectedKeyChildren.reserve(compareFlags.size());
+    for (int column = 0; column < compareFlags.size(); ++column) {
+      expectedKeyChildren.push_back(expectedResult->childAt(column));
+    }
+    const auto expectedKeysOnly = std::make_shared<RowVector>(
+        pool_.get(),
+        keyRowType,
+        nullptr,
+        numRows,
+        std::move(expectedKeyChildren));
+
+    velox::test::assertEqualVectors(actual, expectedKeysOnly);
   }
 
  private:
@@ -192,6 +257,596 @@ TEST_F(PrefixSortTest, singleKey) {
 
     testPrefixSort({kAsc}, data);
     testPrefixSort({kDesc}, data);
+  }
+}
+
+TEST_F(PrefixSortTest, spillRadixSortBigintAndString) {
+  constexpr vector_size_t kNumRows = 4096;
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>(
+          kNumRows, [](auto row) { return 100000 - (row * 37) % 100000; }),
+      makeFlatVector<std::string>(kNumRows, [](auto row) {
+        return fmt::format("same_prefix_{:06}", 100000 - row);
+      }),
+      makeFlatVector<int32_t>(
+          kNumRows, [](auto row) { return static_cast<int32_t>(row); }),
+  });
+
+  testSpillRadixSort({kAsc, kAsc}, data);
+  testSpillRadixSort({kAsc, kDesc}, data);
+  testSpillRadixSort({kDesc, kAsc}, data);
+}
+
+// Single-key coverage for every type kind supported by SpillRadixSort, with
+// nulls. Exercises the null-byte branch of encodeRowColumn for each encoder.
+TEST_F(PrefixSortTest, spillRadixSortWithNulls) {
+  constexpr vector_size_t kNumRows = 1500;
+  // Place a null roughly every 7 rows to exercise both null and non-null
+  // encoding paths within the same column.
+  auto nullAt = [](vector_size_t row) { return row % 7 == 3; };
+
+  std::vector<VectorPtr> testData;
+  testData.push_back(makeFlatVector<int16_t>(
+      kNumRows,
+      [](vector_size_t row) {
+        return static_cast<int16_t>(7919 - (row * 31) % 7919);
+      },
+      nullAt));
+  testData.push_back(makeFlatVector<int32_t>(
+      kNumRows,
+      [](vector_size_t row) {
+        return static_cast<int32_t>(1'000'003 - (row * 131) % 1'000'003);
+      },
+      nullAt));
+  testData.push_back(makeFlatVector<int64_t>(
+      kNumRows,
+      [](vector_size_t row) {
+        return 1'000'000'007LL -
+            (static_cast<int64_t>(row) * 1031) % 1'000'000'007LL;
+      },
+      nullAt));
+  testData.push_back(makeFlatVector<int128_t>(
+      kNumRows,
+      [](vector_size_t row) {
+        return HugeInt::build(
+            static_cast<int64_t>(row) - 750,
+            static_cast<uint64_t>(row) * 6364136223846793005ULL);
+      },
+      nullAt,
+      HUGEINT()));
+  // Floats include a mix of negatives, infinities and NaN to exercise the
+  // IEEE-754 bit-twiddling in the encoder.
+  testData.push_back(makeFlatVector<float>(
+      kNumRows,
+      [](vector_size_t row) {
+        if (row == 0) {
+          return std::numeric_limits<float>::quiet_NaN();
+        }
+        if (row == 1) {
+          return -std::numeric_limits<float>::infinity();
+        }
+        if (row == 2) {
+          return std::numeric_limits<float>::infinity();
+        }
+        return 0.5f - static_cast<float>(row) * 0.25f;
+      },
+      nullAt));
+  testData.push_back(makeFlatVector<double>(
+      kNumRows,
+      [](vector_size_t row) {
+        if (row == 0) {
+          return -0.0;
+        }
+        if (row == 1) {
+          return 0.0;
+        }
+        return 1.5 - static_cast<double>(row) * 0.125;
+      },
+      nullAt));
+  testData.push_back(makeFlatVector<Timestamp>(
+      kNumRows,
+      [](vector_size_t row) {
+        return Timestamp(
+            static_cast<int64_t>(1'700'000'000) - row * 13,
+            static_cast<uint64_t>((row * 17) % 1'000'000'000));
+      },
+      nullAt));
+
+  for (const auto& column : testData) {
+    SCOPED_TRACE(fmt::format("type {}", column->type()->toString()));
+    const auto data = makeRowVector({column});
+    testSpillRadixSort({kAsc}, data);
+    testSpillRadixSort({kDesc}, data);
+  }
+
+  // VARCHAR/VARBINARY exercised separately so we can mix inline (<= 12 bytes)
+  // and non-inline values plus nulls. All values are unique to keep the
+  // expected order well defined under std::sort.
+  {
+    auto strings = makeFlatVector<std::string>(
+        kNumRows,
+        [](vector_size_t row) {
+          // Alternate between short (inline) and long (non-inline) variants
+          // while keeping every value unique across rows.
+          if (row % 5 == 0) {
+            return fmt::format("s_{:04}", row);
+          }
+          return fmt::format("long_string_value_{:08}", kNumRows - row);
+        },
+        nullAt);
+    const auto data = makeRowVector({strings});
+    testSpillRadixSort({kAsc}, data);
+    testSpillRadixSort({kDesc}, data);
+  }
+  {
+    auto bins = makeFlatVector<std::string>(
+        kNumRows,
+        [](vector_size_t row) {
+          return fmt::format("bin_{:010}_{}", row * 7, row);
+        },
+        nullAt,
+        VARBINARY());
+    const auto data = makeRowVector({bins});
+    testSpillRadixSort({kAsc}, data);
+    testSpillRadixSort({kDesc}, data);
+  }
+}
+
+// Exercises the residual-compare branch in SpillRadixSort::sort:
+//  - hasNonNormalizedKey: more keys than the prefix budget can normalize.
+//  - long string keys that are truncated by maxStringPrefixLength so that
+//    the radix prefix is identical for many rows and the timsort fallback
+//    must order them.
+TEST_F(PrefixSortTest, spillRadixSortResidualCompare) {
+  constexpr vector_size_t kNumRows = 2048;
+
+  // Case 1: long strings with the same prefix force equal-prefix groups.
+  // The radix prefix is bounded by config.maxStringPrefixLength below; the
+  // tail (and the second key) must be ordered by the residual comparator.
+  {
+    auto data = makeRowVector({
+        makeFlatVector<std::string>(
+            kNumRows,
+            [](vector_size_t row) {
+              // First 16+ chars are identical; differences only after the
+              // prefix window so radix cannot resolve order alone.
+              return fmt::format(
+                  "common_prefix_padding_{:08}", kNumRows - row);
+            }),
+        makeFlatVector<int64_t>(
+            kNumRows,
+            [](vector_size_t row) {
+              return static_cast<int64_t>((row * 911) % 7919);
+            }),
+    });
+    testSpillRadixSort({kAsc, kAsc}, data);
+    testSpillRadixSort({kAsc, kDesc}, data);
+  }
+
+  // Case 2: more keys than the prefix budget can fully normalize. With three
+  // BIGINT keys (each 9 bytes including the null byte) and a 16-byte
+  // normalized budget, only the first key is normalized; the remaining keys
+  // are non-normalized and must be ordered by the residual RowContainer
+  // comparator (hasNonNormalizedKey path).
+  {
+    auto data = makeRowVector({
+        makeFlatVector<int64_t>(
+            kNumRows, [](vector_size_t row) { return row % 4; }),
+        makeFlatVector<int64_t>(
+            kNumRows, [](vector_size_t row) { return (row / 4) % 8; }),
+        makeFlatVector<int64_t>(
+            kNumRows,
+            [](vector_size_t row) {
+              return static_cast<int64_t>(kNumRows - row);
+            }),
+    });
+    const std::vector<CompareFlags> compareFlags{kAsc, kAsc, kAsc};
+    const auto numRows = data->size();
+    const auto rowType = asRowType(data->type());
+    const std::vector<TypePtr> keyTypes(
+        rowType->children().begin(), rowType->children().end());
+
+    RowContainer rowContainer(keyTypes, {}, pool_.get());
+    auto rows = storeRows(numRows, data, &rowContainer);
+    const auto sortPool =
+        rootPool_->addLeafChild("spill-radix-sort-residual");
+    // 16 normalized bytes only fits one BIGINT (9 bytes including null
+    // byte). The other two keys must be resolved by the timsort fallback.
+    const SpillRadixSortConfig config{true, 0, 16, 12};
+    ASSERT_TRUE(SpillRadixSort::canSort(
+        &rowContainer, compareFlags, rows.size(), config));
+    SpillRadixSort::sort(
+        &rowContainer, compareFlags, config, sortPool.get(), rows);
+
+    // Compute expected order via std::sort to validate the residual path.
+    RowContainer ref(keyTypes, {}, pool_.get());
+    auto refRows = storeRows(numRows, data, &ref);
+    std::sort(
+        refRows.begin(),
+        refRows.end(),
+        [&](const char* l, const char* r) {
+          for (auto i = 0; i < compareFlags.size(); ++i) {
+            const auto c = ref.compare(l, r, i, compareFlags[i]);
+            if (c != 0) {
+              return c < 0;
+            }
+          }
+          return false;
+        });
+
+    const auto actual =
+        BaseVector::create<RowVector>(rowType, numRows, pool_.get());
+    const auto expectedSorted =
+        BaseVector::create<RowVector>(rowType, numRows, pool_.get());
+    for (int column = 0; column < compareFlags.size(); ++column) {
+      rowContainer.extractColumn(
+          rows.data(), numRows, column, actual->childAt(column));
+      ref.extractColumn(
+          refRows.data(), numRows, column, expectedSorted->childAt(column));
+    }
+    velox::test::assertEqualVectors(actual, expectedSorted);
+  }
+}
+
+// Fuzz across every type kind that SpillRadixSort supports. Mirrors the
+// PrefixSort fuzz tests but restricted to the radix-eligible type set.
+TEST_F(PrefixSortTest, spillRadixSortFuzz) {
+  std::vector<TypePtr> keyTypes = {
+      SMALLINT(),
+      INTEGER(),
+      BIGINT(),
+      HUGEINT(),
+      REAL(),
+      DOUBLE(),
+      TIMESTAMP(),
+      VARCHAR(),
+      VARBINARY()};
+
+  auto runFuzzTest = [&](double nullRatio) {
+    for (const auto& type : keyTypes) {
+      SCOPED_TRACE(fmt::format("type {}, nulls {}", type->toString(), nullRatio));
+      VectorFuzzer fuzzer(
+          {.vectorSize = 4'096, .nullRatio = nullRatio}, pool());
+      RowVectorPtr data = fuzzer.fuzzRow(ROW({type}));
+      testSpillRadixSort({kAsc}, data);
+      testSpillRadixSort({kDesc}, data);
+    }
+  };
+
+  runFuzzTest(0.0);
+  runFuzzTest(0.1);
+}
+
+// Verifies the chunked prefix-buffer allocation: with a tiny per-chunk page
+// budget the sort must still produce the same stable order as the default
+// (single-chunk) path. Exercises many chunks, chunk-boundary crossings, and
+// a non-multiple row count so the last chunk is partial.
+TEST_F(PrefixSortTest, spillRadixSortChunkedAllocation) {
+  constexpr vector_size_t kNumRows = 20'000;
+
+  // Two keys: a BIGINT and a VARCHAR longer than 8 bytes so the normalized
+  // prefix is non-trivial and rows cross chunk boundaries.
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>(
+          kNumRows,
+          [](vector_size_t row) {
+            return static_cast<int64_t>((row * 2654435761U) % 1'000'003);
+          }),
+      makeFlatVector<std::string>(
+          kNumRows,
+          [](vector_size_t row) {
+            return fmt::format("chunk_test_key_{:012}", row % 4093);
+          }),
+  });
+  const std::vector<CompareFlags> compareFlags{kAsc, kAsc};
+
+  auto runSort = [&](uint32_t chunkPages) {
+    const auto rowType = asRowType(data->type());
+    RowContainer rowContainer(
+        {BIGINT(), VARCHAR()}, {}, pool_.get());
+    auto rows = storeRows(kNumRows, data, &rowContainer);
+    const auto sortPool =
+        rootPool_->addLeafChild("spill-radix-sort-chunked");
+    SpillRadixSortConfig config;
+    config.enabled = true;
+    config.minRows = 0;
+    config.maxPrefixBufferChunkPages = chunkPages;
+    EXPECT_TRUE(SpillRadixSort::canSort(
+        &rowContainer, compareFlags, rows.size(), config));
+    SpillRadixSort::sort(
+        &rowContainer, compareFlags, config, sortPool.get(), rows);
+
+    std::vector<std::string> keyNames{"c0", "c1"};
+    const auto keyRowType = ROW(std::move(keyNames), {BIGINT(), VARCHAR()});
+    const RowVectorPtr actual =
+        BaseVector::create<RowVector>(keyRowType, kNumRows, pool_.get());
+    for (int column = 0; column < compareFlags.size(); ++column) {
+      rowContainer.extractColumn(
+          rows.data(), kNumRows, column, actual->childAt(column));
+    }
+    return actual;
+  };
+
+  // Default (single large chunk) vs tiny 1-page chunks (forces ~every row in
+  // its own chunk) vs a small multi-row chunk that straddles boundaries.
+  const auto defaultResult = runSort(256);
+  const auto tinyResult = runSort(1);
+  const auto smallResult = runSort(4);
+
+  velox::test::assertEqualVectors(defaultResult, tinyResult);
+  velox::test::assertEqualVectors(defaultResult, smallResult);
+}
+
+// Verifies the fallback to the comparator sort when the prefix-buffer chunk
+// allocation fails (e.g. the spill memory allocator is exhausted). The
+// fallback must produce the same sorted order as the radix path.
+TEST_F(PrefixSortTest, spillRadixSortAllocationFailureFallback) {
+  constexpr vector_size_t kNumRows = 5'000;
+
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>(
+          kNumRows, [](vector_size_t row) { return row % 97; }),
+      makeFlatVector<std::string>(
+          kNumRows,
+          [](vector_size_t row) {
+            return fmt::format("fallback_key_{:010}", row % 2039);
+          }),
+  });
+  const std::vector<CompareFlags> compareFlags{kAsc, kAsc};
+
+  auto runSort = [&](bool injectFailure) {
+    const auto rowType = asRowType(data->type());
+    RowContainer rowContainer({BIGINT(), VARCHAR()}, {}, pool_.get());
+    auto rows = storeRows(kNumRows, data, &rowContainer);
+    const auto sortPool =
+        rootPool_->addLeafChild("spill-radix-sort-fallback");
+    SpillRadixSortConfig config;
+    config.enabled = true;
+    config.minRows = 0;
+    EXPECT_TRUE(SpillRadixSort::canSort(
+        &rowContainer, compareFlags, rows.size(), config));
+
+    // The scoped injection must outlive the sort() call below, so it is
+    // declared outside the 'if' (ScopedTestValue unregisters the hook in its
+    // destructor, which would otherwise run at the end of the 'if' block).
+    std::optional<common::testutil::ScopedTestValue> injection;
+    if (injectFailure) {
+      // Force the chunk allocation to fail so sort() falls back to the
+      // comparator path.
+      injection.emplace(
+          "SpillRadixSort::sort::allocateChunks",
+          std::function<void(bool*)>([&](bool*) {
+            throw VeloxRuntimeError(
+                __FILE__,
+                __LINE__,
+                __FUNCTION__,
+                "SpillRadixSort::sort",
+                "Injected prefix buffer allocation failure",
+                "",
+                error_code::kMemAllocError,
+                /*isRetriable=*/true);
+          }));
+    }
+    SpillRadixSort::sort(
+        &rowContainer, compareFlags, config, sortPool.get(), rows);
+
+    std::vector<std::string> keyNames{"c0", "c1"};
+    const auto keyRowType = ROW(std::move(keyNames), {BIGINT(), VARCHAR()});
+    const RowVectorPtr actual =
+        BaseVector::create<RowVector>(keyRowType, kNumRows, pool_.get());
+    for (int column = 0; column < compareFlags.size(); ++column) {
+      rowContainer.extractColumn(
+          rows.data(), kNumRows, column, actual->childAt(column));
+    }
+    return actual;
+  };
+
+  const auto radixResult = runSort(false);
+  const auto fallbackResult = runSort(true);
+  velox::test::assertEqualVectors(radixResult, fallbackResult);
+}
+
+// Negative tests: configurations and inputs for which canSort must return
+// false so the caller falls back to the comparator-based sort path.
+TEST_F(PrefixSortTest, spillRadixSortCanSortNegative) {
+  const std::vector<TypePtr> keyTypes{BIGINT()};
+  RowContainer rowContainer(keyTypes, {}, pool_.get());
+  const std::vector<CompareFlags> compareFlags{kAsc};
+
+  // Disabled config.
+  {
+    SpillRadixSortConfig config;
+    config.enabled = false;
+    EXPECT_FALSE(
+        SpillRadixSort::canSort(&rowContainer, compareFlags, 10'000, config));
+  }
+
+  // Below minRows threshold.
+  {
+    SpillRadixSortConfig config;
+    config.enabled = true;
+    config.minRows = 1024;
+    EXPECT_FALSE(
+        SpillRadixSort::canSort(&rowContainer, compareFlags, 1023, config));
+    EXPECT_TRUE(
+        SpillRadixSort::canSort(&rowContainer, compareFlags, 1024, config));
+  }
+
+  // Null rowContainer.
+  {
+    SpillRadixSortConfig config;
+    EXPECT_FALSE(
+        SpillRadixSort::canSort(nullptr, compareFlags, 10'000, config));
+  }
+
+  // Unsupported type kind (BOOLEAN has no PrefixSort encoder, so the layout
+  // produces no normalized keys and radix cannot run).
+  {
+    const std::vector<TypePtr> boolKeys{BOOLEAN()};
+    RowContainer boolContainer(boolKeys, {}, pool_.get());
+    SpillRadixSortConfig config;
+    EXPECT_FALSE(SpillRadixSort::canSort(
+        &boolContainer, std::vector<CompareFlags>{kAsc}, 10'000, config));
+  }
+}
+
+// Verifies the truncated-string-key gate: radix is rejected when two or more
+// string keys exceed maxStringPrefixLength (their equal-prefix groups grow
+// too large for residual compare), but accepted with zero or one such key.
+TEST_F(PrefixSortTest, spillRadixSortTruncatedStringGate) {
+  constexpr vector_size_t kNumRows = 1'000;
+
+  // Helper: build a hasher-agnostic RowContainer of string keys and check
+  // canSort. Long keys (> maxStringPrefixLength) populate columnStats with a
+  // maxBytes that exceeds the 16-byte default prefix budget.
+  auto makeContainer = [&](const std::vector<std::string>& col0,
+                           const std::vector<std::string>& col1) {
+    std::vector<TypePtr> keyTypes;
+    if (!col0.empty()) {
+      keyTypes.push_back(VARCHAR());
+    }
+    if (!col1.empty()) {
+      keyTypes.push_back(VARCHAR());
+    }
+    // Use the two-argument constructor (no dependent types); an empty brace
+    // list cannot be deduced through make_unique's forwarding.
+    auto container = std::make_unique<RowContainer>(keyTypes, pool_.get());
+    std::vector<char*> rows(kNumRows);
+    for (auto i = 0; i < kNumRows; ++i) {
+      rows[i] = container->newRow();
+    }
+    if (!col0.empty()) {
+      auto vec = makeFlatVector<StringView>(
+          kNumRows, [&](vector_size_t row) { return StringView(col0[row]); });
+      DecodedVector decoded(*vec);
+      for (auto i = 0; i < kNumRows; ++i) {
+        container->store(decoded, i, rows[i], 0);
+      }
+    }
+    if (!col1.empty()) {
+      auto vec = makeFlatVector<StringView>(
+          kNumRows, [&](vector_size_t row) { return StringView(col1[row]); });
+      DecodedVector decoded(*vec);
+      for (auto i = 0; i < kNumRows; ++i) {
+        container->store(decoded, i, rows[i], 1);
+      }
+    }
+    return container;
+  };
+
+  std::vector<std::string> shortKeys(kNumRows);
+  std::vector<std::string> longKeys(kNumRows);
+  for (auto i = 0; i < kNumRows; ++i) {
+    shortKeys[i] = fmt::format("short{}", i % 7); // <= 16 bytes
+    longKeys[i] = fmt::format("a_very_long_string_key_{:012}", i % 1000);
+  }
+
+  SpillRadixSortConfig config;
+  config.enabled = true;
+  config.minRows = 0;
+
+  // Zero truncated keys: two short string keys fully fit the prefix.
+  {
+    auto container = makeContainer(shortKeys, shortKeys);
+    std::vector<CompareFlags> flags{kAsc, kAsc};
+    EXPECT_TRUE(SpillRadixSort::canSort(
+        container.get(), flags, kNumRows, config));
+  }
+
+  // One truncated key: still acceptable (prefix usually disambiguates).
+  {
+    auto container = makeContainer(shortKeys, longKeys);
+    std::vector<CompareFlags> flags{kAsc, kAsc};
+    EXPECT_TRUE(SpillRadixSort::canSort(
+        container.get(), flags, kNumRows, config));
+  }
+
+  // Two truncated keys: rejected, falls back to comparator sort.
+  {
+    auto container = makeContainer(longKeys, longKeys);
+    std::vector<CompareFlags> flags{kAsc, kAsc};
+    EXPECT_FALSE(SpillRadixSort::canSort(
+        container.get(), flags, kNumRows, config));
+  }
+}
+
+// Verifies the radix counting pass
+// (facebook::velox::exec::detail::spillRadixSortCountingPass):
+// it buckets rows by the byte at 'byteOffset' of each prefix and scatters
+// them into 'out' in stable order. We compare against a scalar reference.
+TEST_F(PrefixSortTest, spillRadixSortCountingPass) {
+  constexpr size_t kNumRows = 10'000;
+  constexpr size_t kEntrySize = 64;
+  constexpr uint32_t kByteOffset = 27;
+  constexpr uint32_t kTrialOffset = 13;
+
+  // Reference implementation (scalar).
+  auto referenceCountingPass =
+      [](char** in,
+         char** out,
+         size_t numRows,
+         uint32_t byteOffset) {
+        std::vector<uint32_t> counts(257, 0);
+        for (size_t i = 0; i < numRows; ++i) {
+          ++counts[1 + static_cast<uint8_t>(*(in[i] + byteOffset))];
+        }
+        for (int32_t i = 1; i < 256; ++i) {
+          counts[i] += counts[i - 1];
+        }
+        for (size_t i = 0; i < numRows; ++i) {
+          const auto key = static_cast<uint8_t>(*(in[i] + byteOffset));
+          out[counts[key]++] = in[i];
+        }
+      };
+
+  // Build a contiguous prefix buffer with unique rows so we can verify
+  // stability: row j occupies bytes [j * kEntrySize, (j+1) * kEntrySize).
+  const size_t bufferSize = kNumRows * kEntrySize;
+  std::vector<char> prefix(bufferSize);
+  for (size_t j = 0; j < kNumRows; ++j) {
+    // Fill the whole row with deterministic pseudo-random bytes.
+    for (size_t b = 0; b < kEntrySize; ++b) {
+      prefix[j * kEntrySize + b] =
+          static_cast<char>((j * 131 + b * 17 + (b * b) % 251) & 0xff);
+    }
+  }
+  std::vector<char*> rows(kNumRows);
+  for (size_t j = 0; j < kNumRows; ++j) {
+    rows[j] = prefix.data() + j * kEntrySize;
+  }
+
+  // Compare the two byte offsets in both directions: the counting pass must
+  // produce the same stable scatter as the scalar reference, and the two
+  // offsets must agree with each other (a permutation of all rows).
+  for (uint32_t byteOffset : {kByteOffset, kTrialOffset}) {
+    std::vector<char*> outSve(kNumRows, nullptr);
+    std::vector<char*> outScalar(kNumRows, nullptr);
+    facebook::velox::exec::detail::spillRadixSortCountingPass(
+        rows.data(), outSve.data(), kNumRows, byteOffset);
+    referenceCountingPass(
+        rows.data(), outScalar.data(), kNumRows, byteOffset);
+
+    EXPECT_EQ(outSve, outScalar) << "counting pass mismatch at byte "
+                                 << byteOffset;
+
+    // Every row must appear exactly once (stable permutation).
+    std::vector<bool> seen(kNumRows, false);
+    for (size_t j = 0; j < kNumRows; ++j) {
+      const auto rowIndex = (outSve[j] - prefix.data()) / kEntrySize;
+      ASSERT_LT(rowIndex, kNumRows);
+      EXPECT_FALSE(seen[rowIndex]);
+      seen[rowIndex] = true;
+    }
+  }
+
+  // Edge cases: empty input and single row.
+  {
+    std::vector<char*> out(1, nullptr);
+    facebook::velox::exec::detail::spillRadixSortCountingPass(
+        rows.data(), out.data(), 0, kByteOffset);
+    facebook::velox::exec::detail::spillRadixSortCountingPass(
+        rows.data(), out.data(), 1, kByteOffset);
+    EXPECT_EQ(out[0], rows[0]);
   }
 }
 
